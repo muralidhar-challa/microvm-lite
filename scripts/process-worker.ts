@@ -239,7 +239,6 @@ function claimPoolWorker(): PoolEntry | null {
 };
 
 (globalThis as any).workerSpawn = function (filePtr: number, argvPtr: number): number {
-  dbg("[DEBUG] workerSpawn ENTRY, pipes.size:", pipes.size);
   try {
     const file = readCStr(filePtr);
     const argv = readArgv(argvPtr);
@@ -248,17 +247,17 @@ function claimPoolWorker(): PoolEntry | null {
     const entry = children.get(lastForkedPid)!;
     const sab = entry.ctrl.buffer as SharedArrayBuffer;
 
-    dbg("[DEBUG] pendingRedirects at spawn time:", JSON.stringify(pendingRedirects), "marker:", EVAL_MARKER, "pipes keys:", [...pipes.keys()]);
     const redirects: Record<string, { ctrlBuf: SharedArrayBuffer; dataBuf: SharedArrayBuffer; role: "r" | "w" }> = {};
     for (const [slot, vfd] of Object.entries(pendingRedirects)) {
       if (vfd < 0) continue;
       const p = pipes.get(vfd);
       if (!p) { dbg("[DEBUG] no pipe found for vfd", vfd); continue; }
-      // hand off: the spawned child becomes a new holder of this pipe end
-      Atomics.add(p.ctrl, p.role === "w" ? 3 : 4, 1);
+      // Transfer ownership: the child inherits the parent's refcount slot.
+      // Do NOT bump the count — that would double-count and prevent EOF
+      // from ever being signalled (writersOpen would never reach 0).
       redirects[slot] = { ctrlBuf: p.ctrl.buffer as SharedArrayBuffer, dataBuf: p.data.buffer as SharedArrayBuffer, role: p.role };
+      pipes.delete(vfd);
     }
-    dbg("[DEBUG] redirects built:", Object.keys(redirects));
     pendingRedirects = { stdin: -1, stdout: -1, stderr: -1 };
 
     entry.worker.postMessage({ type: "exec", argv, sab, redirects });
@@ -313,6 +312,17 @@ function claimPoolWorker(): PoolEntry | null {
 
 let cachedWasmBytes: Uint8Array;
 
+// busybox.js snapshots Module["print"]/["printErr"]/["stdin"] once, at factory()
+// call time (`if (Module["print"]) out = Module["print"]`) — reassigning
+// mod.print/mod.printErr/mod.stdin afterwards (e.g. per-exec, to switch between
+// pipe and relay output) is a silent no-op; the runtime keeps calling whatever
+// was captured at init. Route through these mutable indirections instead, and
+// pass them as the *initial* print/printErr/stdin so the one-time snapshot
+// captures the indirection, not a fixed target.
+let currentPrint: (t: string) => void = (t) => (self as any).postMessage({ type: "stdout", text: t + "\n" });
+let currentPrintErr: (t: string) => void = (t) => (self as any).postMessage({ type: "stderr", text: t + "\n" });
+let currentStdin: () => number | null = () => null;
+
 function snapshotFiles(): Record<string, Uint8Array> {
   const out: Record<string, Uint8Array> = {};
   function walk(dir: string) {
@@ -339,69 +349,6 @@ const readyPromise = new Promise<void>((r) => { readyResolve = r; });
 self.onmessage = async (ev: MessageEvent) => {
   const msg = ev.data;
 
-  if (msg.type === "test-pool-fork-exec") {
-    dbg("test-pool-fork-exec: pre-warming worker, waiting for it to be alive");
-    try {
-      cachedWasmBytes = msg.wasmBytes;
-      const pid = pidCounter++;
-      const worker = new Worker(import.meta.url, { type: "module" });
-      const sab = new SharedArrayBuffer(8);
-      const ctrl = new Int32Array(sab);
-      let aliveResolve: () => void;
-      const alive = new Promise<void>((r) => { aliveResolve = r; });
-      worker.onmessage = (ev) => {
-        if (ev.data.type === "dbg" || ev.data.type === "stdout" || ev.data.type === "stderr") (self as any).postMessage(ev.data);
-        if (ev.data.type === "ready") aliveResolve();
-      };
-      worker.postMessage({ type: "init", pid, wasmBytes: cachedWasmBytes, files: {} });
-      dbg("test-pool-fork-exec: waiting for child ready message (real await, event loop free)");
-      await alive;
-      children.set(pid, { worker, ctrl });
-      lastForkedPid = pid;
-      dbg("test-pool-fork-exec: child is alive and ready, NOW doing exec+wait with zero yield");
-      worker.postMessage({ type: "exec", argv: ["echo", "hi-from-pool"], sab: ctrl.buffer });
-      const status = (globalThis as any).workerWaitpid(pid, 0, 0);
-      dbg("test-pool-fork-exec: workerWaitpid returned", status);
-    } catch (e) {
-      dbg("test-pool-fork-exec: threw:", String(e));
-    }
-    return;
-  }
-
-  if (msg.type === "test-full-fork-exec") {
-    dbg("test-full-fork-exec: calling real workerFork()");
-    try {
-      cachedWasmBytes = msg.wasmBytes;
-      const pid = (globalThis as any).workerFork();
-      dbg("test-full-fork-exec: workerFork returned pid", pid);
-      const entry = children.get(pid);
-      if (!entry) { dbg("test-full-fork-exec: no entry for pid!"); return; }
-      entry.worker.postMessage({ type: "exec", argv: ["echo", "hi-from-fork-exec"], sab: entry.ctrl.buffer });
-      dbg("test-full-fork-exec: sent exec message, yielding before wait");
-      await new Promise((r) => setTimeout(r, 50));
-      dbg("test-full-fork-exec: now waiting via Atomics.wait");
-      const status = (globalThis as any).workerWaitpid(pid, 0, 0);
-      dbg("test-full-fork-exec: workerWaitpid returned", status);
-    } catch (e) {
-      dbg("test-full-fork-exec: threw:", String(e));
-    }
-    return;
-  }
-
-  if (msg.type === "test-nested-spawn") {
-    dbg("test-nested-spawn: about to construct Worker(import.meta.url)");
-    try {
-      const w = new Worker(import.meta.url, { type: "module" });
-      dbg("test-nested-spawn: constructed OK");
-      w.onmessage = (e) => dbg("test-nested-spawn: child said:", JSON.stringify(e.data));
-      w.onerror = (e) => dbg("test-nested-spawn: child error:", e.message, e.filename, String(e.lineno));
-      w.addEventListener("messageerror", () => dbg("test-nested-spawn: messageerror"));
-    } catch (e) {
-      dbg("test-nested-spawn: threw:", String(e));
-    }
-    return;
-  }
-
   if (msg.type === "init") {
     myPid = msg.pid;
     cachedWasmBytes = msg.wasmBytes;
@@ -411,6 +358,9 @@ self.onmessage = async (ev: MessageEvent) => {
       noInitialRun: true,
       noExitRuntime: true,
       thisProgram: "busybox",
+      print: (t: string) => currentPrint(t),
+      printErr: (t: string) => currentPrintErr(t),
+      stdin: () => currentStdin(),
       async instantiateWasm(imports: WebAssembly.Imports, cb: (i: WebAssembly.Instance) => void) {
         const { instance } = await WebAssembly.instantiate(msg.wasmBytes, imports);
         memory = (Object.values(instance.exports).find((v) => v instanceof WebAssembly.Memory) as WebAssembly.Memory)
@@ -456,11 +406,11 @@ self.onmessage = async (ev: MessageEvent) => {
         data: new Uint8Array(redirects.stdout.dataBuf),
         role: "w",
       };
-      mod.print = (t: string) => { dbg("[DEBUG] print->pipe", JSON.stringify(t)); pipeWriteBytes(stdoutPipe!, new TextEncoder().encode(t + "\n")); };
+      currentPrint = (t: string) => pipeWriteBytes(stdoutPipe!, new TextEncoder().encode(t + "\n"));
     } else {
-      mod.print = (t: string) => { dbg("[DEBUG] print->relay", JSON.stringify(t)); (self as any).postMessage({ type: "stdout", text: t + "\n" }); };
+      currentPrint = (t: string) => (self as any).postMessage({ type: "stdout", text: t + "\n" });
     }
-    mod.printErr = (t: string) => (self as any).postMessage({ type: "stderr", text: t + "\n" });
+    currentPrintErr = (t: string) => (self as any).postMessage({ type: "stderr", text: t + "\n" });
 
     if (redirects.stdin) {
       stdinPipe = {
@@ -468,11 +418,15 @@ self.onmessage = async (ev: MessageEvent) => {
         data: new Uint8Array(redirects.stdin.dataBuf),
         role: "r",
       };
-      mod.stdin = () => { const b = pipeReadByte(stdinPipe!); dbg("[DEBUG] stdin<-pipe", b); return b; };
+      currentStdin = () => pipeReadByte(stdinPipe!);
+    } else {
+      currentStdin = () => null;
     }
 
+    // busybox.js's quit_() always throws a real ExitStatus (ignores any
+    // Module["quit"] override — there isn't one), so the exit code has to be
+    // read off the caught exception rather than injected via a callback.
     let exitCode = 0;
-    mod.quit = (status: number) => { exitCode = status; throw new Error("ExitStatus"); };
     try {
       // hush_main()'s "-c" parsing relies on libc's process-global optind,
       // which stays wherever the previous top-level callMain() left it
@@ -481,8 +435,9 @@ self.onmessage = async (ev: MessageEvent) => {
       // recognize "-c" and treats the command string as a script filename.
       mod._em_reset_getopt();
       mod.callMain(msg.argv);
-    } catch (_e) {
-      // normal exit via quit()
+    } catch (e: any) {
+      if (e?.name === "ExitStatus") exitCode = e.status;
+      else dbg("[DEBUG] callMain threw non-exit error:", String(e));
     }
 
     // This process implicitly closes whatever pipe ends it was holding.
