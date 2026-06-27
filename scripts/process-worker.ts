@@ -13,7 +13,7 @@ const debugBC = new BroadcastChannel("busybox-debug");
 
 function dbg(...args: unknown[]) {
   const text = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
-  console.error(text);
+  console.log(text);
   const full = `[marker ${EVAL_MARKER}] ${text}`;
   try { (self as any).postMessage({ type: "dbg", text: full }); } catch (_e) { /* ignore */ }
   try { debugBC.postMessage(full); } catch (_e) { /* ignore */ }
