@@ -71,7 +71,10 @@ int em_dup2(int oldfd, int newfd) {
 
 int em_close(int fd) {
     if (fd >= VIRTUAL_FD_BASE) {
-        js_pipe_close(fd);
+        // Virtual pipe FDs are owned by JS. Cleanup happens in workerSpawn()
+        // via pipes.delete() after handing off the buffer to the child worker.
+        // Calling js_pipe_close() here is premature — the sibling child's
+        // workerSpawn() hasn't had a chance to look up the other pipe end yet.
         return 0;
     }
     return close(fd);
