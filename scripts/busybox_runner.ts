@@ -95,7 +95,7 @@ export async function createBusyboxRunner(
       },
       async instantiateWasm(imports: WebAssembly.Imports, successCallback: (instance: WebAssembly.Instance) => void) {
         const wasmUrl = new URL(wasmPath, moduleBase);
-        const wasmBinary = await Deno.readFile(wasmUrl);
+        const wasmBinary = new Uint8Array(await Bun.file(wasmUrl).arrayBuffer());
         const { instance } = await WebAssembly.instantiate(wasmBinary, imports);
         successCallback(instance);
         return instance.exports;

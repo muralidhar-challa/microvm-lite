@@ -13,7 +13,7 @@ window.testLog = log;
 
 const wasmBytes = await fetch("./busybox.wasm").then(r => r.arrayBuffer()).then(b => new Uint8Array(b));
 
-const root = new Worker("./deno/process-worker.bundle.js", { type: "module" });
+const root = new Worker("./scripts/process-worker.bundle.js", { type: "module" });
 root.onmessage = (ev) => {
   const msg = ev.data;
   if (msg.type === "stdout") out.textContent += msg.text;

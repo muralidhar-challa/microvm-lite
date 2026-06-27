@@ -1,6 +1,6 @@
 import factory from "../busybox.js";
 
-const wasmBytes = await Deno.readFile(new URL("../busybox.wasm", import.meta.url));
+const wasmBytes = new Uint8Array(await Bun.file(new URL("../busybox.wasm", import.meta.url)).arrayBuffer());
 
 const mod = await factory({
   noInitialRun: true,
@@ -21,6 +21,7 @@ mod.quit = (status: number) => { throw new Error("ExitStatus:" + status); };
 
 function run(args: string[]) {
   stdout.length = 0;
+  mod._em_reset_getopt();
   try {
     mod.callMain(args);
   } catch (e) {
