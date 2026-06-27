@@ -39,5 +39,27 @@ mergeInto(LibraryManager.library, {
         }
         // standalone: return -1 with ECHILD
         return -1;
+    },
+
+    js_pipe__sig: 'vp',
+    js_pipe: function(fdsPtr) {
+        if (typeof workerPipe !== 'undefined') {
+            return workerPipe(fdsPtr);
+        }
+        // standalone: no-op (caller will see garbage fds; not used outside worker mode)
+    },
+
+    js_pipe_close__sig: 'vi',
+    js_pipe_close: function(vfd) {
+        if (typeof workerPipeClose !== 'undefined') {
+            return workerPipeClose(vfd);
+        }
+    },
+
+    js_set_redirects__sig: 'viii',
+    js_set_redirects: function(stdinVfd, stdoutVfd, stderrVfd) {
+        if (typeof workerSetRedirects !== 'undefined') {
+            return workerSetRedirects(stdinVfd, stdoutVfd, stderrVfd);
+        }
     }
 });

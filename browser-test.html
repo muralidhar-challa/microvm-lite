@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>busybox worker-fork test</title></head>
+<body>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+function log(...args) {
+  console.log(...args);
+  out.textContent += args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ") + "\n";
+}
+window.testLog = log;
+
+const wasmBytes = await fetch("./busybox.wasm").then(r => r.arrayBuffer()).then(b => new Uint8Array(b));
+
+const root = new Worker("./deno/process-worker.bundle.js", { type: "module" });
+root.onmessage = (ev) => {
+  const msg = ev.data;
+  if (msg.type === "stdout") out.textContent += msg.text;
+  if (msg.type === "stderr") out.textContent += "[ERR] " + msg.text;
+  if (msg.type === "exited") log(`[exited code=${msg.exitCode}]`);
+  if (msg.type === "dbg") log(msg.text);
+};
+
+root.postMessage({ type: "init", pid: 1, wasmBytes, files: { "/tmp/test.txt": new TextEncoder().encode("foo\nbar\nbaz\n") } });
+await new Promise(r => setTimeout(r, 500));
+
+log("=== echo hi (no sh) ===");
+root.postMessage({ type: "exec", argv: ["echo", "hi"] });
+await new Promise(r => setTimeout(r, 1000));
+
+log("=== sh -c 'echo hi' (no pipe) ===");
+root.postMessage({ type: "exec", argv: ["sh", "-c", "echo hi"] });
+await new Promise(r => setTimeout(r, 1500));
+
+log("=== sh -c 'cat /tmp/test.txt' (no pipe) ===");
+root.postMessage({ type: "exec", argv: ["sh", "-c", "cat /tmp/test.txt"] });
+await new Promise(r => setTimeout(r, 1500));
+
+log("=== sh -c 'cat /tmp/test.txt | grep bar' (pipe) ===");
+root.postMessage({ type: "exec", argv: ["sh", "-c", "cat /tmp/test.txt | grep bar"] });
+await new Promise(r => setTimeout(r, 2000));
+
+log("=== done ===");
+window.testDone = true;
+</script>
+</body>
+</html>
