@@ -5,3 +5,5 @@ test-results/
 *.bak
 busybox.js
 busybox.wasm
+scripts/process-worker.bundle.js
+scripts/busybox-*.js

@@ -17,7 +17,7 @@ const result = await page.evaluate(async () => {
   const bc = new BroadcastChannel("busybox-debug");
   bc.onmessage = (ev) => logs.push("[bc] " + ev.data);
 
-  const root = new Worker("/deno/process-worker.bundle.js", { type: "module" });
+  const root = new Worker("/scripts/process-worker.bundle.js", { type: "module" });
   root.onmessage = (ev) => {
     const m = ev.data;
     if (m.type === "stdout") logs.push("[stdout] " + JSON.stringify(m.text));
@@ -39,6 +39,10 @@ const result = await page.evaluate(async () => {
   await new Promise((r) => setTimeout(r, 2000));
 
   logs.push("=== sh -c 'cat /tmp/test.txt | grep bar' (real pipe) ===");
+  root.postMessage({ type: "exec", argv: ["sh", "-c", "cat /tmp/test.txt | grep bar"] });
+  await new Promise((r) => setTimeout(r, 2500));
+
+  logs.push("=== sh -c 'cat /tmp/test.txt | grep bar' AGAIN (regression check: optind reentrancy after a real vfork pipe) ===");
   root.postMessage({ type: "exec", argv: ["sh", "-c", "cat /tmp/test.txt | grep bar"] });
   await new Promise((r) => setTimeout(r, 2500));
 

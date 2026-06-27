@@ -49,7 +49,7 @@ const mod = await factory({
   print: (t: string) => console.log("[stdout]", t),
   printErr: (t: string) => console.log("[stderr]", t),
   async instantiateWasm(imports: WebAssembly.Imports, cb: (i: WebAssembly.Instance) => void) {
-    const wasmBytes = await Deno.readFile(new URL("../busybox.wasm", import.meta.url));
+    const wasmBytes = new Uint8Array(await Bun.file(new URL("../busybox.wasm", import.meta.url)).arrayBuffer());
     const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
     memory = (Object.values(instance.exports).find((v) => v instanceof WebAssembly.Memory) as WebAssembly.Memory)
       ?? (imports.env?.memory as WebAssembly.Memory);
