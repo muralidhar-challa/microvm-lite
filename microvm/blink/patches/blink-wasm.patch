@@ -1,0 +1,27 @@
+diff --git a/blink/realpath.c b/blink/realpath.c
+index 8999ef5..be3c087 100644
+--- a/blink/realpath.c
++++ b/blink/realpath.c
+@@ -32,6 +32,7 @@
+ #include <unistd.h>
+ 
+ #include "blink/limits.h"
++#include "blink/string.h"
+ #include "blink/util.h"
+ 
+ // clang-format off
+diff --git a/blink/syscall.c b/blink/syscall.c
+index 34cc01c..f5e8204 100644
+--- a/blink/syscall.c
++++ b/blink/syscall.c
+@@ -159,8 +159,8 @@ int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+ }
+ 
+ ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
+-  // Handle blocking reads by waiting for POLLIN
+-  if ((VfsFcntl(fd, F_GETFL, 0) & O_NONBLOCK) == 0) {
++  // Only poll-loop on stdin (fd 0) — regular file reads must not block
++  if (fd == 0) {
+     struct pollfd pfd;
+     pfd.fd = fd;
+     pfd.events = POLLIN;

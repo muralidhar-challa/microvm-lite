@@ -7,3 +7,13 @@ busybox.js
 busybox.wasm
 scripts/process-worker.bundle.js
 scripts/busybox-*.js
+
+# microvm-lite (blink backend) build outputs — regenerate with: bash microvm/blink/build.sh
+microvm/blink-src/
+microvm/blink-wasm/
+# symlinks into blink-wasm/ for the dev server
+microvm/test/blink.js
+microvm/test/blink.wasm
+microvm/test/busybox
+microvm/test/xtool
+microvm/test/probe

@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>microvm-lite — M0 spike</title>
+<style>
+  body { font-family: ui-monospace, monospace; background: #0d0d0d; color: #e0e0e0; margin: 0; padding: 16px; }
+  #statusEl { color: #00ff88; margin-bottom: 12px; }
+  #log { white-space: pre-wrap; background: #111; border: 1px solid #333; padding: 12px; min-height: 200px; }
+  .cmd { color: #6cf; }
+  .err { color: #f66; }
+  button { margin: 4px 4px 12px 0; }
+</style>
+</head>
+<body>
+  <div id="statusEl">booting worker…</div>
+  <div>
+    <button onclick="run(['ls','/bin'])">ls /bin</button>
+    <button onclick="run(['xtool','ping'])">xtool ping</button>
+    <button onclick="run(['echo','hello from blink'])">echo</button>
+  </div>
+  <div id="log"></div>
+
+<script>
+  var log = document.getElementById('log');
+  var statusEl = document.getElementById('statusEl');
+  var worker = new Worker('worker.js');
+  var pending = {};
+  var nextId = 1;
+
+  worker.onerror = function (e) {
+    log.innerHTML += '<span class="err">worker error: ' + e.message + ' @ ' + e.filename + ':' + e.lineno + '</span>\n';
+    statusEl.textContent = 'worker failed to load';
+  };
+
+  worker.onmessage = function (ev) {
+    var msg = ev.data;
+    log.textContent += '[recv:' + msg.type + '] ';
+    if (msg.type === 'ready') { statusEl.textContent = 'ready'; return; }
+    if (msg.type === 'dbg') { log.textContent += '[dbg] ' + msg.text + '\n'; return; }
+    if (msg.type === 'result') {
+      var p = pending[msg.id];
+      delete pending[msg.id];
+      if (msg.error) log.innerHTML += '<span class="err">error: ' + msg.error + '</span>\n';
+      log.textContent += msg.output;
+      if (p) p(msg);
+    }
+  };
+
+  function run(argv) {
+    var id = nextId++;
+    log.innerHTML += '<span class="cmd">$ ' + argv.join(' ') + '</span>\n';
+    return new Promise(function (resolve) {
+      pending[id] = resolve;
+      worker.postMessage({ type: 'exec', id: id, argv: argv });
+    });
+  }
+  window.run = run;
+</script>
+</body>
+</html>

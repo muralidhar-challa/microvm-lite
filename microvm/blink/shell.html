@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <title>blink shell</title>
+    <script src="coi-serviceworker.js"></script>
+    <script src="xterm.min.js"></script>
+    <script src="xterm-addon-fit.min.js"></script>
+    <link rel="stylesheet" href="xterm.css"/>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      body {
+        background: #0d0d0d;
+        color: #e0e0e0;
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      #topbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 14px;
+        background: #161616;
+        border-bottom: 1px solid #2a2a2a;
+        flex-shrink: 0;
+      }
+
+      #topbar h1 {
+        font-size: 14px;
+        font-weight: 600;
+        color: #00ff88;
+        letter-spacing: 0.05em;
+      }
+
+      #status-pill {
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 10px;
+        background: #2a2a2a;
+        color: #888;
+      }
+      #status-pill.ready { background: #003322; color: #00ff88; }
+
+      #spinner-wrap { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #666; }
+      .spinner {
+        width: 14px; height: 14px;
+        border: 2px solid #333;
+        border-top-color: #00ff88;
+        border-radius: 50%;
+        animation: spin 0.7s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+
+      #main {
+        display: flex;
+        flex: 1;
+        overflow: hidden;
+      }
+
+      /* ── Terminal pane ── */
+      #terminal-pane {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        border-right: 1px solid #2a2a2a;
+      }
+
+      #terminal-pane-header {
+        padding: 6px 12px;
+        font-size: 11px;
+        color: #555;
+        background: #111;
+        border-bottom: 1px solid #1e1e1e;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      #terminal-container {
+        flex: 1;
+        overflow: hidden;
+        padding: 4px;
+        /* xterm.js needs explicit height; flex:1 gives it the space but xterm
+           must be told to fill via FitAddon */
+        min-height: 0;
+      }
+
+      #terminal-container .xterm {
+        height: 100%;
+      }
+
+      #terminal-container .xterm-viewport {
+        overflow-y: hidden !important;
+      }
+
+      /* ── File manager pane ── */
+      #fm-pane {
+        width: 320px;
+        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+        background: #111;
+        overflow: hidden;
+      }
+
+      #fm-header {
+        padding: 8px 12px;
+        font-size: 12px;
+        font-weight: 600;
+        color: #aaa;
+        border-bottom: 1px solid #1e1e1e;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      #fm-header .cwd { color: #00ff88; font-family: monospace; font-size: 11px; }
+
+      #fm-toolbar {
+        display: flex;
+        gap: 6px;
+        padding: 8px 10px;
+        border-bottom: 1px solid #1e1e1e;
+        flex-wrap: wrap;
+      }
+
+      .fm-btn {
+        font-size: 11px;
+        padding: 4px 10px;
+        border-radius: 4px;
+        border: 1px solid #2e2e2e;
+        background: #1a1a1a;
+        color: #ccc;
+        cursor: pointer;
+        transition: background 0.15s;
+      }
+      .fm-btn:hover { background: #252525; color: #fff; }
+      .fm-btn.primary { border-color: #00aa55; color: #00ff88; }
+      .fm-btn.primary:hover { background: #002211; }
+
+      #fm-drop-zone {
+        margin: 8px 10px;
+        border: 1px dashed #2a2a2a;
+        border-radius: 6px;
+        padding: 10px;
+        text-align: center;
+        font-size: 11px;
+        color: #555;
+        cursor: pointer;
+        transition: border-color 0.2s, color 0.2s;
+      }
+      #fm-drop-zone.drag-over { border-color: #00ff88; color: #00ff88; }
+      #fm-drop-zone input { display: none; }
+
+      #fm-file-list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 4px 0;
+      }
+
+      .fm-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 12px;
+        font-size: 12px;
+        font-family: monospace;
+        cursor: default;
+        border-bottom: 1px solid #171717;
+        transition: background 0.1s;
+      }
+      .fm-item:hover { background: #1a1a1a; }
+      .fm-item .icon { width: 14px; text-align: center; color: #555; font-style: normal; }
+      .fm-item .name { flex: 1; color: #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .fm-item .size { color: #555; font-size: 10px; flex-shrink: 0; }
+      .fm-item .dl-btn {
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 3px;
+        border: 1px solid #2a2a2a;
+        background: transparent;
+        color: #666;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.15s;
+      }
+      .fm-item:hover .dl-btn { opacity: 1; }
+      .fm-item .dl-btn:hover { color: #00ff88; border-color: #00ff88; }
+
+      .fm-empty { padding: 20px 12px; text-align: center; color: #333; font-size: 12px; }
+
+      /* scrollbar */
+      #fm-file-list::-webkit-scrollbar { width: 4px; }
+      #fm-file-list::-webkit-scrollbar-track { background: #111; }
+      #fm-file-list::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+      /* hide emscripten canvas junk */
+      #controls, #output, canvas, .emscripten, .emscripten_border,
+      .spinner-old, #progress { display: none !important; }
+    </style>
+  </head>
+  <body>
+
+    <!-- hidden emscripten elements it needs in the DOM -->
+    <div class="emscripten" id="status" style="display:none"></div>
+    <div class="emscripten_border" style="display:none">
+      <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex=-1></canvas>
+    </div>
+    <textarea id="output" rows="8" style="display:none"></textarea>
+
+    <div id="topbar">
+      <h1>⬡ blink shell</h1>
+      <div id="status-pill">loading...</div>
+      <div id="spinner-wrap"><div class="spinner"></div><span id="status-text">Downloading...</span></div>
+    </div>
+
+    <div id="main">
+
+      <!-- Terminal -->
+      <div id="terminal-pane">
+        <div id="terminal-pane-header">
+          <span style="color:#00ff88">●</span> shell
+          <span id="exec-label" style="color:#444; font-family:monospace; font-size:10px"></span>
+        </div>
+        <div id="terminal-container"></div>
+      </div>
+
+      <!-- File Manager -->
+      <div id="fm-pane">
+        <div id="fm-header">
+          <span>Files</span>
+          <span class="cwd" id="fm-cwd">/root</span>
+        </div>
+        <div id="fm-toolbar">
+          <button class="fm-btn primary" onclick="fmRefresh()">↻ Refresh</button>
+          <button class="fm-btn" onclick="fmUpload()">↑ Upload</button>
+          <button class="fm-btn" onclick="fmNewDir()">+ Dir</button>
+        </div>
+        <div id="fm-drop-zone" id="fm-drop">
+          <input type="file" id="fm-file-input" multiple onchange="fmHandleFiles(this.files)">
+          Drop files here or <u onclick="fmUpload()" style="cursor:pointer">browse</u>
+        </div>
+        <div id="fm-file-list">
+          <div class="fm-empty">No files yet</div>
+        </div>
+      </div>
+
+    </div>
+
+    <script type='text/javascript'>
+      // ── Status / spinner ──────────────────────────────────────────
+      var statusPill = document.getElementById('status-pill');
+      var statusText = document.getElementById('status-text');
+      var spinnerWrap = document.getElementById('spinner-wrap');
+
+      var stdinBuffer = [];
+      var stdinPipeMode = false; // when true, empty buffer = EOF not block
+      var fitAddon = new FitAddon.FitAddon();
+      var terminal = new Terminal({
+        cursorBlink: true,
+        fontSize: 13,
+        fontFamily: '"Cascadia Code", "Fira Code", monospace',
+        theme: { background: '#0d0d0d', foreground: '#e0e0e0', cursor: '#00ff88' }
+      });
+      terminal.loadAddon(fitAddon);
+
+      var smartQuoteMap = {"\u2018": "'", "\u2019": "'", "\u201c": "\"", "\u201d": "\""};
+
+      var Module = {
+        preRun: [function() {
+          // Set up dirs
+          FS.mkdir('/root');
+          FS.mkdir('/bin');
+
+          // Set environment before shell starts
+          ENV['HOME'] = '/root';
+          ENV['PATH'] = '/bin:/root';
+          ENV['PS1'] = '$ ';
+          ENV['TERM'] = 'xterm';
+
+          // Async-fetch busybox, block Module startup until done
+          addRunDependency('busybox-fetch');
+          fetch('busybox')
+            .then(function(r) { return r.arrayBuffer(); })
+            .then(function(buf) {
+              FS.writeFile('/bin/busybox', new Uint8Array(buf), {mode: 0o755});
+
+              // Copy busybox as each applet name — blink supports exec
+              var applets = ['sh','hush','ls','cat','sed','awk','grep','find','head','tail',
+                             'cp','mv','rm','mkdir','rmdir','touch','echo','printf',
+                             'wc','sort','uniq','cut','tr','xargs','env','pwd','id',
+                             'chmod','stat','du','df','diff','md5sum','tar','gzip','gunzip'];
+              applets.forEach(function(a) {
+                try { FS.writeFile('/bin/' + a, new Uint8Array(buf), {mode: 0o755}); } catch(e) {}
+              });
+              removeRunDependency('busybox-fetch');
+            })
+            .catch(function(e) {
+              console.warn('busybox fetch failed:', e);
+              removeRunDependency('busybox-fetch');
+            });
+
+          var ops = {
+            get_char: function(tty) {
+              if (stdinBuffer.length > 0) return stdinBuffer.shift();
+              return stdinPipeMode ? undefined : null; // pipe=EOF, interactive=block
+            },
+            put_char: function(tty, val) {
+              if (val === 10) {
+                terminal.write('\r\n');
+              } else {
+                terminal.write(new Uint8Array([val]));
+              }
+            },
+            flush: function(tty) {},
+            fsync: function(tty) {},
+            poll: function(tty) { return stdinBuffer.length > 0 ? 5 : 0; },
+          };
+          TTY.register(FS.makedev(5, 0), ops);
+          TTY.register(FS.makedev(6, 0), ops);
+          FS.devices[FS.makedev(5, 0)].stream_ops.poll = ops.poll;
+          FS.devices[FS.makedev(6, 0)].stream_ops.poll = ops.poll;
+        }],
+        postRun: [function() { moduleReady(); }],
+        canvas: document.getElementById('canvas'),
+        setStatus: function(text) {
+          if (!text) {
+            spinnerWrap.style.display = 'none';
+            return;
+          }
+          statusText.textContent = text;
+        },
+        totalDependencies: 0,
+        monitorRunDependencies: function(left) {
+          this.totalDependencies = Math.max(this.totalDependencies, left);
+          Module.setStatus(left ? 'Loading... (' + (this.totalDependencies - left) + '/' + this.totalDependencies + ')' : '');
+        }
+      };
+
+      window.onerror = function(event) {
+        Module.setStatus = function(text) { if (text) console.error('[post-exception status] ' + text); };
+      };
+    </script>
+    {{{ SCRIPT }}}
+    <script type='text/javascript'>
+
+      // ── Boot coordination ─────────────────────────────────────────
+      var execLabel = document.getElementById('exec-label');
+      var _moduleReadyResolve;
+      var moduleReadyPromise = new Promise(function(r) { _moduleReadyResolve = r; });
+      function moduleReady() { _moduleReadyResolve(); }
+
+      // ── JS REPL ───────────────────────────────────────────────────
+      // blink can't fork in WASM so there's no shell process.
+      // Instead we parse commands in JS and call Module.callMain per command.
+      // blink's exit() is overridden to _exit() so callMain can be called repeatedly.
+
+      var replCwd = '/root';
+      var replRunning = false;
+      var replLineBuffer = '';
+
+      // Simple tokenizer: handles single/double quotes and backslash escapes
+      function parseArgs(line) {
+        var args = [], cur = '', inS = false, inD = false;
+        for (var i = 0; i < line.length; i++) {
+          var c = line[i];
+          if (c === '\\' && i + 1 < line.length) { cur += line[++i]; continue; }
+          if (c === "'" && !inD) { inS = !inS; continue; }
+          if (c === '"' && !inS) { inD = !inD; continue; }
+          if (c === ' ' && !inS && !inD) {
+            if (cur) { args.push(cur); cur = ''; }
+          } else { cur += c; }
+        }
+        if (cur) args.push(cur);
+        return args;
+      }
+
+      // Expand ~ and simple $VAR (ENV only, no subshell)
+      var replEnv = { HOME: '/root', PATH: '/bin:/root', PS1: '$ ', TERM: 'xterm' };
+      function expandArg(a) {
+        if (a === '~' || a.startsWith('~/')) a = replEnv.HOME + a.slice(1);
+        a = a.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, function(_, n) { return replEnv[n] || ''; });
+        return a;
+      }
+
+      // Resolve a command name to a full path
+      function resolveCmd(cmd) {
+        if (cmd.startsWith('/') || cmd.startsWith('./') || cmd.startsWith('../')) return cmd;
+        var dirs = (replEnv.PATH || '/bin').split(':');
+        for (var i = 0; i < dirs.length; i++) {
+          var p = dirs[i] + '/' + cmd;
+          try { FS.stat(p); return p; } catch(e) {}
+        }
+        return null;
+      }
+
+      // Built-in: cd
+      function builtinCd(args) {
+        var target = args[1] ? expandArg(args[1]) : replEnv.HOME;
+        if (!target.startsWith('/')) target = replCwd + '/' + target;
+        try {
+          FS.chdir(target);
+          replCwd = FS.cwd();
+          execLabel.textContent = replCwd;
+        } catch(e) {
+          terminal.write('cd: ' + args[1] + ': No such file or directory\r\n');
+        }
+      }
+
+      // Built-in: export
+      function builtinExport(args) {
+        for (var i = 1; i < args.length; i++) {
+          var eq = args[i].indexOf('=');
+          if (eq >= 0) {
+            var k = args[i].slice(0, eq), v = args[i].slice(eq + 1);
+            replEnv[k] = v;
+            try { ENV[k] = v; } catch(e) {}
+          }
+        }
+      }
+
+      function showPrompt() {
+        var cwd = replCwd.replace(replEnv.HOME, '~');
+        terminal.write('\r\n\x1b[32m' + cwd + '\x1b[0m $ ');
+      }
+
+      // Split a command line on unquoted pipe characters
+      function splitPipes(line) {
+        var segments = [], cur = '', inS = false, inD = false;
+        for (var i = 0; i < line.length; i++) {
+          var c = line[i];
+          if (c === '\\' && i + 1 < line.length) { cur += c + line[++i]; continue; }
+          if (c === "'" && !inD) { inS = !inS; cur += c; continue; }
+          if (c === '"' && !inS) { inD = !inD; cur += c; continue; }
+          if (c === '|' && !inS && !inD) { segments.push(cur.trim()); cur = ''; }
+          else { cur += c; }
+        }
+        segments.push(cur.trim());
+        return segments.filter(function(s) { return s.length > 0; });
+      }
+
+      var pipeFile = '/.pipe_tmp';
+
+      // Run one command segment.
+      // stdinFile: path to read stdin from (null = interactive TTY)
+      // stdoutFile: path to write stdout to (null = terminal)
+      async function runSegment(line, stdinFile, stdoutFile) {
+        var args = parseArgs(line).map(expandArg);
+        if (!args.length) return;
+        var cmd = args[0];
+
+        // Built-ins
+        if (cmd === 'cd') { builtinCd(args); return; }
+        if (cmd === 'export' || cmd === 'set') { builtinExport(args); return; }
+        if (cmd === 'exit' || cmd === 'quit') { terminal.write('\r\n\x1b[33m[session ended]\x1b[0m\r\n'); return; }
+        if (cmd === 'clear') { terminal.write('\x1b[2J\x1b[H'); return; }
+        if (cmd === 'pwd') { terminal.write(replCwd + '\r\n'); return; }
+        if (cmd === 'help') {
+          terminal.write('Built-ins: cd, pwd, export, clear, exit\r\nPipes (|) supported.\r\n');
+          return;
+        }
+
+        var fullPath = resolveCmd(cmd);
+        if (!fullPath) { terminal.write(cmd + ': command not found\r\n'); return; }
+        args[0] = fullPath;
+
+        execLabel.textContent = cmd;
+        Object.keys(replEnv).forEach(function(k) { try { ENV[k] = replEnv[k]; } catch(e) {} });
+
+        // Wire stdin: load file bytes into stdinBuffer
+        stdinPipeMode = false;
+        if (stdinFile) {
+          stdinBuffer.length = 0;
+          try {
+            var bytes = FS.readFile(stdinFile);
+            for (var i = 0; i < bytes.length; i++) stdinBuffer.push(bytes[i]);
+          } catch(e) {}
+          stdinPipeMode = true; // empty buffer = EOF for this command
+        }
+
+        // Wire stdout: if capturing, swap put_char to write to a JS array then save to file
+        if (stdoutFile) {
+          // Redirect stdout/stderr by replacing fd 1 and 2 in the FS streams table
+          var outFd = FS.open(stdoutFile, 'w');
+          var savedStreams = { 1: FS.streams[1], 2: FS.streams[2] };
+          FS.streams[1] = outFd;
+          FS.streams[2] = outFd;
+          try { await Module.callMain(args); } catch(e) {}
+          finally {
+            FS.streams[1] = savedStreams[1];
+            FS.streams[2] = savedStreams[2];
+            FS.close(outFd);
+          }
+        } else {
+          try { await Module.callMain(args); } catch(e) {
+            terminal.write('\r\n\x1b[31m[error: ' + e.message + ']\x1b[0m\r\n');
+          }
+          // Reset stdin state after interactive command finishes
+          stdinBuffer.length = 0;
+          stdinPipeMode = false;
+        }
+      }
+
+      var ttyStream1 = null; // saved at first run, used to restore stdout
+      var ttyStream2 = null; // saved at first run, used to restore stderr
+
+      async function runCommand(line) {
+        line = line.trim();
+        stdinBuffer.length = 0;
+        stdinPipeMode = false;
+        // Restore stdout/stderr to TTY in case a previous pipe left them redirected
+        if (ttyStream1) FS.streams[1] = ttyStream1;
+        if (ttyStream2) FS.streams[2] = ttyStream2;
+        if (!line || line.startsWith('#')) { showPrompt(); return; }
+
+        var segments = splitPipes(line);
+
+        if (segments.length === 1) {
+          await runSegment(segments[0], null, null);
+        } else {
+          // Pipeline: use temp files to pass data between segments
+          var pipeId = Date.now();
+          var files = [];
+          for (var i = 0; i <= segments.length; i++) files.push('/.pipe' + pipeId + '_' + i);
+          for (var i = 0; i < segments.length; i++) {
+            var isLast = i === segments.length - 1;
+            var sin  = i === 0 ? null : files[i];
+            var sout = isLast  ? null : files[i + 1];
+            await runSegment(segments[i], sin, sout);
+            // Clean up input temp file immediately after use
+            if (sin) try { FS.unlink(sin); } catch(e) {}
+          }
+        }
+
+        stdinBuffer.length = 0;
+        stdinPipeMode = false;
+        execLabel.textContent = replCwd;
+        fmRefresh();
+        showPrompt();
+      }
+
+      // Wire terminal input to the REPL line editor
+      // (replaces the raw stdinBuffer passthrough for interactive use)
+      var replActive = false;
+      function activateRepl() {
+        replActive = true;
+        // Intercept onData: collect lines, run commands
+        terminal.onData(function(data) {
+          if (replRunning) {
+            // Forward to stdinBuffer for running command's stdin
+            for (var i = 0; i < data.length; i++) {
+              var c = data.charCodeAt(i);
+              if (c === 13) c = 10;
+              stdinBuffer.push(c);
+            }
+            return;
+          }
+          var isPaste = data.length > 1;
+          if (isPaste) {
+            // Paste: strip \r, display, append to line buffer — user hits Enter to run
+            var pasted = data.replace(/\r/g, '');
+            terminal.write(pasted);
+            replLineBuffer += pasted;
+            return;
+          }
+
+          for (var i = 0; i < data.length; i++) {
+            var ch = smartQuoteMap[data[i]] || data[i];
+            var c = ch.charCodeAt(0);
+            if (c === 13) { // Enter
+              replRunning = true;
+              terminal.write('\r\n');
+              var line = replLineBuffer;
+              replLineBuffer = '';
+              runCommand(line).finally(function() { replRunning = false; });
+            } else if (c === 127) { // Backspace
+              if (replLineBuffer.length > 0) {
+                replLineBuffer = replLineBuffer.slice(0, -1);
+                terminal.write('\b \b');
+              }
+            } else if (c === 3) { // Ctrl-C
+              stdinBuffer.push(3);
+              replLineBuffer = '';
+              terminal.write('^C');
+              showPrompt();
+            } else if (c === 4) { // Ctrl-D
+              stdinBuffer.push(4);
+            } else if (c >= 32) {
+              replLineBuffer += ch;
+              terminal.write(ch);
+            }
+          }
+        });
+      }
+
+      async function bootShell() {
+        await moduleReadyPromise;
+
+        statusPill.textContent = 'ready';
+        statusPill.className = 'ready';
+        spinnerWrap.style.display = 'none';
+
+        FS.chdir('/root');
+        ttyStream1 = FS.streams[1];
+        ttyStream2 = FS.streams[2];
+        fitAddon.fit();
+        fmRefresh();
+
+        terminal.write('\x1b[32mBlink shell ready\x1b[0m  (x86-64 · no fork · JS REPL)\r\n');
+        terminal.write('\x1b[90mUpload binaries via file manager, then run them here.\x1b[0m\r\n');
+
+        activateRepl();
+        showPrompt();
+      }
+
+      // ── Filesystem API ────────────────────────────────────────────
+      window.BlinkFS = {
+        writeFile: function(name, data, dir) {
+          dir = dir || '/root';
+          var bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+          FS.writeFile(dir + '/' + name, bytes, {encoding: 'binary', mode: 0o755});
+          fmRefresh();
+        },
+        readFile: function(path) {
+          return FS.readFile(path, {encoding: 'binary'});
+        },
+        downloadFile: function(path) {
+          var data = FS.readFile(path, {encoding: 'binary'});
+          var blob = new Blob([data]);
+          var a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = path.split('/').pop();
+          a.click();
+          URL.revokeObjectURL(a.href);
+        },
+        readdir: function(path) { return FS.readdir(path || '/root'); },
+      };
+
+      // ── File Manager ──────────────────────────────────────────────
+      var fmCwd = '/root';
+
+      function fmRefresh() {
+        var list = document.getElementById('fm-file-list');
+        document.getElementById('fm-cwd').textContent = fmCwd;
+        var entries;
+        try { entries = FS.readdir(fmCwd); } catch(e) { list.innerHTML = '<div class="fm-empty">Cannot read directory</div>'; return; }
+
+        entries = entries.filter(function(e) { return e !== '.' && e !== '..'; });
+        if (entries.length === 0) { list.innerHTML = '<div class="fm-empty">Empty directory</div>'; return; }
+
+        list.innerHTML = '';
+
+        // Add parent dir entry if not at root
+        if (fmCwd !== '/') {
+          var up = document.createElement('div');
+          up.className = 'fm-item';
+          up.innerHTML = '<i class="icon">↑</i><span class="name">..</span>';
+          up.onclick = function() { fmCwd = fmCwd.split('/').slice(0, -1).join('/') || '/'; fmRefresh(); };
+          list.appendChild(up);
+        }
+
+        entries.sort().forEach(function(name) {
+          var path = fmCwd + '/' + name;
+          var stat;
+          try { stat = FS.stat(path); } catch(e) { return; }
+          var isDir = FS.isDir(stat.mode);
+          var size = isDir ? '' : fmFmtSize(stat.size);
+
+          var item = document.createElement('div');
+          item.className = 'fm-item';
+          item.innerHTML =
+            '<i class="icon">' + (isDir ? '📁' : '📄') + '</i>' +
+            '<span class="name" title="' + name + '">' + name + '</span>' +
+            '<span class="size">' + size + '</span>' +
+            (!isDir ? '<button class="dl-btn" title="Download">↓</button>' : '');
+
+          if (isDir) {
+            item.style.cursor = 'pointer';
+            item.ondblclick = function() { fmCwd = path; fmRefresh(); };
+          } else {
+            item.querySelector('.dl-btn').onclick = function(e) {
+              e.stopPropagation();
+              BlinkFS.downloadFile(path);
+            };
+          }
+          list.appendChild(item);
+        });
+      }
+
+      function fmFmtSize(n) {
+        if (n < 1024) return n + 'B';
+        if (n < 1048576) return (n/1024).toFixed(1) + 'K';
+        return (n/1048576).toFixed(1) + 'M';
+      }
+
+      function fmUpload() { document.getElementById('fm-file-input').click(); }
+
+      function fmHandleFiles(files) {
+        Array.from(files).forEach(function(file) {
+          var reader = new FileReader();
+          reader.onload = function(e) {
+            BlinkFS.writeFile(file.name, e.target.result, fmCwd);
+            terminal.write('\r\n\x1b[33m[uploaded: ' + file.name + ' → ' + fmCwd + ']\x1b[0m\r\n');
+          };
+          reader.readAsArrayBuffer(file);
+        });
+        document.getElementById('fm-file-input').value = '';
+      }
+
+      function fmNewDir() {
+        var name = prompt('Directory name:');
+        if (!name) return;
+        try { FS.mkdir(fmCwd + '/' + name); } catch(e) { alert('Error: ' + e.message); }
+        fmRefresh();
+      }
+
+      // Drop zone
+      var dropZone = document.getElementById('fm-drop-zone');
+      dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.classList.add('drag-over'); });
+      dropZone.addEventListener('dragleave', function() { dropZone.classList.remove('drag-over'); });
+      dropZone.addEventListener('drop', function(e) {
+        e.preventDefault();
+        dropZone.classList.remove('drag-over');
+        fmHandleFiles(e.dataTransfer.files);
+      });
+
+      // Also allow dropping on the terminal pane
+      document.getElementById('terminal-pane').addEventListener('dragover', function(e) { e.preventDefault(); });
+      document.getElementById('terminal-pane').addEventListener('drop', function(e) {
+        e.preventDefault();
+        fmHandleFiles(e.dataTransfer.files);
+      });
+
+      // ── Init ──────────────────────────────────────────────────────
+      terminal.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+      window.addEventListener('resize', function() { fitAddon.fit(); });
+      bootShell();
+
+    </script>
+  </body>
+</html>
