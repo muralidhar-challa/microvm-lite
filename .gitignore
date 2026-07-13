@@ -17,3 +17,15 @@ microvm/test/blink.wasm
 microvm/test/busybox
 microvm/test/xtool
 microvm/test/probe
+
+# microvm M1: regenerable artifacts
+# native blink build (local test harness): (cd microvm/blink-native && ./configure && gmake -j8 o//blink/blink)
+microvm/blink-native/
+blink.log
+# poppler/sqlite closure — regen: bash microvm/binaries/build-rootfs.sh
+microvm/test/rootfs/
+# test PDFs (permit/item8 copied from v86 assets; text30 via microvm/test/gen-text-pdf.sh)
+microvm/test/*.pdf
+# guest-binary symlinks into blink-wasm/
+microvm/test/app
+microvm/test/runner

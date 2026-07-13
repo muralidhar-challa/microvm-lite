@@ -17,7 +17,16 @@ self.onunhandledrejection = function (e) {
 var _moduleReadyResolve;
 var moduleReadyPromise = new Promise(function (r) { _moduleReadyResolve = r; });
 
-var BINARIES = ["busybox", "xtool", "probe"];
+// Static binaries fetched into /bin (our Rust tools + busybox).
+var BINARIES = ["busybox", "xtool", "probe", "app", "runner"];
+// Dynamic poppler-utils + sqlite3 come from Alpine packages (rootfs/): binaries
+// into /bin, their shared-library closure + musl loader into /lib. blink runs
+// the ELF interpreter out of MEMFS just like a real rootfs.
+var ROOTFS_MANIFEST = "rootfs/manifest.json";
+// Seed files fetched into /workspace (test assets for the bench).
+// permit.pdf/item8.pdf are scanned (image) PDFs; text30.pdf is a 30-page
+// text-layer PDF for a fair pdftotext extraction benchmark.
+var SEED_FILES = ["permit.pdf", "item8.pdf", "text30.pdf"];
 var APPLETS = [
   "sh", "hush", "ls", "cat", "sed", "awk", "grep", "find", "head", "tail",
   "cp", "mv", "rm", "mkdir", "rmdir", "touch", "echo", "printf",
@@ -28,32 +37,59 @@ var APPLETS = [
 self.Module = {
   preRun: [
     function () {
-      FS.mkdir("/root");
-      FS.mkdir("/bin");
+      function mkdirp(p) {
+        try { FS.mkdir(p); } catch (e) { /* EEXIST */ }
+      }
+      mkdirp("/root");
+      mkdirp("/bin");
       ENV["HOME"] = "/root";
       ENV["PATH"] = "/bin:/root";
       ENV["TERM"] = "xterm";
 
-      BINARIES.forEach(function (name) {
-        addRunDependency("fetch-" + name);
-      });
-      BINARIES.forEach(function (name) {
-        fetch(name)
-          .then(function (r) { return r.arrayBuffer(); })
+      mkdirp("/home");
+      mkdirp("/workspace");
+      mkdirp("/lib");
+
+      function fetchInto(url, destPath, mode, applets) {
+        addRunDependency("fetch-" + destPath);
+        fetch(url)
+          .then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.arrayBuffer();
+          })
           .then(function (buf) {
-            FS.writeFile("/bin/" + name, new Uint8Array(buf), { mode: 0o755 });
-            if (name === "busybox") {
-              APPLETS.forEach(function (a) {
+            FS.writeFile(destPath, new Uint8Array(buf), { mode: mode });
+            if (applets) {
+              applets.forEach(function (a) {
                 try { FS.writeFile("/bin/" + a, new Uint8Array(buf), { mode: 0o755 }); } catch (e) {}
               });
             }
-            removeRunDependency("fetch-" + name);
+            removeRunDependency("fetch-" + destPath);
           })
           .catch(function (e) {
-            self.postMessage({ type: "dbg", text: "fetch " + name + " failed: " + e });
-            removeRunDependency("fetch-" + name);
+            self.postMessage({ type: "dbg", text: "fetch " + destPath + " skipped: " + e.message });
+            removeRunDependency("fetch-" + destPath);
           });
+      }
+
+      BINARIES.forEach(function (name) {
+        fetchInto(name, "/bin/" + name, 0o755, name === "busybox" ? APPLETS : null);
       });
+      SEED_FILES.forEach(function (name) { fetchInto(name, "/workspace/" + name, 0o644); });
+
+      // Dynamic poppler/sqlite rootfs (blocks ready until the closure is in MEMFS).
+      addRunDependency("fetch-rootfs");
+      fetch(ROOTFS_MANIFEST)
+        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(function (man) {
+          man.bin.forEach(function (f) { fetchInto("rootfs/bin/" + f, "/bin/" + f, 0o755); });
+          man.lib.forEach(function (f) { fetchInto("rootfs/lib/" + f, "/lib/" + f, 0o755); });
+          removeRunDependency("fetch-rootfs");
+        })
+        .catch(function (e) {
+          self.postMessage({ type: "dbg", text: "rootfs manifest skipped: " + e.message });
+          removeRunDependency("fetch-rootfs");
+        });
 
       // No terminal in a Worker — stdout/stderr default to a discard TTY;
       // exec() below redirects fd 1/2 to a real file for the duration of each call.
