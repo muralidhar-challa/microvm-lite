@@ -20,7 +20,10 @@
 // #define DISABLE_ROM
 #define DISABLE_BMI2
 
-// #define HAVE_FORK
+// HAVE_FORK registers the fork/vfork/execve/wait4 syscalls. Emscripten has no
+// host fork/execve/wait4, so blink/syscall.c's host-backed implementations are
+// overridden in the wasm build (see the __EMSCRIPTEN__ fork/exec/wait code).
+#define HAVE_FORK
 // #define HAVE_SYNC
 // #define HAVE_DUP3
 // #define HAVE_PIPE2
