@@ -24,6 +24,29 @@ fn main() {
             m.insert("k", 1);
             println!("hash-ok {}", m["k"]);
         }
+        "exec" => {
+            // Replace this process image with `probe out` via execve (no fork).
+            // Proves blink's in-process Exec() works when driven by a guest
+            // execve syscall, not just the initial program load.
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new("/bin/probe").arg("out").exec();
+            eprintln!("exec failed: {err}");
+            std::process::exit(1);
+        }
+        "spawn" => {
+            // fork+exec+wait via the standard library (the runner's `sh -c` path).
+            let out = std::process::Command::new("/bin/probe").arg("out").output();
+            match out {
+                Ok(o) => {
+                    print!("{}", String::from_utf8_lossy(&o.stdout));
+                    println!("spawn-exit={:?}", o.status.code());
+                }
+                Err(e) => {
+                    eprintln!("spawn failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => println!("probe-default"),
     }
 }
