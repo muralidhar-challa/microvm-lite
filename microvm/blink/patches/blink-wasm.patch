@@ -1,3 +1,104 @@
+diff --git a/blink/errno.c b/blink/errno.c
+index 8f7515e..ee6a351 100644
+--- a/blink/errno.c
++++ b/blink/errno.c
+@@ -35,6 +35,14 @@ long einval(void) {
+   return ReturnErrno(EINVAL);
+ }
+ 
++long echild(void) {
++  return ReturnErrno(ECHILD);
++}
++
++long enoexec(void) {
++  return ReturnErrno(ENOEXEC);
++}
++
+ long eagain(void) {
+   return ReturnErrno(EAGAIN);
+ }
+diff --git a/blink/errno.h b/blink/errno.h
+index 42d0955..378fe12 100644
+--- a/blink/errno.h
++++ b/blink/errno.h
+@@ -7,6 +7,8 @@ long efault(void);
+ void *efault0(void);
+ long eintr(void);
+ long einval(void);
++long echild(void);
++long enoexec(void);
+ long enfile(void);
+ long enoent(void);
+ long enomem(void);
+diff --git a/blink/machine.c b/blink/machine.c
+index ad309eb..b3de3df 100644
+--- a/blink/machine.c
++++ b/blink/machine.c
+@@ -2272,6 +2272,50 @@ void Blink(struct Machine *m) {
+   }
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// Like Blink(), but returns the guest exit code instead of exiting the process.
++// Used to run a forked/exec'd child machine to completion within the parent's
++// call stack (WebAssembly has no host fork). trapexit makes SysExitGroup halt
++// via kMachineExitTrap instead of calling exit(); see blink/syscall.c.
++int RunMachineUntilExit(struct Machine *m) {
++  int rc;
++  // Fork() (syscall.c) calls this NESTED, from inside the parent's own
++  // still-in-progress clone()/vfork() syscall dispatch — m->sysdepth already
++  // reflects THAT outer nesting level, and the OpSyscall frame waiting on
++  // Fork()'s return will do `unassert(--m->sysdepth >= 0)` once we return.
++  // The per-iteration reset below (copied from Blink()'s loop, correct for
++  // the single-top-level-machine case: after a signal/exit escapes Actor(m)
++  // via siglongjmp, sysdepth is a leftover mid-syscall value with no outer
++  // caller left to care) would clobber that outer nesting if left in place
++  // on our way out — so restore it right before returning.
++  int caller_sysdepth = m->sysdepth;
++  m->system->trapexit = true;
++  for (;;) {
++    if (!(rc = sigsetjmp(m->onhalt, 1))) {
++      m->canhalt = true;
++      Actor(m);
++    }
++    m->sysdepth = 0;
++    m->sigdepth = 0;
++    m->canhalt = false;
++    m->nofault = false;
++    m->insyscall = false;
++    CollectPageLocks(m);
++    CollectGarbage(m, 0);
++    if (IsMakingPath(m)) {
++      AbandonPath(m);
++    }
++    if (rc == kMachineExitTrap && m->system->exited) {
++      m->sysdepth = caller_sysdepth;
++      return m->system->exitcode & 255;
++    }
++    if (rc == kMachineFatalSystemSignal) {
++      HandleFatalSystemSignal(m, &g_siginfo);
++    }
++  }
++}
++#endif
++
+ void HandleFatalSystemSignal(struct Machine *m, const siginfo_t *si) {
+   int sig;
+   RestoreIp(m);
+diff --git a/blink/machine.h b/blink/machine.h
+index be17a8a..4af5a3c 100644
+--- a/blink/machine.h
++++ b/blink/machine.h
+@@ -466,6 +466,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
+ i64 AreAllPagesUnlocked(struct System *) nosideeffect;
+ bool IsOrphan(struct Machine *) nosideeffect;
+ _Noreturn void Blink(struct Machine *);
++#ifdef __EMSCRIPTEN__
++int RunMachineUntilExit(struct Machine *);
++#endif
+ _Noreturn void Actor(struct Machine *);
+ void Jitter(P, const char *, ...);
+ void FreeMachine(struct Machine *);
 diff --git a/blink/realpath.c b/blink/realpath.c
 index 8999ef5..be3c087 100644
 --- a/blink/realpath.c
@@ -11,7 +112,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..f5e8204 100644
+index 34cc01c..ff7467f 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -159,8 +159,8 @@ int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
@@ -25,3 +126,232 @@ index 34cc01c..f5e8204 100644
      struct pollfd pfd;
      pfd.fd = fd;
      pfd.events = POLLIN;
+@@ -399,6 +399,7 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
+ #endif
+ }
+ 
++#ifndef __EMSCRIPTEN__
+ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
+   int pid, newpid = 0;
+   _Atomic(int) *ctid_ptr;
+@@ -483,6 +484,116 @@ static int SysVfork(struct Machine *m) {
+   // TODO: Parent should be stopped while child is running.
+   return SysFork(m);
+ }
++#else /* __EMSCRIPTEN__ */
++// ── wasm process model ──────────────────────────────────────────────────────
++//
++// WebAssembly has no host fork()/execve()/wait4(). We emulate the vfork()
++// contract — which is what busybox hush (NOMMU build) and musl's posix_spawn
++// (which is what Rust's std::process::Command uses, see SysClone's
++// IsForkOrVfork check) actually call — using plain recursive C calls, since
++// vfork()'s real semantics (child temporarily shares the parent's address
++// space; parent is suspended until the child execve()s or exits) map directly
++// onto "run the child to completion, in place, before returning to the
++// parent's syscall site":
++//
++//   1. Fork() sets ax=0 (the child's view of vfork()'s return value) on the
++//      SAME Machine `m` — no new Machine/System is created, matching real
++//      vfork()'s shared address space — then runs it via RunMachineUntilExit
++//      until it calls _exit()/exit_group() (already wired through blink's
++//      existing trapexit+kMachineExitTrap mechanism — see SysExitGroup).
++//   2. If the child calls execve() first (the overwhelmingly common case),
++//      SysExecve (below) replaces `m`'s loaded program IN PLACE (wipe virtual
++//      memory, load the new ELF, reset registers to its entry point) and
++//      returns normally — the interpreter just continues fetching
++//      instructions at the new m->ip, no unwind needed. It then runs to
++//      completion and calls exit_group like any program.
++//   3. Fork() returns the synthesized child pid — OpSyscall writes it to
++//      m->ax, so the ORIGINAL vfork() call site (now resumed as the parent)
++//      sees the correct return value with m->ip already past the syscall.
++//   4. The child's exit status is stashed keyed by pid; SysWait4 (below)
++//      looks it up instead of calling a host wait4()/waitpid() that doesn't
++//      exist for these synthetic pids.
++//
++// Limitation: this does NOT support true fork() (independent, concurrently-
++// running address spaces) — only the fork-then-immediately-exec-or-exit
++// pattern. That covers every case in our guest toolset (busybox hush, the
++// `runner` binary's `sh -c`, Rust's Command). A real fork() followed by both
++// parent and child continuing to run concurrently would hang (the "parent"
++// doesn't resume until the "child" exits/execs).
++
++#define EM_MAX_CHILDREN 64
++static struct {
++  int pid;
++  int status;
++  bool used;
++} g_em_children[EM_MAX_CHILDREN];
++
++static void EmStashChildStatus(int pid, int exitcode) {
++  int i;
++  for (i = 0; i < EM_MAX_CHILDREN; ++i) {
++    if (!g_em_children[i].used) {
++      g_em_children[i].used = true;
++      g_em_children[i].pid = pid;
++      g_em_children[i].status = (exitcode & 255) << 8;  // WIFEXITED encoding
++      return;
++    }
++  }
++  LOGF("too many pending vfork children awaiting wait4()");
++}
++
++// Finds and consumes (removes) a stashed child status. wpid<=0 matches any.
++// Returns the matched pid, or -1 if none found.
++static int EmReapChildStatus(int wpid, int *out_status) {
++  int i;
++  for (i = 0; i < EM_MAX_CHILDREN; ++i) {
++    if (g_em_children[i].used &&
++        (wpid <= 0 || g_em_children[i].pid == wpid)) {
++      int found_pid = g_em_children[i].pid;
++      *out_status = g_em_children[i].status;
++      g_em_children[i].used = false;
++      return found_pid;
++    }
++  }
++  return -1;
++}
++
++static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
++  static int next_pid = 1000;
++  int child_pid, rc;
++  u64 parent_sp;
++  (void)flags;
++  (void)ctid;
++  child_pid = ++next_pid;
++  Put64(m->ax, 0);  // child's view of fork()/vfork()/clone()'s return value
++  // Raw vfork()/fork() (stack==0, e.g. busybox hush NOMMU) implicitly shares
++  // the parent's stack in place — leave m->sp untouched. But musl's
++  // posix_spawn (what Rust's std::process::Command uses) calls
++  // clone(CLONE_VM|CLONE_VFORK, explicit_stack, ...) with its OWN small
++  // trampoline stack specifically so the child does NOT touch the parent's
++  // stack; ignoring `stack` here — as if it were plain vfork — corrupts the
++  // child's execution (it runs on the parent's live stack instead of the
++  // buffer musl set aside), which is exactly what real vfork() would never
++  // do for a clone() call that supplies an explicit stack.
++  parent_sp = Get64(m->sp);
++  if (stack) {
++    Put64(m->sp, stack);
++  }
++  rc = RunMachineUntilExit(m);
++  Put64(m->sp, parent_sp);  // restore — the parent resumes on ITS OWN stack
++  EmStashChildStatus(child_pid, rc);
++  THR_LOGF("pid=%d Fork (wasm, run-to-completion) -> child_pid=%d exit=%d",
++           m->system->pid, child_pid, rc);
++  return child_pid;  // OpSyscall writes this to m->ax for the resumed parent
++}
++
++static int SysFork(struct Machine *m) {
++  return Fork(m, 0, 0, 0);
++}
++
++static int SysVfork(struct Machine *m) {
++  return Fork(m, 0, 0, 0);
++}
++#endif /* __EMSCRIPTEN__ */
+ 
+ static void *OnSpawn(void *arg) {
+   int rc;
+@@ -3526,6 +3637,7 @@ static void ResetSignalDispositions(struct System *s) {
+   UNLOCK(&s->sig_lock);
+ }
+ 
++#ifndef __EMSCRIPTEN__
+ static void ExecveBlink(struct Machine *m, char *prog, char **argv,
+                         char **envp) {
+   char *execfn;
+@@ -3627,6 +3739,95 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+   }
+   return rc;
+ }
++#else /* __EMSCRIPTEN__ */
++// In-place execve(): no new Machine/System is created (unlike native Exec()).
++// This SAME Machine keeps its onhalt jmpbuf, fds, rlimits — only its virtual
++// memory is wiped and reloaded with the new program, and registers reset to
++// its entry point by LoadProgram. Since we never leave this call via longjmp,
++// returning normally is correct: the interpreter's next instruction fetch
++// naturally picks up m->ip at the new program's entry, continuing execution
++// as "the new program" with no unwind needed — whether this machine is
++// currently a vfork "child" (see Fork() above) or the top-level program
++// calling execve() directly.
++//
++// Known simplification vs. real execve(): custom (non-default, non-SIG_IGN)
++// signal handlers are reset via ResetSignalDispositions like native blink,
++// but blink's own SIG_IGN-preservation step (see Exec()'s old-branch in
++// blink.c, needed there because that path builds a fresh System) is not
++// replicated — it's a no-op here anyway since we never touch s->hands.
++static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
++  char *prog, **argv, **envp;
++  sigset_t block;
++  if (!(prog = CopyStr(m, pa))) return -1;
++  if (!(argv = CopyStrList(m, aa))) return -1;
++  if (!(envp = CopyStrList(m, ea))) return -1;
++  LOCK(&m->system->exec_lock);
++  sigfillset(&block);
++  unassert(!pthread_sigmask(SIG_BLOCK, &block, &m->system->exec_sigmask));
++  if (!CanEmulateExecutable(m, &prog, &argv)) {
++    unassert(!pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0));
++    UNLOCK(&m->system->exec_lock);
++    return enoexec();
++  }
++  // point of no return: prog/argv/envp are on the freelist, m->ip is about to
++  // be replaced by LoadProgram — nothing below may fail out to a caller that
++  // expects the OLD program's state.
++  //
++  // Native blink zeroes m->sysdepth here before flushing page locks (forces
++  // CollectPageLocks to release everything, regardless of nesting) — safe
++  // there because _Exit() immediately follows. We don't die: OpSyscall is
++  // still going to run `unassert(--m->sysdepth >= 0)` when THIS execve()
++  // syscall dispatch returns, and LoadProgram's own memory operations need
++  // sysdepth>0 (see RecordPageLock) — so restore it right after the flush.
++  {
++    int saved_sysdepth = m->sysdepth;
++    m->sysdepth = 0;
++    CollectPageLocks(m);
++    m->sysdepth = saved_sysdepth;
++  }
++  SYS_LOGF("execve(%s) [in-place, wasm]", prog);
++  SysCloseExec(m->system);
++  ResetTimerDispositions(m->system);
++  ResetSignalDispositions(m->system);
++  unassert(!FreeVirtual(m->system, -0x800000000000, 0x1000000000000));
++  LoadProgram(m, prog, prog, argv, envp, NULL);
++  unassert(!pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0));
++  UNLOCK(&m->system->exec_lock);
++  return 0;  // never observed: the interpreter resumes at the new m->ip
++}
++
++// No host wait4()/waitpid() exists for our synthesized pids — Fork() (above)
++// already ran every child to completion and stashed its exit status.
++static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
++                    int options, i64 opt_out_rusage_addr) {
++  int rc, status;
++  u8 gwstatusb[4];
++  struct rusage_linux grusage;
++  if ((options = XlatWait(options)) == -1) return -1;
++  if ((opt_out_wstatus_addr && !IsValidMemory(m, opt_out_wstatus_addr,
++                                              sizeof(gwstatusb), PROT_WRITE)) ||
++      (opt_out_rusage_addr &&
++       !IsValidMemory(m, opt_out_rusage_addr, sizeof(grusage), PROT_WRITE))) {
++    return -1;
++  }
++  rc = EmReapChildStatus(pid, &status);
++  if (rc == -1) {
++    // Fork() runs children synchronously before returning, so a matching
++    // status should always be waiting unless the caller passes a pid we
++    // never spawned, or calls wait() twice for the same child.
++    return echild();
++  }
++  if (opt_out_wstatus_addr) {
++    Write32(gwstatusb, status);
++    CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
++  }
++  if (opt_out_rusage_addr) {
++    memset(&grusage, 0, sizeof(grusage));
++    CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
++  }
++  return rc;
++}
++#endif /* __EMSCRIPTEN__ */
+ 
+ static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
+   int rc;
