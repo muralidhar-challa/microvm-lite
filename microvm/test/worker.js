@@ -157,10 +157,14 @@ async function exec(argv) {
   FS.streams[2] = outFd;
   var error = null;
   var exitCode = null;
+  var blinkLog = null;
   try {
     exitCode = await callMainAsync(["blink"].concat(argv));
   } catch (e) {
-    error = e && e.message ? e.message : String(e);
+    error = (e && e.name ? e.name + ": " : "") + (e && e.stack ? e.stack : (e && e.message ? e.message : String(e)));
+    // On abort (fatal wasm trap), the module dies — no further calls can
+    // read this. MEMFS is JS-side, so it may still be readable right here.
+    try { blinkLog = new TextDecoder().decode(FS.readFile("/blink.log")); } catch (e2) {}
   } finally {
     FS.streams[1] = saved[1];
     FS.streams[2] = saved[2];
@@ -171,7 +175,10 @@ async function exec(argv) {
     output = new TextDecoder().decode(FS.readFile(outPath));
   } catch (e) {}
   try { FS.unlink(outPath); } catch (e) {}
-  return { output: output, error: error, exitCode: exitCode };
+  if (blinkLog === null) {
+    try { blinkLog = new TextDecoder().decode(FS.readFile("/blink.log")); } catch (e) {}
+  }
+  return { output: output, error: error, exitCode: exitCode, blinkLog: blinkLog };
 }
 
 self.onmessage = async function (ev) {
@@ -184,7 +191,7 @@ self.onmessage = async function (ev) {
       ? ["/bin/" + msg.argv[0]].concat(msg.argv.slice(1))
       : msg.argv;
     var r = await exec(argv);
-    self.postMessage({ type: "result", id: msg.id, output: r.output, error: r.error, exitCode: r.exitCode });
+    self.postMessage({ type: "result", id: msg.id, output: r.output, error: r.error, exitCode: r.exitCode, blinkLog: r.blinkLog });
   }
 };
 

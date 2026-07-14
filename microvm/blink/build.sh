@@ -27,8 +27,11 @@ fi
 # ── 2. Apply patches ─────────────────────────────────────────────────────────
 echo "[2/5] Applying patches..."
 cd "$SRC_DIR"
-# Reset any previous patches before applying
-git checkout blink/syscall.c blink/realpath.c 2>/dev/null || true
+# Reset every file blink-wasm.patch touches before applying — keeps reruns
+# idempotent. Must list every file the patch modifies (git apply is not
+# idempotent against a dirty tree); add new ones here when the patch grows.
+git checkout blink/errno.c blink/errno.h blink/machine.c blink/machine.h \
+            blink/realpath.c blink/syscall.c 2>/dev/null || true
 git apply "$BLINK_DIR/patches/blink-wasm.patch"
 
 # ── 3. Copy our shell template and build config ──────────────────────────────
@@ -51,7 +54,6 @@ emcc \
   "$BLINK_DIR/stubs.c" \
   -I. -I"$BLINK_DIR" \
   -o "$OUT_DIR/blink.js" \
-  -DNDEBUG \
   "-DBUILD_MODE=\"wasm\"" "-DBUILD_TOOLCHAIN=\"emcc\"" \
   "-DBLINK_COMMITS=\"0\"" "-DBLINK_GITSHA=\"local\"" \
   "-DBUILD_TIMESTAMP=\"now\"" "-DCONFIG_ARGUMENTS=\"\"" \
@@ -61,6 +63,7 @@ emcc \
   -s EXPORTED_FUNCTIONS='["_main","_malloc","_free","_em_reset_getopt","_em_main","_em_last_exit"]' \
   -s INVOKE_RUN=0 -s EXIT_RUNTIME=0 -s FORCE_FILESYSTEM=1 \
   -s ASYNCIFY -s ASYNCIFY_IMPORTS='["emscripten_sleep"]' \
+  -s ASSERTIONS=2 \
   -sUSE_ZLIB=1
 
 # ── 5. Build busybox (NOMMU + hush) ──────────────────────────────────────────

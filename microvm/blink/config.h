@@ -7,7 +7,12 @@
 #define DISABLE_SOCKETS
 #define DISABLE_OVERLAYS
 #define DISABLE_VFS
-#define DISABLE_NONPOSIX
+// DISABLE_NONPOSIX is a size-optimization knob, not a safety boundary — but
+// it ALSO guards the vfork() syscall table entry specifically (see
+// syscall.c's #ifdef HAVE_FORK / #ifndef DISABLE_NONPOSIX nesting around
+// SYSCALL(0x03A,"vfork",...)). busybox's NOMMU hush build calls vfork()
+// directly (not fork()/clone()), so this must stay OFF for M2's shell.
+// #define DISABLE_NONPOSIX
 #define DISABLE_ANCILLARY
 // #define DISABLE_DISASSEMBLER
 // #define DISABLE_BACKTRACE
