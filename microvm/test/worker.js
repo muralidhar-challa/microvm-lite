@@ -17,6 +17,9 @@ self.onunhandledrejection = function (e) {
 var _moduleReadyResolve;
 var moduleReadyPromise = new Promise(function (r) { _moduleReadyResolve = r; });
 
+// Monotonic id for per-run capture files.
+var _runSeq = 0;
+
 // Static binaries fetched into /bin (our Rust tools + busybox).
 var BINARIES = ["busybox", "xtool", "probe", "app", "runner"];
 // Dynamic poppler-utils + sqlite3 come from Alpine packages (rootfs/): binaries
@@ -91,8 +94,14 @@ self.Module = {
           removeRunDependency("fetch-rootfs");
         });
 
-      // No terminal in a Worker — stdout/stderr default to a discard TTY;
-      // exec() below redirects fd 1/2 to a real file for the duration of each call.
+      // Keep the stdout/stderr TTY devices registered (so /dev/stdout,
+      // /dev/stderr exist) but discard — real capture happens by redirecting
+      // the guest's fd 1/2 to MEMFS files per run (see exec()). We do NOT
+      // capture via put_char: a forking command's dup2(pipe,1) runs on blink's
+      // single shared Emscripten fd table and destroys the TTY device binding,
+      // which can't be revived, so put_char capture breaks after the first fork.
+      // File streams have no such device-callback fragility, and bytes persist
+      // in the MEMFS node regardless of later fd surgery.
       var ops = {
         get_char: function () { return null; },
         put_char: function () {},
@@ -150,11 +159,20 @@ async function callMainAsync(args) {
 }
 
 async function exec(argv) {
-  var outPath = "/tmp/out-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-  var outFd = FS.open(outPath, "w");
-  var saved = { 1: FS.streams[1], 2: FS.streams[2] };
-  FS.streams[1] = outFd;
-  FS.streams[2] = outFd;
+  // Capture stdout+stderr by pointing the guest's fd 1/2 at fresh MEMFS files.
+  // guest fd 1 → host fd 1 (blink's AddStdFd) → these file streams; the bytes
+  // persist in the MEMFS node during the run, so any fd surgery blink does for
+  // vfork isolation can't lose them, and a fresh file per run means nothing
+  // leaks across commands. fd 1 and fd 2 get SEPARATE stream objects (never the
+  // same object aliased to both — that double-closed and wedged the module).
+  var id = ++_runSeq;
+  var outPath = "/tmp/.stdout." + id;
+  var errPath = "/tmp/.stderr." + id;
+  var outStream = FS.open(outPath, "w+");
+  var errStream = FS.open(errPath, "w+");
+  FS.streams[1] = outStream;
+  FS.streams[2] = errStream;
+
   var error = null;
   var exitCode = null;
   var blinkLog = null;
@@ -162,22 +180,14 @@ async function exec(argv) {
     exitCode = await callMainAsync(["blink"].concat(argv));
   } catch (e) {
     error = (e && e.name ? e.name + ": " : "") + (e && e.stack ? e.stack : (e && e.message ? e.message : String(e)));
-    // On abort (fatal wasm trap), the module dies — no further calls can
-    // read this. MEMFS is JS-side, so it may still be readable right here.
-    try { blinkLog = new TextDecoder().decode(FS.readFile("/blink.log")); } catch (e2) {}
-  } finally {
-    FS.streams[1] = saved[1];
-    FS.streams[2] = saved[2];
-    FS.close(outFd);
   }
+
   var output = "";
-  try {
-    output = new TextDecoder().decode(FS.readFile(outPath));
-  } catch (e) {}
+  try { output += new TextDecoder().decode(FS.readFile(outPath)); } catch (e) {}
+  try { output += new TextDecoder().decode(FS.readFile(errPath)); } catch (e) {}
   try { FS.unlink(outPath); } catch (e) {}
-  if (blinkLog === null) {
-    try { blinkLog = new TextDecoder().decode(FS.readFile("/blink.log")); } catch (e) {}
-  }
+  try { FS.unlink(errPath); } catch (e) {}
+  try { blinkLog = new TextDecoder().decode(FS.readFile("/blink.log")); } catch (e) {}
   return { output: output, error: error, exitCode: exitCode, blinkLog: blinkLog };
 }
 
