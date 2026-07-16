@@ -48,7 +48,7 @@ PY
 echo "[3/4] Hash + emit manifest.json"
 # BusyBox applets that share the single busybox binary (symlink targets in the
 # guest FS). Kept here so the worker installs them without a second fetch.
-APPLETS='["sh","hush","ls","cat","sed","awk","grep","find","head","tail","cp","mv","rm","mkdir","rmdir","touch","echo","printf","wc","sort","uniq","cut","tr","xargs","env","pwd","id","wget","chmod","stat","du","df","diff","md5sum","tar","gzip","gunzip","base64"]'
+APPLETS='["sh","hush","ls","cat","sed","awk","grep","find","head","tail","cp","mv","rm","mkdir","rmdir","touch","echo","printf","wc","sort","uniq","cut","tr","xargs","env","pwd","id","wget","chmod","stat","du","df","diff","md5sum","tar","gzip","gunzip","base64","sleep","seq","yes","date","sync","kill","true","false"]'
 
 python3 - "$OUT" "$ROOTFS" "$APPLETS" <<'PY'
 import json, hashlib, os, sys

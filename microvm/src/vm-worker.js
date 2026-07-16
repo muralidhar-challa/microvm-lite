@@ -40,6 +40,7 @@ var APPLETS = [
   "cp", "mv", "rm", "mkdir", "rmdir", "touch", "echo", "printf",
   "wc", "sort", "uniq", "cut", "tr", "xargs", "env", "pwd", "id", "wget",
   "chmod", "stat", "du", "df", "diff", "md5sum", "tar", "gzip", "gunzip", "base64",
+  "sleep", "seq", "yes", "date", "sync", "kill", "true", "false",
 ];
 
 // M5: the dist manifest (fetched in `init` before blink loads). When present it
