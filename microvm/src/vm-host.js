@@ -236,6 +236,8 @@ async function _doStartVM() {
       return new TextDecoder().decode(buf).replace(/\0+$/, "");
     },
     readFileRaw: async (path) => _call({ type: "read_file", path }),
+    // Diagnostic: wasm heap size + /tmp residue for long-session monitoring.
+    _stat: () => _call({ type: "stat" }),
     resetToFresh: async () => {
       await idbDelete("snapshot").catch(() => {});
       if (_worker) _worker.terminate();
