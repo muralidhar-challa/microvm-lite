@@ -1,0 +1,154 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>microvm-lite — console</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b0e14; color: #cdd6f4; height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 8px 14px; background: #11151f; border-bottom: 1px solid #222838; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  header .title { font-weight: 600; color: #89b4fa; }
+  header .status { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #1e2436; }
+  header .status.ready { background: #1b3a2b; color: #a6e3a1; }
+  header .status.boot { background: #3a2f1b; color: #f9e2af; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chips button { font: inherit; font-size: 11px; background: #1e2436; color: #cdd6f4; border: 1px solid #2a3350; border-radius: 6px; padding: 3px 8px; cursor: pointer; }
+  .chips button:hover { background: #2a3350; }
+  #scrollback { flex: 1; overflow-y: auto; padding: 12px 14px; white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.45; }
+  .cmd { color: #89b4fa; }
+  .cmd::before { content: "$ "; color: #6c7086; }
+  .out { color: #cdd6f4; }
+  .err { color: #f38ba8; }
+  .sys { color: #6c7086; font-style: italic; }
+  .inputrow { display: flex; border-top: 1px solid #222838; background: #11151f; }
+  .inputrow .prompt { padding: 10px 6px 10px 14px; color: #6c7086; }
+  #input { flex: 1; background: transparent; border: 0; outline: 0; color: #cdd6f4; font: inherit; font-size: 13px; padding: 10px 14px 10px 0; }
+  #input:disabled { opacity: .5; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="title">microvm-lite</span>
+    <span id="status" class="status boot">booting…</span>
+    <span class="chips" id="examples"></span>
+  </header>
+  <div id="scrollback"></div>
+  <div class="inputrow">
+    <span class="prompt">app@microvm:~$</span>
+    <input id="input" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="type a command and press Enter (try: help)" disabled>
+  </div>
+
+<script type="module">
+  import { startVM } from "./vm-host.js";
+  window.__vmDebug = false;
+
+  const sb = document.getElementById("scrollback");
+  const input = document.getElementById("input");
+  const statusEl = document.getElementById("status");
+  const history = [];
+  let hix = 0;
+
+  function line(text, cls) {
+    const div = document.createElement("div");
+    div.className = cls || "out";
+    div.textContent = text;
+    sb.appendChild(div);
+    sb.scrollTop = sb.scrollHeight;
+  }
+
+  const EXAMPLES = [
+    "ls -la", "xtool ping", "cat /etc/hosts",
+    "sqlite3 /tmp/d.db 'create table t(x); insert into t values(1),(2),(3); select count(*),sum(x) from t;'",
+    "rm -f /tmp/d.db; sqlite3 /tmp/d.db 'select 42;'",
+    "pdftotext sample.pdf - | head -20",
+    "for i in 1 2 3; do echo row$i; done",
+    "app queries --filter permit",
+  ];
+  const ex = document.getElementById("examples");
+  EXAMPLES.forEach(c => {
+    const b = document.createElement("button");
+    b.textContent = c.length > 34 ? c.slice(0, 32) + "…" : c;
+    b.title = c;
+    b.onclick = () => { input.value = c; input.focus(); };
+    ex.appendChild(b);
+  });
+
+  // ── Mock host endpoints so app/llm/done don't hang without a backend ──
+  // Clearly labelled: these are canned, not a real app/LLM.
+  function installMocks() {
+    if (typeof window.registerVmEndpoint !== "function") return setTimeout(installMocks, 20);
+    window.registerVmEndpoint("/ListQueries", (_m, d) => ({
+      queries: [{ query_id: 101, name: "Permit Lookup (mock)", description: "canned mock row — no real app backend" }],
+      total: 1, note: "MOCK",
+    }));
+    window.registerVmEndpoint("/anthropic/v1/messages", () => ({
+      content: [{ type: "text", text: "(mock LLM) no real model is wired in this local session." }],
+      stop_reason: "end_turn",
+    }));
+    window.registerVmEndpoint("/done", () => ({ ok: true }));
+  }
+
+  const HELP = [
+    "Local microvm-lite session (blink backend, packaged dist).",
+    "",
+    "Works offline:  shell/coreutils, xtool, sqlite3, poppler (pdftotext/pdfinfo — lazy-",
+    "                loaded on first use), file ops. Type any sh command.",
+    "Mocked:         api.vm / llm.vm / done.vm return CANNED data (no real backend).",
+    "Commands:       help · clear · examples are the chips up top.",
+    "Note:           each command runs to completion (no backgrounding) — a hung",
+    "                command will block the session (that's the known limitation).",
+  ].join("\n");
+
+  async function run(cmd) {
+    line(cmd, "cmd");
+    if (cmd === "clear") { sb.innerHTML = ""; return; }
+    if (cmd === "help") { line(HELP, "sys"); return; }
+    input.disabled = true;
+    const t0 = performance.now();
+    try {
+      const out = await window.vm.execute(cmd, 60000);
+      if (out && out.length) line(out, "out");
+      line(`  [${Math.round(performance.now() - t0)} ms]`, "sys");
+    } catch (e) {
+      line("error: " + (e && e.message || e), "err");
+    } finally {
+      input.disabled = false;
+      input.focus();
+    }
+  }
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const cmd = input.value.trim();
+      if (!cmd) return;
+      history.push(cmd); hix = history.length;
+      input.value = "";
+      run(cmd);
+    } else if (e.key === "ArrowUp") {
+      if (hix > 0) { hix--; input.value = history[hix]; e.preventDefault(); }
+    } else if (e.key === "ArrowDown") {
+      if (hix < history.length - 1) { hix++; input.value = history[hix]; }
+      else { hix = history.length; input.value = ""; }
+    }
+  });
+
+  (async () => {
+    line("booting blink microvm… (fetching ~10MB core; poppler loads lazily on first PDF)", "sys");
+    // await startVM: it installs window.vm + registerVmEndpoint and posts init,
+    // THEN we register mocks and wait for the worker's ready signal.
+    await startVM({ cdnBase: "/dist", workerUrl: "/dist/vm-worker.js", vmRoutes: {} });
+    installMocks();
+    await window.vm.ready();
+    // Seed a sample PDF for pdftotext, if the test asset is reachable.
+    try {
+      const r = await fetch("/test/text30.pdf");
+      if (r.ok) { await window.vm.writeFile("/workspace/sample.pdf", await r.arrayBuffer()); }
+    } catch {}
+    statusEl.textContent = "ready"; statusEl.className = "status ready";
+    input.disabled = false; input.focus();
+    line("ready. type 'help', or click an example chip above.", "sys");
+  })();
+</script>
+</body>
+</html>
