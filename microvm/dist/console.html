@@ -63,6 +63,7 @@
     "rm -f /tmp/d.db; sqlite3 /tmp/d.db 'select 42;'",
     "pdftotext sample.pdf - | head -20",
     "for i in 1 2 3; do echo row$i; done",
+    "run echo start; sleep 2; echo end",
     "app queries --filter permit",
   ];
   const ex = document.getElementById("examples");
@@ -95,15 +96,51 @@
     "Works offline:  shell/coreutils, xtool, sqlite3, poppler (pdftotext/pdfinfo — lazy-",
     "                loaded on first use), file ops. Type any sh command.",
     "Mocked:         api.vm / llm.vm / done.vm return CANNED data (no real backend).",
-    "Commands:       help · clear · examples are the chips up top.",
-    "Note:           each command runs to completion (no backgrounding) — a hung",
-    "                command will block the session (that's the known limitation).",
+    "Builtins:       help · clear",
+    "  run <cmd>     run via the BACKGROUND-RUN contract (window.vm.run — the path",
+    "                wasm-bridge.ts uses for run_shell_command). Shows the returned",
+    "                {done, output_file, pid} plus the captured output. Because blink",
+    "                runs to completion, done is always true here (v86 would return",
+    "                done:false + a live pid on timeout — the known divergence).",
+    "  <cmd>         run via window.vm.execute() — blocking, returns the string.",
+    "Note:           each command runs to completion (no backgrounding/kill) — a hung",
+    "                command will block the session (reload the page to recover).",
   ].join("\n");
+
+  // vm.run: the {done, output_file, pid, output} background-run contract that
+  // SQL_Chat's run_shell_command tool calls. Same command surface as the plain
+  // REPL, but surfaces the full contract object + the on-disk output file.
+  async function runBackground(cmd) {
+    input.disabled = true;
+    const t0 = performance.now();
+    try {
+      const r = await window.vm.run(cmd, 60000);
+      line(`{ done: ${r.done}, output_file: ${JSON.stringify(r.output_file)}, pid: ${r.pid} }`, "sys");
+      if (r.output && r.output.length) line(r.output, "out");
+      // Prove output_file is real on the guest FS by reading it back.
+      if (r.output_file) {
+        try {
+          const disk = await window.vm.readFile(r.output_file);
+          line(`  (output_file on disk = ${JSON.stringify(disk.slice(0, 60))}${disk.length > 60 ? "…" : ""})`, "sys");
+        } catch {}
+      }
+      line(`  [${Math.round(performance.now() - t0)} ms]`, "sys");
+    } catch (e) {
+      line("error: " + (e && e.message || e), "err");
+    } finally {
+      input.disabled = false; input.focus();
+    }
+  }
 
   async function run(cmd) {
     line(cmd, "cmd");
     if (cmd === "clear") { sb.innerHTML = ""; return; }
     if (cmd === "help") { line(HELP, "sys"); return; }
+    if (cmd === "run" || cmd.startsWith("run ")) {
+      const inner = cmd.slice(3).trim();
+      if (!inner) { line("usage: run <command>", "err"); return; }
+      return runBackground(inner);
+    }
     input.disabled = true;
     const t0 = performance.now();
     try {
