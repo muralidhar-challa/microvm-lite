@@ -302,12 +302,38 @@ function needsRootfs(cmd) {
   return false;
 }
 
+// Run `cmd` under sh with stdout+stderr captured via a GUEST-LEVEL redirect to
+// `capFile` — the shell itself opens the file and redirects the whole command
+// group into it. This is the ONLY reliable capture in the vfork model: aliasing
+// FS.streams[1] to a MEMFS stream (see runExec) is corrupted by the fd
+// save/restore the instant any fork+exec command runs, so every command AFTER
+// the first fork in a sequence (`rm -f db; sqlite3 db …`, `cp a b; grep …`,
+// `tool1; tool2`) loses its stdout. A guest-opened redirect fd is an ordinary
+// blink Fd that survives the save/restore, so the full `A; B; C` sequence — post
+// -fork commands included — is captured intact. cmd goes on its own line inside
+// the group so a trailing `;`/operator in cmd can't break the `)` terminator.
+async function runShellCapture(cmd, capFile, pidFile) {
+  // Brace group `{ }`, NOT a subshell `( )`: a brace group runs in the current
+  // shell with NO extra fork, so it doesn't add a fork per command (the
+  // run-to-completion vfork model leaks memory per fork, so an extra fork on
+  // every exec drives the wasm heap to its ~2GB ceiling under sustained load).
+  // The redirect still makes the shell open the capture file itself, so fd 1 is
+  // an ordinary guest Fd that survives the vfork fd save/restore. cmd sits on
+  // its own line so a trailing `;`/`&` in it can't collide with the `}`.
+  var script = (pidFile ? "echo $$ > " + pidFile + "\n" : "")
+    + "{ cd " + HOME + " 2>/dev/null\n" + cmd + "\n} > " + capFile + " 2>&1\n";
+  return runExec(["/bin/sh", "-c", script]);
+}
+
 // ── vm.execute (worker msg "run"): simple string capture ─────────────────────
 async function doRun(cmd) {
   if (needsRootfs(cmd)) await ensureRootfs();
-  var r = await runExec(["/bin/sh", "-c", "cd " + HOME + " 2>/dev/null; " + cmd]);
-  var s = (r.output || "").replace(/\s+$/, "");
-  return s;
+  var cap = "/tmp/.run-" + randHex();
+  await runShellCapture(cmd, cap);
+  var out = "";
+  try { out = new TextDecoder().decode(FS.readFile(cap)); } catch (e) {}
+  try { FS.unlink(cap); } catch (e) {}
+  return out.replace(/\s+$/, "");
 }
 
 // ── vm.run (worker msg "execute"): file-capture + pid, {done,output_file,pid} ─
@@ -318,8 +344,7 @@ async function doExecute(cmd) {
   if (needsRootfs(cmd)) await ensureRootfs();
   var hex = randHex();
   var outFile = "/tmp/out-" + hex + ".txt", pidFile = "/tmp/pid-" + hex + ".txt";
-  var script = "echo $$ > " + pidFile + "\n( cd " + HOME + " 2>/dev/null; " + cmd + " ) > " + outFile + " 2>&1\n";
-  await runExec(["/bin/sh", "-c", script]);
+  await runShellCapture(cmd, outFile, pidFile);
   _fsDirty = true;
   var output = "(no output)", pid = null;
   try {
