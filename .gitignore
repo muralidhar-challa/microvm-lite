@@ -29,3 +29,13 @@ microvm/test/*.pdf
 # guest-binary symlinks into blink-wasm/
 microvm/test/app
 microvm/test/runner
+
+# microvm M5: packaged CDN payload — regenerate with: bash microvm/dist/build-dist.sh
+# (build-dist.sh and dist.html are tracked; everything it assembles is not)
+microvm/dist/blink.js
+microvm/dist/blink.wasm
+microvm/dist/vm-worker.js
+microvm/dist/vm-host.js
+microvm/dist/manifest.json
+microvm/dist/bin/
+microvm/dist/rootfs/

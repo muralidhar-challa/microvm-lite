@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>microvm-lite — packaged dist</title></head>
+<body>
+<div id="status">loading</div>
+<script type="module">
+  // Boots the PACKAGED dist copies (./vm-host.js → ./vm-worker.js → manifest).
+  import { startVM } from "./vm-host.js";
+  window.__vmDebug = true;
+  window.__startVM = startVM;
+  document.getElementById("status").textContent = "module-loaded";
+</script>
+</body>
+</html>
