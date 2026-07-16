@@ -131,10 +131,11 @@ try {
         } else if (op === "sqlite") {
           const rows = pick(SQL_ROWS);
           const sql = `CREATE TABLE t(x); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<${rows}) INSERT INTO t SELECT i FROM c; SELECT count(*), sum(x) FROM t;`;
-          // Fresh db name per call — a single fork+exec command. (A "rm -f db;
-          // sqlite3 db" sequence would lose sqlite's stdout: see the M2
-          // external-then-command limitation the soak surfaced.)
-          const outp = await vm.execute(`sqlite3 /tmp/s_${it}.db "${sql}"`);
+          // `rm -f db; sqlite3 db` — the realistic idiom that USED to lose
+          // sqlite's stdout (external fork then output). Now a regression test
+          // for the guest-redirect capture fix: exercises the fixed path under
+          // sustained load.
+          const outp = await vm.execute(`rm -f /tmp/s.db; sqlite3 /tmp/s.db "${sql}"`);
           const want = `${rows}|${(rows * (rows + 1)) / 2}`;
           if (!outp.includes(want)) fail("sqlite:" + rows, `want ${want} got ${JSON.stringify(outp.slice(0, 40))}`);
           record("sqlite:" + rows, performance.now() - t0);
