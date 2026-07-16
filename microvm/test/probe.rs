@@ -47,6 +47,21 @@ fn main() {
                 }
             }
         }
+        "spawnsh" => {
+            // The runner's EXACT run_shell path: Command::new("sh").arg("-c")
+            // with a PIPELINE, captured via .output() (3 host pipes). Isolates
+            // the "Rust Command → sh -c → internal pipe fork" nesting.
+            let out = std::process::Command::new("sh")
+                .arg("-c").arg("echo hello-from-tool | tr a-z A-Z")
+                .output();
+            match out {
+                Ok(o) => {
+                    print!("{}", String::from_utf8_lossy(&o.stdout));
+                    println!("spawnsh-exit={:?}", o.status.code());
+                }
+                Err(e) => { eprintln!("spawnsh failed: {e}"); std::process::exit(1); }
+            }
+        }
         _ => println!("probe-default"),
     }
 }

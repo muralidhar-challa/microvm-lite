@@ -1,13 +1,37 @@
+diff --git a/blink/close.c b/blink/close.c
+index daf01d6..255361c 100644
+--- a/blink/close.c
++++ b/blink/close.c
+@@ -36,6 +36,11 @@
+ static int CloseFd(struct Fd *fd) {
+   int rc;
+   unassert(fd->cb);
++#ifdef __EMSCRIPTEN__
++  // Covers close(), close_range(), and O_CLOEXEC exec teardown — every path
++  // that retires a guest fd for good must drop its virtual-socket entry.
++  EmSockOnClose(fd->fildes);
++#endif
+   if (fd->dirstream) {
+     rc = VfsClosedir(fd->dirstream);
+   } else {
 diff --git a/blink/errno.c b/blink/errno.c
-index 8f7515e..ee6a351 100644
+index 8f7515e..4c8c04a 100644
 --- a/blink/errno.c
 +++ b/blink/errno.c
-@@ -35,6 +35,14 @@ long einval(void) {
+@@ -35,6 +35,22 @@ long einval(void) {
    return ReturnErrno(EINVAL);
  }
  
 +long echild(void) {
 +  return ReturnErrno(ECHILD);
++}
++
++long enotsock(void) {
++  return ReturnErrno(ENOTSOCK);
++}
++
++long eafnosupport(void) {
++  return ReturnErrno(EAFNOSUPPORT);
 +}
 +
 +long enoexec(void) {
@@ -18,14 +42,16 @@ index 8f7515e..ee6a351 100644
    return ReturnErrno(EAGAIN);
  }
 diff --git a/blink/errno.h b/blink/errno.h
-index 42d0955..378fe12 100644
+index 42d0955..91b588e 100644
 --- a/blink/errno.h
 +++ b/blink/errno.h
-@@ -7,6 +7,8 @@ long efault(void);
+@@ -7,6 +7,10 @@ long efault(void);
  void *efault0(void);
  long eintr(void);
  long einval(void);
 +long echild(void);
++long enotsock(void);
++long eafnosupport(void);
 +long enoexec(void);
  long enfile(void);
  long enoent(void);
@@ -187,7 +213,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..fd285a2 100644
+index 34cc01c..8444a08 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -159,8 +159,8 @@ int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
@@ -209,7 +235,7 @@ index 34cc01c..fd285a2 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +484,207 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +484,497 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -330,9 +356,12 @@ index 34cc01c..fd285a2 100644
 +// child's Fd list (freeing structs, closing the host fds it left in the guest
 +// range), then restore each parent fd from its saved slot and rebuild the Fd
 +// struct — leaving the table as it was at vfork() time.
++void EmSockOnClose(int fildes);  // defined in the M3 socket section below
++void EmDbgf(const char *fmt, ...);
++
 +static void EmRestoreFds(struct Machine *m, struct EmFdSave *sv, int n) {
 +  struct Dll *e, *e2;
-+  int i;
++  int i, j;
 +  LOCK(&m->system->fds.lock);
 +  for (e = dll_first(m->system->fds.list); e; e = e2) {
 +    struct Fd *fd = FD_CONTAINER(e);
@@ -340,6 +369,14 @@ index 34cc01c..fd285a2 100644
 +    if (fd->fildes < 0 || fd->fildes >= kMinBlinkFd) continue;  // leave vm fds
 +    dll_remove(&m->system->fds.list, e);
 +    VfsClose(fd->fildes);
++    // A virtual socket the CHILD opened dies with the child's fd — clear its
++    // side-table entry so the fd number can't hijack an unrelated later fd.
++    // But if the parent owned this fd number too (it's in the saved set), the
++    // dup2 below restores the same open file, so any socket entry stays valid.
++    for (j = 0; j < n; ++j) {
++      if (sv[j].slot != -1 && sv[j].fildes == fd->fildes) break;
++    }
++    if (j == n) EmSockOnClose(fd->fildes);
 +    FreeFd(fd);
 +  }
 +  for (i = 0; i < n; ++i) {
@@ -413,11 +450,310 @@ index 34cc01c..fd285a2 100644
 +static int SysVfork(struct Machine *m) {
 +  return Fork(m, 0, 0, 0);
 +}
++
++// ── M3: virtual sockets → HTTP fetch bridge ─────────────────────────────────
++//
++// The guest's HTTP clients (musl ureq in `runner`/`app`, busybox wget) do
++// getaddrinfo → socket → connect → write(request) → read(response) → close.
++// getaddrinfo needs no syscall support: /etc/hosts is seeded by the worker
++// with fake IPs for the virtual endpoints (llm.vm/api.vm/done.vm), and musl
++// consults /etc/hosts before DNS. Everything below reproduces the rest of the
++// path WITHOUT host sockets (Emscripten's socket layer is WebSocket-proxy
++// emulation — unusable for plain fetch):
++//
++//   socket()  → a MEMFS temp FILE fd (same trick as the file-backed pipes)
++//               plus a side-table entry. Request bytes written by the guest
++//               accumulate in the backing file via the NORMAL write path — no
++//               write interception at all.
++//   connect() → records the destination IP/port in the table entry.
++//   read()    → on the FIRST read of a connected socket, the accumulated
++//               request bytes are handed to JS (Module.emHttpFetch, an
++//               Asyncify suspend point), and the raw HTTP response replaces
++//               the backing file's contents with the offset rewound; that
++//               read and all later ones then proceed down the normal file
++//               path, ending in a clean EOF (= server close) when drained.
++//   close()   → frees the table entry (hooked in CloseFd, covering close,
++//               close_range, and O_CLOEXEC exec teardown).
++//
++// A response always carries "Connection: close" (the worker enforces it), so
++// clients don't pool/reuse sockets across a vfork — a socket's lifetime stays
++// inside one request, which keeps it out of the M2 fd save/restore tension.
++
++#define EM_MAX_SOCKETS 16
++
++static struct EmSock {
++  bool used;
++  bool connected;
++  bool fetched;
++  int fildes;
++  u16 port;  // network byte order, as read from the guest's sockaddr_in
++  u32 addr;  // network byte order
++} g_em_socks[EM_MAX_SOCKETS];
++
++static struct EmSock *EmSockFind(int fildes) {
++  int i;
++  for (i = 0; i < EM_MAX_SOCKETS; ++i) {
++    if (g_em_socks[i].used && g_em_socks[i].fildes == fildes) {
++      return &g_em_socks[i];
++    }
++  }
++  return 0;
++}
++
++void EmSockOnClose(int fildes) {
++  struct EmSock *s = EmSockFind(fildes);
++  if (s) memset(s, 0, sizeof(*s));
++}
++
++// Debug tap to the worker console (Module.emHttpLog → postMessage dbg).
++EM_JS(void, em_dbg, (const char *msg), {
++  if (Module.emHttpLog) Module.emHttpLog(UTF8ToString(msg));
++});
++
++void EmDbgf(const char *fmt, ...) {
++  char buf[256];
++  va_list va;
++  va_start(va, fmt);
++  vsnprintf(buf, sizeof(buf), fmt, va);
++  va_end(va);
++  em_dbg(buf);
++}
++
++// Hands the raw request bytes to the worker and returns a malloc()d buffer
++// holding the raw HTTP response (0 on failure → the guest sees EOF, i.e. the
++// server hanging up). Module.emHttpFetch(ipString, port, requestUint8Array)
++// must resolve to a Uint8Array; the await is an Asyncify suspend point.
++EM_ASYNC_JS(int, em_http_fetch,
++            (const char *ip, int port, const u8 *req, int reqlen, int *outlen),
++            {
++  var resp = null;
++  try {
++    resp = await Module.emHttpFetch(UTF8ToString(ip), port,
++                                    HEAPU8.slice(req, req + reqlen));
++  } catch (e) {
++    if (Module.emHttpLog) Module.emHttpLog("emHttpFetch failed: " + e);
++  }
++  if (!resp || !resp.length) {
++    HEAP32[outlen >> 2] = 0;
++    return 0;
++  }
++  var p = _malloc(resp.length);
++  HEAPU8.set(resp, p);
++  HEAP32[outlen >> 2] = resp.length;
++  return p;
++});
++
++// Called at the top of the guest read paths: on the first read of a connected
++// virtual socket, swap the backing file's contents (the accumulated request)
++// for the fetched response.
++static void EmSockBeforeRead(struct Machine *m, i32 fildes) {
++  struct EmSock *s;
++  off_t reqlen;
++  char *req;
++  char ip[16];
++  int resplen = 0;
++  int respptr;
++  unsigned char *a, *p;
++  if (!(s = EmSockFind(fildes))) return;
++  if (!s->connected || s->fetched) return;
++  s->fetched = true;
++  reqlen = lseek(fildes, 0, SEEK_END);
++  if (reqlen < 0) reqlen = 0;
++  req = (char *)malloc(reqlen ? reqlen : 1);
++  lseek(fildes, 0, SEEK_SET);
++  if (reqlen) reqlen = read(fildes, req, reqlen);
++  a = (unsigned char *)&s->addr;
++  p = (unsigned char *)&s->port;
++  snprintf(ip, sizeof(ip), "%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
++  respptr = em_http_fetch(ip, (p[0] << 8) | p[1], (const u8 *)req,
++                          (int)reqlen, &resplen);
++  free(req);
++  unassert(!ftruncate(fildes, 0));
++  lseek(fildes, 0, SEEK_SET);
++  if (respptr && resplen > 0) {
++    unassert(write(fildes, (void *)(uintptr_t)respptr, resplen) == resplen);
++    lseek(fildes, 0, SEEK_SET);
++  }
++  if (respptr) free((void *)(uintptr_t)respptr);
++  (void)m;
++}
++
++static int EmSysSocket(struct Machine *m, i32 family, i32 type, i32 protocol) {
++  struct Fd *fd;
++  int i, fildes, flags;
++  char path[] = "/tmp/.blinksockXXXXXX";
++  flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
++  type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
++  (void)protocol;
++  // Only TCP: HTTP is the sole consumer, and DNS never gets here (/etc/hosts).
++  if (family != AF_INET_LINUX) return eafnosupport();
++  if (type != SOCK_STREAM_LINUX) return einval();
++  for (i = 0; i < EM_MAX_SOCKETS; ++i) {
++    if (!g_em_socks[i].used) break;
++  }
++  if (i == EM_MAX_SOCKETS) return emfile();
++  if ((fildes = mkstemp(path)) == -1) return emfile();
++  unlink(path);
++  if (flags & SOCK_CLOEXEC_LINUX) VfsFcntl(fildes, F_SETFD, FD_CLOEXEC);
++  LOCK(&m->system->fds.lock);
++  fd = AddFd(&m->system->fds, fildes,
++             O_RDWR | (flags & SOCK_CLOEXEC_LINUX ? O_CLOEXEC : 0) |
++                 (flags & SOCK_NONBLOCK_LINUX ? O_NDELAY : 0));
++  fd->socktype = SOCK_STREAM;
++  UNLOCK(&m->system->fds.lock);
++  memset(&g_em_socks[i], 0, sizeof(g_em_socks[i]));
++  g_em_socks[i].used = true;
++  g_em_socks[i].fildes = fildes;
++  return fildes;
++}
++
++static int EmSysConnect(struct Machine *m, i32 fildes, i64 sockaddr_addr,
++                        u32 sockaddr_size) {
++  struct EmSock *s;
++  struct sockaddr_in_linux sin;
++  if (!(s = EmSockFind(fildes))) return enotsock();
++  if (sockaddr_size < sizeof(sin)) return einval();
++  if (CopyFromUserRead(m, &sin, sockaddr_addr, sizeof(sin)) == -1) {
++    return efault();
++  }
++  if (Read16(sin.family) != AF_INET_LINUX) return eafnosupport();
++  s->port = sin.port;
++  s->addr = sin.addr;
++  s->connected = true;
++  s->fetched = false;
++  // Success is immediate and synchronous — legal even for a nonblocking
++  // connect (Rust's connect_timeout handles rc==0 without the poll dance).
++  return 0;
++}
++
++// sendto/recvfrom on a virtual socket are plain file I/O on the backing fd
++// (musl send() and Rust std's Socket::read use these syscalls, not
++// write/read). SysWrite/SysRead are defined later in this file.
++static i64 SysRead(struct Machine *, i32, i64, u64);
++static i64 SysWrite(struct Machine *, i32, i64, u64);
++
++static i64 EmSysSendto(struct Machine *m, i32 fildes, i64 bufaddr, u64 buflen,
++                       i32 flags, i64 sockaddr_addr, i32 sockaddr_size) {
++  (void)flags;  // MSG_NOSIGNAL et al are meaningless here
++  (void)sockaddr_addr;
++  (void)sockaddr_size;
++  if (!EmSockFind(fildes)) return enotsock();
++  return SysWrite(m, fildes, bufaddr, buflen);
++}
++
++static i64 EmSysRecvfrom(struct Machine *m, i32 fildes, i64 bufaddr,
++                         u64 buflen, i32 flags, i64 sockaddr_addr,
++                         i64 sockaddr_size_addr) {
++  (void)flags;
++  (void)sockaddr_addr;
++  (void)sockaddr_size_addr;
++  if (!EmSockFind(fildes)) return enotsock();
++  return SysRead(m, fildes, bufaddr, buflen);  // SysRead triggers the fetch
++}
++
++static int EmSockName(struct Machine *m, i32 fildes, i64 sockaddr_addr,
++                      i64 sockaddr_size_addr, bool peer) {
++  struct EmSock *s;
++  u8 size_buf[4];
++  u32 avail;
++  struct sockaddr_in_linux sin;
++  if (!(s = EmSockFind(fildes))) return enotsock();
++  if (CopyFromUserRead(m, size_buf, sockaddr_size_addr, sizeof(size_buf)) ==
++      -1) {
++    return efault();
++  }
++  avail = Read32(size_buf);
++  memset(&sin, 0, sizeof(sin));
++  Write16(sin.family, AF_INET_LINUX);
++  if (peer) {
++    sin.port = s->port;
++    sin.addr = s->addr;
++  }  // else 0.0.0.0:0 — nothing meaningful to report for a local name
++  if (CopyToUserWrite(m, sockaddr_addr, &sin,
++                      MIN(sizeof(sin), (size_t)avail)) == -1) {
++    return efault();
++  }
++  Write32(size_buf, sizeof(sin));
++  CopyToUserWrite(m, sockaddr_size_addr, size_buf, sizeof(size_buf));
++  return 0;
++}
++
++static int EmSysGetsockname(struct Machine *m, i32 fildes, i64 aa, i64 asa) {
++  return EmSockName(m, fildes, aa, asa, false);
++}
++
++static int EmSysGetpeername(struct Machine *m, i32 fildes, i64 aa, i64 asa) {
++  return EmSockName(m, fildes, aa, asa, true);
++}
++
++static int EmSysShutdown(struct Machine *m, i32 fildes, i32 how) {
++  (void)m;
++  (void)how;
++  if (!EmSockFind(fildes)) return enotsock();
++  return 0;
++}
++
++// Timeouts/TCP_NODELAY/keepalive are meaningless for the fetch bridge —
++// accept and ignore them so clients' socket setup doesn't error out.
++static int EmSysSetsockopt(struct Machine *m, i32 fildes, i32 level,
++                           i32 optname, i64 optvaladdr, u32 optvalsize) {
++  (void)m;
++  (void)level;
++  (void)optname;
++  (void)optvaladdr;
++  (void)optvalsize;
++  if (!EmSockFind(fildes)) return enotsock();
++  return 0;
++}
++
++// Every readable option reports as 0 — the case that matters is SO_ERROR
++// after a nonblocking connect, where 0 means "connected fine".
++static int EmSysGetsockopt(struct Machine *m, i32 fildes, i32 level,
++                           i32 optname, i64 optvaladdr,
++                           i64 optvalsizeaddr) {
++  u8 size_buf[4];
++  u8 zero[4] = {0, 0, 0, 0};
++  u32 avail;
++  (void)level;
++  (void)optname;
++  if (!EmSockFind(fildes)) return enotsock();
++  if (CopyFromUserRead(m, size_buf, optvalsizeaddr, sizeof(size_buf)) == -1) {
++    return efault();
++  }
++  avail = Read32(size_buf);
++  if (CopyToUserWrite(m, optvaladdr, zero,
++                      MIN(sizeof(zero), (size_t)avail)) == -1) {
++    return efault();
++  }
++  Write32(size_buf, MIN(sizeof(zero), (size_t)avail));
++  CopyToUserWrite(m, optvalsizeaddr, size_buf, sizeof(size_buf));
++  return 0;
++}
 +#endif /* __EMSCRIPTEN__ */
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -3526,6 +3728,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -2344,6 +2836,9 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+   struct Iovs iv;
+   ssize_t (*readv_impl)(int, const struct iovec *, int);
+   if (size > NUMERIC_MAX(size_t)) return eoverflow();
++#ifdef __EMSCRIPTEN__
++  EmSockBeforeRead(m, fildes);  // first read of a virtual socket → fetch
++#endif
+   LOCK(&m->system->fds.lock);
+   if ((fd = GetFd(&m->system->fds, fildes))) {
+     unassert(fd->cb);
+@@ -2559,6 +3054,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+ }
+ 
+ static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
++#ifdef __EMSCRIPTEN__
++  EmSockBeforeRead(m, fildes);  // first read of a virtual socket → fetch
++#endif
+   return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
+ }
+ 
+@@ -3526,6 +4024,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -425,7 +761,7 @@ index 34cc01c..fd285a2 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +3830,129 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4126,129 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -555,3 +891,48 @@ index 34cc01c..fd285a2 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
+@@ -5620,6 +6242,20 @@ void OpSyscall(P) {
+     SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
+     SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
+ #endif /* DISABLE_SOCKETS */
++#if defined(DISABLE_SOCKETS) && defined(__EMSCRIPTEN__)
++    // M3 virtual sockets: the HTTP fetch bridge (see the EmSock section).
++    // Native socket syscalls stay compiled out (DISABLE_SOCKETS) — they'd
++    // route to Emscripten's WebSocket-proxy emulation, which can't fetch.
++    SYSCALL(3, 0x029, "socket", EmSysSocket, STRACE_SOCKET);
++    SYSCALL(3, 0x02A, "connect", EmSysConnect, STRACE_CONNECT);
++    SYSCALL(6, 0x02C, "sendto", EmSysSendto, STRACE_SENDTO);
++    SYSCALL(6, 0x02D, "recvfrom", EmSysRecvfrom, STRACE_RECVFROM);
++    SYSCALL(2, 0x030, "shutdown", EmSysShutdown, STRACE_2);
++    SYSCALL(3, 0x033, "getsockname", EmSysGetsockname, STRACE_GETSOCKNAME);
++    SYSCALL(3, 0x034, "getpeername", EmSysGetpeername, STRACE_GETPEERNAME);
++    SYSCALL(5, 0x036, "setsockopt", EmSysSetsockopt, STRACE_5);
++    SYSCALL(5, 0x037, "getsockopt", EmSysGetsockopt, STRACE_5);
++#endif /* virtual sockets */
+ #ifdef HAVE_FORK
+     SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
+ #ifndef DISABLE_NONPOSIX
+@@ -5720,6 +6356,9 @@ void OpSyscall(P) {
+     default:
+     DefaultCase:
+       LOGF("missing syscall 0x%03" PRIx64, ax);
++#ifdef __EMSCRIPTEN__
++      EmDbgf("missing syscall 0x%03x", (int)(ax & 0xfff));
++#endif
+       ax = enosys();
+       break;
+   }
+diff --git a/blink/syscall.h b/blink/syscall.h
+index 87a351c..43b6cae 100644
+--- a/blink/syscall.h
++++ b/blink/syscall.h
+@@ -60,6 +60,9 @@ void OpSyscall(P);
+ void SysCloseExec(struct System *);
+ int SysClose(struct Machine *, i32);
+ int SysCloseRange(struct Machine *, u32, u32, u32);
++#ifdef __EMSCRIPTEN__
++void EmSockOnClose(int);  // M3 virtual sockets: drop the side-table entry
++#endif
+ int SysDup(struct Machine *, i32, i32, i32, i32);
+ int SysOpenat(struct Machine *, i32, i64, i32, i32);
+ int SysPipe2(struct Machine *, i64, i32);

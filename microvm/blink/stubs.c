@@ -1,35 +1,56 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include "blink/machine.h"
 #include "blink/linux.h"
 #include "blink/types.h"
 
+// NOTE: a Sys* stub's negative return value goes to the guest RAW (only -1
+// triggers the host-errno translation), so it must use *_LINUX errno numbers.
+// Returning -ENOSYS here used Emscripten's WASI numbering (ENOSYS=52) and the
+// guest saw the meaningless errno 52.
 int SysIoctl(struct Machine *m, int fd, u64 request, i64 addr) {
-  (void)m; (void)fd; (void)request; (void)addr;
-  return -ENOSYS;
+  (void)m; (void)addr;
+  switch (request) {
+    case FIONBIO_LINUX:
+      // Rust std's set_nonblocking() — used inside TcpStream::connect_timeout,
+      // i.e. by every ureq client (runner/app). Nothing in this build actually
+      // blocks (virtual sockets answer from a buffer, MEMFS files are
+      // synchronous), so accepting the flag without applying it is faithful.
+      return 0;
+    case FIOCLEX_LINUX:
+      fcntl(fd, F_SETFD, FD_CLOEXEC);
+      return 0;
+    case FIONCLEX_LINUX:
+      fcntl(fd, F_SETFD, 0);
+      return 0;
+    default:
+      // What a real kernel says for an unsupported ioctl on a non-tty.
+      return -ENOTTY_LINUX;
+  }
 }
 
 int SysStatfs(struct Machine *m, i64 path, i64 buf) {
   (void)m; (void)path; (void)buf;
-  return -ENOSYS;
+  return -ENOSYS_LINUX;
 }
 
 int SysFstatfs(struct Machine *m, i32 fd, i64 buf) {
   (void)m; (void)fd; (void)buf;
-  return -ENOSYS;
+  return -ENOSYS_LINUX;
 }
 
 int SendAncillary(struct Machine *m, struct msghdr *msg,
                   const struct msghdr_linux *guestmsg) {
   (void)m; (void)msg; (void)guestmsg;
-  return -ENOSYS;
+  return -ENOSYS_LINUX;
 }
 
 int ReceiveAncillary(struct Machine *m, struct msghdr_linux *guestmsg,
                      struct msghdr *msg, int flags) {
   (void)m; (void)guestmsg; (void)msg; (void)flags;
-  return -ENOSYS;
+  return -ENOSYS_LINUX;
 }
 
 int GetCpuCount(void) {
@@ -69,5 +90,5 @@ int em_last_exit(void) {
 
 int sysinfo_linux(struct sysinfo_linux *info) {
   (void)info;
-  return -ENOSYS;
+  return -ENOSYS_LINUX;
 }
