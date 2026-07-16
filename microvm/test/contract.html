@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>microvm-lite — M4 contract harness</title></head>
+<body>
+<div id="status">loading</div>
+<script type="module">
+  import { startVM } from "/src/vm-host.js";
+  window.__vmDebug = true;
+  window.__startVM = startVM;
+  document.getElementById("status").textContent = "module-loaded";
+</script>
+</body>
+</html>
