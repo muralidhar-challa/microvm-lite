@@ -135,10 +135,14 @@ self.Module = {
         if (_proxyWaiters[id]) { delete _proxyWaiters[id]; resolve({ status: 504, statusText: "Gateway Timeout", body: "endpoint timeout\n" }); }
       }, 30000);
     });
+    // Split the query off for the registry key (useV86 routes on pathname
+    // only); keep the full target in `url` so handlers can read query params.
+    var q = req.path.indexOf("?");
+    var pathname = q === -1 ? req.path : req.path.slice(0, q);
     self.postMessage({
       type: "proxy_request", id: id,
       url: "http://" + hostname + req.path,
-      pathname: req.path,
+      pathname: pathname,
       hostname: hostname,
       method: req.method,
       body: new TextDecoder().decode(req.body),
@@ -457,4 +461,23 @@ self.onmessage = async function (ev) {
   }
 
   if (msg.type === "serial_send") { /* no interactive serial console in blink */ return; }
+
+  // Diagnostic (used by the stress soak and viable for prod ops monitoring):
+  // report the wasm heap size and /tmp residue so a long-lived session can be
+  // watched for growth/leaks.
+  if (msg.type === "stat") {
+    await moduleReadyPromise;
+    var tmpFiles = 0;
+    try { FS.readdir("/tmp").forEach(function (n) { if (n !== "." && n !== "..") tmpFiles++; }); } catch (e) {}
+    // HEAPU8 isn't in EXPORTED_RUNTIME_METHODS; HEAPU32 is. Total wasm memory =
+    // HEAPU32.length * 4. Fall back to wasmMemory if present.
+    var heapBytes = (Module.HEAPU32 && Module.HEAPU32.length * 4) ||
+                    (Module.wasmMemory && Module.wasmMemory.buffer.byteLength) || 0;
+    self.postMessage({ type: "result", id: msg.id, value: {
+      heapBytes: heapBytes,
+      tmpFiles: tmpFiles,
+      runSeq: _runSeq,
+    } });
+    return;
+  }
 };
