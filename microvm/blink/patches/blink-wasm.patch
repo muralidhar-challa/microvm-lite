@@ -86,10 +86,25 @@ index ad309eb..b3de3df 100644
    int sig;
    RestoreIp(m);
 diff --git a/blink/machine.h b/blink/machine.h
-index be17a8a..4af5a3c 100644
+index be17a8a..a8e3e80 100644
 --- a/blink/machine.h
 +++ b/blink/machine.h
-@@ -466,6 +466,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
+@@ -449,6 +449,14 @@ struct Machine {               //
+   sigset_t spawn_sigmask;                //
+   struct Dll elem;                       //
+   struct SmcQueue smcqueue;              //
++#ifdef __EMSCRIPTEN__
++  // Set while this machine is executing as a run-to-completion vfork() child
++  // (see Fork() in syscall.c). When set, execve() must NOT replace this
++  // machine's program in place — that would destroy the shared parent memory
++  // vfork() gives us — but instead run the new program in a FRESH machine,
++  // matching real vfork()'s separate-address-space-at-exec semantics.
++  bool em_vfork_child;
++#endif
+   struct OpCache opcache[1];             //
+ };  //
+ 
+@@ -466,6 +474,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
  i64 AreAllPagesUnlocked(struct System *) nosideeffect;
  bool IsOrphan(struct Machine *) nosideeffect;
  _Noreturn void Blink(struct Machine *);
@@ -99,6 +114,66 @@ index be17a8a..4af5a3c 100644
  _Noreturn void Actor(struct Machine *);
  void Jitter(P, const char *, ...);
  void FreeMachine(struct Machine *);
+diff --git a/blink/pipe.c b/blink/pipe.c
+index 011e442..a1c64b0 100644
+--- a/blink/pipe.c
++++ b/blink/pipe.c
+@@ -18,6 +18,7 @@
+ ╚─────────────────────────────────────────────────────────────────────────────*/
+ #include <errno.h>
+ #include <fcntl.h>
++#include <stdlib.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -51,6 +52,47 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
+     return efault();
+   }
+   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
++#ifdef __EMSCRIPTEN__
++  // File-backed pipe for the run-to-completion process model (WebAssembly has
++  // no host fork). A real pipe deadlocks here: pipeline stages can't run
++  // concurrently, so the writer runs fully first, then the reader — but the
++  // parent still holds the write end open (see Fork()'s fd save/restore), so a
++  // real-pipe read never sees EOF and blocks forever. Backing the pipe with a
++  // temp file instead: the reader gets the writer's bytes and then a clean EOF
++  // at end-of-file regardless of open write ends, and the buffer is unbounded
++  // (no 64 KB pipe-capacity stall on large output).
++  {
++    char path[] = "/tmp/.blinkpipeXXXXXX";
++    int wfd, rfd;
++    (void)oflags;
++    if ((wfd = mkstemp(path)) == -1) return emfile();
++    if ((rfd = open(path, O_RDONLY)) == -1) {
++      close(wfd);
++      unlink(path);
++      return emfile();
++    }
++    unlink(path);  // both fds keep the inode alive; auto-cleaned on last close
++    oflags = 0;
++    if (flags & O_CLOEXEC_LINUX) {
++      oflags |= O_CLOEXEC;
++      unassert(!VfsFcntl(rfd, F_SETFD, FD_CLOEXEC));
++      unassert(!VfsFcntl(wfd, F_SETFD, FD_CLOEXEC));
++    }
++    if (rfd >= lim || wfd >= lim) {
++      close(rfd);
++      close(wfd);
++      return emfile();
++    }
++    LOCK(&m->system->fds.lock);
++    unassert(AddFd(&m->system->fds, rfd, O_RDONLY | oflags));
++    unassert(AddFd(&m->system->fds, wfd, O_WRONLY | oflags));
++    UNLOCK(&m->system->fds.lock);
++    Write32(fds_linux[0], rfd);
++    Write32(fds_linux[1], wfd);
++    unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));
++    return 0;
++  }
++#endif
+ #ifdef HAVE_PIPE2
+   if ((rc = VfsPipe2(fds, (oflags = XlatOpenFlags(flags)))) != -1) {
+ #else
 diff --git a/blink/realpath.c b/blink/realpath.c
 index 8999ef5..be3c087 100644
 --- a/blink/realpath.c
@@ -112,7 +187,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..ff7467f 100644
+index 34cc01c..fd285a2 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -159,8 +159,8 @@ int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
@@ -134,7 +209,7 @@ index 34cc01c..ff7467f 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +484,116 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +484,207 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -211,29 +286,120 @@ index 34cc01c..ff7467f 100644
 +  return -1;
 +}
 +
++// Guest fds live in [0, kMinBlinkFd); blink's own fds are >= kMinBlinkFd.
++struct EmFdSave {
++  int fildes;  // guest fd number (== host fd number in blink's model)
++  int oflags;  // blink Fd oflags, to rebuild the Fd struct
++  int slot;    // high host fd holding a dup of the original open file
++};
++
++// Snapshot the parent's fd table before running a vfork child by dup()ing each
++// open guest fd to a high slot (F_DUPFD_CLOEXEC min=kMinBlinkFd lands above the
++// guest range and skips blink's own fds), so the child's open/dup2/close for
++// redirections and pipes can be undone on resume. Returns the number of saved
++// entries.
++//
++// KNOWN LIMITATION (see the microvm-lite plan): dup2()ing fd 0/1/2 back on
++// restore rebinds those Emscripten fd slots to fresh stream objects that no
++// longer route through the worker's stdout/stderr TTY put_char capture, so in a
++// long-lived worker every command AFTER the first forking one loses its output.
++// Individual commands (fresh worker) are correct. Fixing this needs a cleaner
++// process/fd model — see the meta-discussion in the plan.
++static int EmSaveFds(struct Machine *m, struct EmFdSave *sv, int max) {
++  int n = 0;
++  struct Dll *e;
++  LOCK(&m->system->fds.lock);
++  for (e = dll_first(m->system->fds.list); e && n < max;
++       e = dll_next(m->system->fds.list, e)) {
++    struct Fd *fd = FD_CONTAINER(e);
++    if (fd->fildes < 0 || fd->fildes >= kMinBlinkFd) continue;  // skip vm fds
++    sv[n].fildes = fd->fildes;
++    sv[n].oflags = fd->oflags;
++    sv[n].slot = VfsFcntl(fd->fildes, F_DUPFD_CLOEXEC, kMinBlinkFd);
++    if (sv[n].slot == -1) {
++      LOGF("EmSaveFds: could not preserve fd %d (errno %d)", fd->fildes, errno);
++      continue;  // best effort: this fd won't be restorable, but don't abort
++    }
++    ++n;
++  }
++  UNLOCK(&m->system->fds.lock);
++  return n;
++}
++
++// Undo whatever the vfork child did to the shared fd table: tear down the
++// child's Fd list (freeing structs, closing the host fds it left in the guest
++// range), then restore each parent fd from its saved slot and rebuild the Fd
++// struct — leaving the table as it was at vfork() time.
++static void EmRestoreFds(struct Machine *m, struct EmFdSave *sv, int n) {
++  struct Dll *e, *e2;
++  int i;
++  LOCK(&m->system->fds.lock);
++  for (e = dll_first(m->system->fds.list); e; e = e2) {
++    struct Fd *fd = FD_CONTAINER(e);
++    e2 = dll_next(m->system->fds.list, e);
++    if (fd->fildes < 0 || fd->fildes >= kMinBlinkFd) continue;  // leave vm fds
++    dll_remove(&m->system->fds.list, e);
++    VfsClose(fd->fildes);
++    FreeFd(fd);
++  }
++  for (i = 0; i < n; ++i) {
++    if (sv[i].slot == -1) continue;
++    VfsDup2(sv[i].slot, sv[i].fildes);  // restore the parent's open file
++    VfsClose(sv[i].slot);               // release the save slot
++    AddFd(&m->system->fds, sv[i].fildes, sv[i].oflags);
++  }
++  UNLOCK(&m->system->fds.lock);
++}
++
 +static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
 +  static int next_pid = 1000;
-+  int child_pid, rc;
-+  u64 parent_sp;
++  int child_pid, rc, nsv;
++  bool saved_vfork_child;
++  u64 saved_ip;
++  u32 saved_flags;
++  u8 saved_beg[128];   // the general register file
++  u8 saved_xmm[256];   // the vector register file (16 x 16 bytes)
++  struct EmFdSave sv[kMinBlinkFd];  // at most one entry per guest fd
 +  (void)flags;
 +  (void)ctid;
 +  child_pid = ++next_pid;
++
++  // vfork() runs the child on the SAME Machine `m` as the parent (they share
++  // one address space, exactly as real vfork() specifies). The child mutates
++  // registers, the fd table, and — until it execve()s — the shared memory, so
++  // we snapshot everything the parent needs to resume from its vfork() call
++  // site and restore it once the child has execve()d or _exit()ed. The child's
++  // execve() runs the new program in a FRESH machine (see SysExecve) so it
++  // never clobbers this parent memory — the crucial difference from a plain
++  // in-place execve, which would destroy the shared program image.
++  nsv = EmSaveFds(m, sv, kMinBlinkFd);
++  saved_ip = m->ip;
++  saved_flags = m->flags;
++  memcpy(saved_beg, m->beg, sizeof(saved_beg));
++  memcpy(saved_xmm, m->xmm, sizeof(saved_xmm));
++  saved_vfork_child = m->em_vfork_child;
++
 +  Put64(m->ax, 0);  // child's view of fork()/vfork()/clone()'s return value
 +  // Raw vfork()/fork() (stack==0, e.g. busybox hush NOMMU) implicitly shares
-+  // the parent's stack in place — leave m->sp untouched. But musl's
-+  // posix_spawn (what Rust's std::process::Command uses) calls
-+  // clone(CLONE_VM|CLONE_VFORK, explicit_stack, ...) with its OWN small
-+  // trampoline stack specifically so the child does NOT touch the parent's
-+  // stack; ignoring `stack` here — as if it were plain vfork — corrupts the
-+  // child's execution (it runs on the parent's live stack instead of the
-+  // buffer musl set aside), which is exactly what real vfork() would never
-+  // do for a clone() call that supplies an explicit stack.
-+  parent_sp = Get64(m->sp);
++  // the parent's stack; musl's posix_spawn (Rust's std::process::Command)
++  // calls clone(CLONE_VM|CLONE_VFORK, explicit_stack, ...) with its own
++  // trampoline stack so the child does NOT touch the parent's stack. The full
++  // register restore below covers sp either way, but set it up for the child.
 +  if (stack) {
 +    Put64(m->sp, stack);
 +  }
++  m->em_vfork_child = true;
 +  rc = RunMachineUntilExit(m);
-+  Put64(m->sp, parent_sp);  // restore — the parent resumes on ITS OWN stack
++  m->em_vfork_child = saved_vfork_child;
++
++  // Restore the parent's full pre-vfork() register + fd state so it resumes at
++  // its vfork() call site as if the child had run in a separate process.
++  m->ip = saved_ip;
++  m->flags = saved_flags;
++  memcpy(m->beg, saved_beg, sizeof(saved_beg));
++  memcpy(m->xmm, saved_xmm, sizeof(saved_xmm));
++  EmRestoreFds(m, sv, nsv);
++
 +  EmStashChildStatus(child_pid, rc);
 +  THR_LOGF("pid=%d Fork (wasm, run-to-completion) -> child_pid=%d exit=%d",
 +           m->system->pid, child_pid, rc);
@@ -251,7 +417,7 @@ index 34cc01c..ff7467f 100644
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -3526,6 +3637,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -3526,6 +3728,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -259,7 +425,7 @@ index 34cc01c..ff7467f 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +3739,95 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +3830,129 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -292,6 +458,40 @@ index 34cc01c..ff7467f 100644
 +    unassert(!pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0));
 +    UNLOCK(&m->system->exec_lock);
 +    return enoexec();
++  }
++  if (m->em_vfork_child) {
++    // vfork child: run the new program in a FRESH machine so it never destroys
++    // the parent memory that vfork() shares with us. The child already applied
++    // its redirections to the shared fd table (dup2/close before execve), so
++    // the new program inherits that table; we detach it before freeing the
++    // throwaway machine so the parent/host fds stay open. When it finishes we
++    // halt THIS machine (kMachineExitTrap) with the program's exit status —
++    // Fork()'s RunMachineUntilExit(m) returns it, then Fork() restores the
++    // parent's registers so the parent resumes at its vfork() call site.
++    struct Machine *m2, *saved_g;
++    int status, saved_sysdepth;
++    saved_sysdepth = m->sysdepth;  // flush page locks regardless of nesting
++    m->sysdepth = 0;
++    CollectPageLocks(m);
++    m->sysdepth = saved_sysdepth;
++    SysCloseExec(m->system);  // honor O_CLOEXEC on the shared table
++    unassert(!pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0));
++    UNLOCK(&m->system->exec_lock);
++    saved_g = g_machine;
++    m2 = NewMachine(NewSystem(XED_MACHINE_MODE_LONG), 0);
++    g_machine = m2;
++    m2->system->exec = m->system->exec;
++    memcpy(m2->system->rlim, m->system->rlim, sizeof(m2->system->rlim));
++    m2->system->fds.list = m->system->fds.list;  // inherit redirected fds
++    LoadProgram(m2, prog, prog, argv, envp, NULL);
++    status = RunMachineUntilExit(m2);
++    m2->system->fds.list = 0;  // detach: those fds belong to the parent/host
++    FreeMachine(m2);
++    g_machine = saved_g;
++    m->system->exited = true;
++    m->system->exitcode = status;
++    HaltMachine(m, kMachineExitTrap);
++    unassert(0);  // unreachable: HaltMachine longjmps to RunMachineUntilExit(m)
 +  }
 +  // point of no return: prog/argv/envp are on the freelist, m->ip is about to
 +  // be replaced by LoadProgram — nothing below may fail out to a caller that
