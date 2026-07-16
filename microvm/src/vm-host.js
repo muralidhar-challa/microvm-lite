@@ -121,6 +121,7 @@ let _nextId = 1;
 const _pending = new Map();
 let _saving = false;
 let _baseEtag = "v1";
+let _baseEtagExplicit = false;  // true when the caller pinned baseEtag via opts
 let _cdnBase = ".";
 let _vmRoutes = {};
 let _workerUrl = "./vm-worker.js";
@@ -165,6 +166,18 @@ async function _loadSnapshotFromIdb() {
 }
 
 async function _doStartVM() {
+  // Prefer the packaged manifest's buildId as the snapshot etag: a rebuilt core
+  // binary changes buildId, which invalidates a stale IDB filesystem snapshot.
+  // A caller-supplied baseEtag (opts) wins; a bare test dir with no manifest
+  // keeps the default. (Poppler is excluded from buildId — it can't change
+  // persisted /workspace state — so lazy-fetching it never busts snapshots.)
+  if (!_baseEtagExplicit) {
+    try {
+      const m = await fetch(_cdnBase + "/manifest.json");
+      if (m.ok) { const j = await m.json(); if (j.buildId) _baseEtag = j.buildId; }
+    } catch { /* keep default */ }
+  }
+
   const stateBuffer = await _loadSnapshotFromIdb();
 
   _worker = new Worker(_workerUrl);
@@ -239,7 +252,7 @@ async function _doStartVM() {
 // ── Public API ───────────────────────────────────────────────────────────────
 export function startVM(opts = {}) {
   if (_startPromise) return _startPromise;
-  if (opts.baseEtag) _baseEtag = opts.baseEtag;
+  if (opts.baseEtag) { _baseEtag = opts.baseEtag; _baseEtagExplicit = true; }
   if (opts.cdnBase) _cdnBase = opts.cdnBase;
   if (opts.vmRoutes) _vmRoutes = opts.vmRoutes;
   if (opts.workerUrl) _workerUrl = opts.workerUrl;

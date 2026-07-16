@@ -31,6 +31,8 @@ self.onunhandledrejection = function (e) {
 var BASE = ".";
 var VM_ROUTES = { "10.0.2.10": "llm.vm", "10.0.2.11": "api.vm", "10.0.2.12": "done.vm" };
 
+// Fallback lists used only when no dist manifest.json is present (e.g. a bare
+// test dir). In the packaged dist/, the manifest drives everything.
 var BINARIES = ["busybox", "xtool", "probe", "app", "runner"];
 var ROOTFS_MANIFEST = "rootfs/manifest.json";
 var APPLETS = [
@@ -39,6 +41,14 @@ var APPLETS = [
   "wc", "sort", "uniq", "cut", "tr", "xargs", "env", "pwd", "id", "wget",
   "chmod", "stat", "du", "df", "diff", "md5sum", "tar", "gzip", "gunzip", "base64",
 ];
+
+// M5: the dist manifest (fetched in `init` before blink loads). When present it
+// lists the eager `core` bin/, the `applets`, the `lazy.poppler` closure, and
+// the `triggers` (command tokens that force a lazy fetch). null → fall back to
+// the hardcoded lists above and eager-load everything.
+var MANIFEST = null;
+// Lazy poppler/sqlite closure: fetched at most once, on first triggering cmd.
+var _rootfsPromise = null;
 
 var HOME = "/workspace";
 
@@ -164,17 +174,29 @@ self.Module = {
         .catch(function (e) { self.postMessage({ type: "dbg", text: "fetch " + destPath + " skipped: " + e.message }); removeRunDependency("fetch-" + destPath); });
     }
 
-    BINARIES.forEach(function (name) { fetchInto(BASE + "/" + name, "/bin/" + name, 0o755, name === "busybox" ? APPLETS : null); });
-
-    addRunDependency("fetch-rootfs");
-    fetch(BASE + "/" + ROOTFS_MANIFEST)
-      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-      .then(function (man) {
-        man.bin.forEach(function (f) { fetchInto(BASE + "/rootfs/bin/" + f, "/bin/" + f, 0o755); });
-        man.lib.forEach(function (f) { fetchInto(BASE + "/rootfs/lib/" + f, "/lib/" + f, 0o755); });
-        removeRunDependency("fetch-rootfs");
-      })
-      .catch(function (e) { self.postMessage({ type: "dbg", text: "rootfs manifest skipped: " + e.message }); removeRunDependency("fetch-rootfs"); });
+    if (MANIFEST) {
+      // Packaged path: eager-load ONLY the core tier (busybox+applets, xtool,
+      // app, runner). Poppler/sqlite stay unfetched until a triggering command
+      // (see ensureRootfs) — this is what keeps cold boot off the ~16MB closure.
+      var applets = MANIFEST.applets || APPLETS;
+      Object.keys(MANIFEST.core).forEach(function (rel) {
+        if (rel.indexOf("bin/") !== 0) return;  // blink.js/.wasm load via Emscripten
+        var name = rel.slice(4);
+        fetchInto(BASE + "/" + rel, "/bin/" + name, 0o755, name === "busybox" ? applets : null);
+      });
+    } else {
+      // Fallback path (no manifest): eager-load everything, including poppler.
+      BINARIES.forEach(function (name) { fetchInto(BASE + "/" + name, "/bin/" + name, 0o755, name === "busybox" ? APPLETS : null); });
+      addRunDependency("fetch-rootfs");
+      fetch(BASE + "/" + ROOTFS_MANIFEST)
+        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(function (man) {
+          man.bin.forEach(function (f) { fetchInto(BASE + "/rootfs/bin/" + f, "/bin/" + f, 0o755); });
+          man.lib.forEach(function (f) { fetchInto(BASE + "/rootfs/lib/" + f, "/lib/" + f, 0o755); });
+          removeRunDependency("fetch-rootfs");
+        })
+        .catch(function (e) { self.postMessage({ type: "dbg", text: "rootfs manifest skipped: " + e.message }); removeRunDependency("fetch-rootfs"); });
+    }
 
     // Keep /dev/stdout,/dev/stderr registered but discard — real capture is
     // via MEMFS-file redirection per run (see runExec).
@@ -234,8 +256,51 @@ async function runExec(argv) {
 
 function randHex() { return Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0"); }
 
+// ── Lazy poppler/sqlite closure (M5) ─────────────────────────────────────────
+// Fetched at most once, the first time a command references a trigger token
+// (pdftotext/pdfinfo/pdftoppm/…/sqlite3). Staged into MEMFS /bin and /lib just
+// like the eager tier; subsequent calls reuse the resolved promise.
+function ensureRootfs() {
+  if (!MANIFEST || !MANIFEST.lazy || !MANIFEST.lazy.poppler) return Promise.resolve();
+  if (_rootfsPromise) return _rootfsPromise;
+  var lazy = MANIFEST.lazy.poppler;
+  self.postMessage({ type: "dbg", text: "lazy-loading poppler closure (" + Object.keys(lazy).length + " files)" });
+  _rootfsPromise = Promise.all(Object.keys(lazy).map(function (rel) {
+    // rel is "rootfs/bin/<f>" or "rootfs/lib/<f>" → /bin/<f> or /lib/<f>
+    var dest = rel.indexOf("rootfs/bin/") === 0 ? "/bin/" + rel.slice(11)
+             : rel.indexOf("rootfs/lib/") === 0 ? "/lib/" + rel.slice(11)
+             : null;
+    if (!dest) return Promise.resolve();
+    return fetch(BASE + "/" + rel).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status + " for " + rel);
+      return r.arrayBuffer();
+    }).then(function (buf) { FS.writeFile(dest, new Uint8Array(buf), { mode: 0o755 }); });
+  })).then(function () {
+    self.postMessage({ type: "dbg", text: "poppler closure ready" });
+  }).catch(function (e) {
+    _rootfsPromise = null;  // allow a retry on the next triggering command
+    self.postMessage({ type: "dbg", text: "poppler lazy-load failed: " + e.message });
+    throw e;
+  });
+  return _rootfsPromise;
+}
+
+// Whether a command line references any lazy-tier binary → needs ensureRootfs.
+function needsRootfs(cmd) {
+  if (!MANIFEST || !MANIFEST.triggers || !MANIFEST.triggers.length) return false;
+  for (var i = 0; i < MANIFEST.triggers.length; i++) {
+    var t = MANIFEST.triggers[i];
+    // word-ish boundary so "pdftotext" matches but a substring in a path/arg
+    // that merely contains it (e.g. "mypdftotextfile") does not.
+    var re = new RegExp("(^|[^A-Za-z0-9_])" + t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^A-Za-z0-9_]|$)");
+    if (re.test(cmd)) return true;
+  }
+  return false;
+}
+
 // ── vm.execute (worker msg "run"): simple string capture ─────────────────────
 async function doRun(cmd) {
+  if (needsRootfs(cmd)) await ensureRootfs();
   var r = await runExec(["/bin/sh", "-c", "cd " + HOME + " 2>/dev/null; " + cmd]);
   var s = (r.output || "").replace(/\s+$/, "");
   return s;
@@ -246,6 +311,7 @@ async function doRun(cmd) {
 // /tmp/pid-<hex>.txt) so the app's window.vm.run pid-readback path is byte-for-
 // byte compatible. Run-to-completion → always done:true (see file header).
 async function doExecute(cmd) {
+  if (needsRootfs(cmd)) await ensureRootfs();
   var hex = randHex();
   var outFile = "/tmp/out-" + hex + ".txt", pidFile = "/tmp/pid-" + hex + ".txt";
   var script = "echo $$ > " + pidFile + "\n( cd " + HOME + " 2>/dev/null; " + cmd + " ) > " + outFile + " 2>&1\n";
@@ -319,8 +385,14 @@ self.onmessage = async function (ev) {
     BASE = msg.cdnBase || ".";
     if (msg.vmRoutes) { /* host may override, but IPs are ours; keep VM_ROUTES */ }
     if (msg.stateBuffer) _initSnapshot = msg.stateBuffer;
+    // Fetch the dist manifest BEFORE blink loads: preRun reads MANIFEST to
+    // decide eager vs lazy tiers. Absent (bare test dir) → hardcoded fallback.
+    try {
+      var mr = await fetch(BASE + "/manifest.json");
+      if (mr.ok) MANIFEST = await mr.json();
+    } catch (e) { MANIFEST = null; }
     importScripts(BASE + "/blink.js");
-    moduleReadyPromise.then(function () { self.postMessage({ type: "ready" }); });
+    moduleReadyPromise.then(function () { self.postMessage({ type: "ready", buildId: MANIFEST && MANIFEST.buildId }); });
     return;
   }
 
@@ -334,6 +406,7 @@ self.onmessage = async function (ev) {
   if (msg.type === "exec" || msg.type === "exec_raw") {
     await moduleReadyPromise;
     var argv = msg.type === "exec" ? ["/bin/" + msg.argv[0]].concat(msg.argv.slice(1)) : msg.argv;
+    if (needsRootfs(argv.join(" "))) await ensureRootfs();
     var r = await runExec(argv);
     self.postMessage({ type: "result", id: msg.id, output: r.output, error: r.error, exitCode: r.exitCode });
     return;
