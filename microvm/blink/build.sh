@@ -30,8 +30,9 @@ cd "$SRC_DIR"
 # Reset every file blink-wasm.patch touches before applying — keeps reruns
 # idempotent. Must list every file the patch modifies (git apply is not
 # idempotent against a dirty tree); add new ones here when the patch grows.
-git checkout blink/errno.c blink/errno.h blink/machine.c blink/machine.h \
-            blink/pipe.c blink/realpath.c blink/syscall.c 2>/dev/null || true
+git checkout blink/close.c blink/errno.c blink/errno.h blink/machine.c \
+            blink/machine.h blink/pipe.c blink/realpath.c blink/syscall.c \
+            blink/syscall.h 2>/dev/null || true
 git apply "$BLINK_DIR/patches/blink-wasm.patch"
 
 # ── 3. Copy our shell template and build config ──────────────────────────────
@@ -60,10 +61,10 @@ emcc \
   "-DBUILD_TIMESTAMP=\"now\"" "-DCONFIG_ARGUMENTS=\"\"" \
   -O2 \
   -s ALLOW_MEMORY_GROWTH=1 \
-  -s EXPORTED_RUNTIME_METHODS='["callMain","ccall","FS","TTY","ENV","HEAPU32","stringToNewUTF8"]' \
+  -s EXPORTED_RUNTIME_METHODS='["callMain","ccall","FS","TTY","ENV","HEAPU32","stringToNewUTF8","UTF8ToString"]' \
   -s EXPORTED_FUNCTIONS='["_main","_malloc","_free","_em_reset_getopt","_em_main","_em_last_exit"]' \
   -s INVOKE_RUN=0 -s EXIT_RUNTIME=0 -s FORCE_FILESYSTEM=1 \
-  -s ASYNCIFY -s ASYNCIFY_IMPORTS='["emscripten_sleep"]' \
+  -s ASYNCIFY -s ASYNCIFY_IMPORTS='["emscripten_sleep","__asyncjs__em_http_fetch"]' \
   -s STACK_SIZE=33554432 \
   -sUSE_ZLIB=1
 

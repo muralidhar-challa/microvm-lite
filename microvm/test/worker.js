@@ -33,11 +33,115 @@ var SEED_FILES = ["permit.pdf", "item8.pdf", "text30.pdf"];
 var APPLETS = [
   "sh", "hush", "ls", "cat", "sed", "awk", "grep", "find", "head", "tail",
   "cp", "mv", "rm", "mkdir", "rmdir", "touch", "echo", "printf",
-  "wc", "sort", "uniq", "cut", "tr", "xargs", "env", "pwd", "id",
+  "wc", "sort", "uniq", "cut", "tr", "xargs", "env", "pwd", "id", "wget",
   "chmod", "stat", "du", "df", "diff", "md5sum", "tar", "gzip", "gunzip",
 ];
 
+// M3 HTTP bridge: virtual IP → hostname (mirrors useV86.ts's vmRoutes). The
+// same table seeds the guest's /etc/hosts, so guest connect() destinations
+// always map back to one of these names.
+var VM_ROUTES = {
+  "10.0.2.10": "llm.vm",
+  "10.0.2.11": "api.vm",
+  "10.0.2.12": "done.vm",
+};
+
+// Pending proxy_request round-trips to the main thread, keyed by id.
+var _proxySeq = 0;
+var _proxyWaiters = {};
+
+// Parse the raw HTTP/1.x request bytes the guest wrote to its socket.
+function parseHttpRequest(bytes) {
+  var headerEnd = -1;
+  for (var i = 0; i + 3 < bytes.length; i++) {
+    if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) {
+      headerEnd = i;
+      break;
+    }
+  }
+  if (headerEnd === -1) return null;
+  var head = new TextDecoder("latin1").decode(bytes.subarray(0, headerEnd)).split("\r\n");
+  var reqLine = head[0].split(" ");
+  var headers = {};
+  for (var j = 1; j < head.length; j++) {
+    var k = head[j].indexOf(":");
+    if (k > 0) headers[head[j].slice(0, k).trim().toLowerCase()] = head[j].slice(k + 1).trim();
+  }
+  return {
+    method: reqLine[0],
+    path: reqLine[1] || "/",
+    headers: headers,
+    body: bytes.subarray(headerEnd + 4),
+  };
+}
+
+// Serialize a response as raw HTTP/1.1 bytes for the guest's socket recv
+// buffer. Always Connection: close — clients must not pool/reuse the socket
+// (a pooled socket crossing a vfork would fight the M2 fd save/restore).
+function buildHttpResponse(status, statusText, headers, bodyBytes) {
+  var head = "HTTP/1.1 " + status + " " + (statusText || "OK") + "\r\n";
+  var seen = {};
+  Object.keys(headers || {}).forEach(function (k) {
+    var kl = k.toLowerCase();
+    if (kl === "content-length" || kl === "connection" || kl === "transfer-encoding") return;
+    seen[kl] = true;
+    head += k + ": " + headers[k] + "\r\n";
+  });
+  if (!seen["content-type"]) head += "Content-Type: application/json\r\n";
+  head += "Content-Length: " + bodyBytes.length + "\r\nConnection: close\r\n\r\n";
+  var headBytes = new TextEncoder().encode(head);
+  var out = new Uint8Array(headBytes.length + bodyBytes.length);
+  out.set(headBytes, 0);
+  out.set(bodyBytes, headBytes.length);
+  return out;
+}
+
+function textResponse(status, statusText, text) {
+  return buildHttpResponse(status, statusText, { "Content-Type": "text/plain" },
+                           new TextEncoder().encode(text));
+}
+
 self.Module = {
+  // Called by blink's virtual-socket layer (EM_ASYNC_JS em_http_fetch) with
+  // the guest's destination IP/port and the raw request bytes; must resolve
+  // to raw HTTP response bytes. Routing mirrors useV86.ts: every known
+  // endpoint round-trips to the main thread as proxy_request/proxy_response
+  // (the test page mocks them; the real host registers endpoint handlers).
+  // Unknown destinations get a synthesized 403 — never a real network hop.
+  emHttpFetch: async function (ip, port, reqBytes) {
+    var hostname = VM_ROUTES[ip];
+    if (!hostname || port !== 80) {
+      return textResponse(403, "Forbidden", "blocked: " + ip + ":" + port + " is not a vm route\n");
+    }
+    var req = parseHttpRequest(reqBytes);
+    if (!req) return textResponse(400, "Bad Request", "unparseable HTTP request\n");
+    var id = ++_proxySeq;
+    var respPromise = new Promise(function (resolve) {
+      _proxyWaiters[id] = resolve;
+      setTimeout(function () {
+        if (_proxyWaiters[id]) {
+          delete _proxyWaiters[id];
+          resolve({ status: 504, statusText: "Gateway Timeout", headers: {}, body: "endpoint timeout\n" });
+        }
+      }, 30000);
+    });
+    self.postMessage({
+      type: "proxy_request",
+      id: id,
+      hostname: hostname,
+      port: port,
+      method: req.method,
+      path: req.path,
+      headers: req.headers,
+      body: new TextDecoder().decode(req.body),
+    });
+    var r = await respPromise;
+    var body = typeof r.body === "string" ? new TextEncoder().encode(r.body)
+             : (r.body instanceof Uint8Array ? r.body : new Uint8Array(0));
+    return buildHttpResponse(r.status || 200, r.statusText, r.headers || {}, body);
+  },
+  emHttpLog: function (text) { self.postMessage({ type: "dbg", text: text }); },
+
   preRun: [
     function () {
       function mkdirp(p) {
@@ -52,6 +156,17 @@ self.Module = {
       mkdirp("/home");
       mkdirp("/workspace");
       mkdirp("/lib");
+      mkdirp("/etc");
+
+      // M3 HTTP bridge, DNS half: musl/busybox getaddrinfo consult /etc/hosts
+      // before DNS, so seeding fake IPs for the virtual endpoints means no
+      // DNS-syscall interception is needed. connect() to one of these IPs hits
+      // the virtual-socket path in blink (EmSysConnect), which hands the HTTP
+      // request to Module.emHttpFetch below.
+      var hosts = "";
+      Object.keys(VM_ROUTES).forEach(function (ip) { hosts += ip + " " + VM_ROUTES[ip] + "\n"; });
+      FS.writeFile("/etc/hosts", "127.0.0.1 localhost\n" + hosts);
+      FS.writeFile("/etc/resolv.conf", "nameserver 127.0.0.1\n");
 
       function fetchInto(url, destPath, mode, applets) {
         addRunDependency("fetch-" + destPath);
@@ -193,6 +308,14 @@ async function exec(argv) {
 
 self.onmessage = async function (ev) {
   var msg = ev.data;
+  if (msg.type === "proxy_response") {
+    var waiter = _proxyWaiters[msg.id];
+    if (waiter) {
+      delete _proxyWaiters[msg.id];
+      waiter(msg);
+    }
+    return;
+  }
   if (msg.type === "exec" || msg.type === "exec_raw") {
     await moduleReadyPromise;
     // exec: argv[0] resolved under /bin. exec_raw: argv passed verbatim to
