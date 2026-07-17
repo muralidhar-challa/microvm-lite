@@ -151,6 +151,7 @@ self.Module = {
       pathname: pathname,
       hostname: hostname,
       method: req.method,
+      headers: req.headers,
       body: new TextDecoder().decode(req.body),
     });
     var r = await respPromise;
@@ -159,6 +160,7 @@ self.Module = {
     return buildHttpResponse(r.status || 200, r.statusText, r.headers || {}, body);
   },
   emHttpLog: function (text) { self.postMessage({ type: "dbg", text: text }); },
+  onAbort: function (what) { self.postMessage({ type: "dbg", text: "ABORT: " + what + "\n" + (new Error().stack) }); },
 
   preRun: [function () {
     function mkdirp(p) { try { FS.mkdir(p); } catch (e) { /* EEXIST */ } }
@@ -213,6 +215,7 @@ var _lastExitCode = null;
 
 async function callMainAsync(args) {
   Module._em_reset_getopt();
+  Module._em_reset_children();
   _prevArgvAllocs.forEach(function (p) { Module._free(p); });
   var ptrs = args.map(function (a) { return Module.stringToNewUTF8(a); });
   var argvBuf = Module._malloc((ptrs.length + 1) * 4);
@@ -231,11 +234,26 @@ async function callMainAsync(args) {
 }
 
 // runExec: run argv under blink, capturing stdout+stderr via MEMFS files.
+//
+// fd 0 is explicitly opened here (/dev/null — no interactive stdin in this
+// model) for the same reason fd 1/2 always get a fresh stream: a real Unix
+// process ALWAYS has fds 0/1/2 pre-opened before it runs, and some guest
+// programs rely on that guarantee. Confirmed root cause of a real bug: dash's
+// own evalpipe() (src/eval.c) only dup2()s a pipe's write end to fd 1 when
+// `pip[1] > 1` — on a real OS pipe() can never return fd 0 (0/1/2 are always
+// already taken), so dash's authors never needed to handle pip[1]==0, but if
+// fd 0 is left CLOSED here, pipe() may allocate its write end AT fd 0, and
+// dash's `> 1` check then wrongly skips the redirect — the pipeline's writer
+// silently keeps writing to whatever fd 1 already was instead of the pipe,
+// which only shows up as wrong output on the pipeline that happens to hit
+// this, not as a crash. Keeping fd 0 always-open sidesteps it for dash and
+// any other guest binary carrying the same (extremely standard) assumption.
 async function runExec(argv) {
   var id = ++_runSeq;
   var outPath = "/tmp/.stdout." + id, errPath = "/tmp/.stderr." + id;
+  var inStream = FS.open("/dev/null", "r");
   var outStream = FS.open(outPath, "w+"), errStream = FS.open(errPath, "w+");
-  FS.streams[1] = outStream; FS.streams[2] = errStream;
+  FS.streams[0] = inStream; FS.streams[1] = outStream; FS.streams[2] = errStream;
   var error = null, exitCode = null;
   _execBusy = true;
   try { exitCode = await callMainAsync(["blink"].concat(argv)); }
@@ -244,6 +262,16 @@ async function runExec(argv) {
   var output = "";
   try { output += new TextDecoder().decode(FS.readFile(outPath)); } catch (e) {}
   try { output += new TextDecoder().decode(FS.readFile(errPath)); } catch (e) {}
+  // Close the streams explicitly — leaving them open leaks Emscripten fd
+  // numbers across every run in this worker (FS.streams[N] just get
+  // overwritten next run, never freed), so fd numbers climb unbounded over a
+  // long-lived session. blink's own C code partitions fds into a "guest range"
+  // vs "blink-internal range" by a fixed numeric cutoff (kMinBlinkFd) — once
+  // real host fd numbers climb past that cutoff, blink misclassifies a guest
+  // fd as its own internal fd and later commands' output/redirection breaks.
+  try { FS.close(inStream); } catch (e) {}
+  try { FS.close(outStream); } catch (e) {}
+  try { FS.close(errStream); } catch (e) {}
   try { FS.unlink(outPath); } catch (e) {}
   try { FS.unlink(errPath); } catch (e) {}
   return { output: output, error: error, exitCode: exitCode };
@@ -336,8 +364,8 @@ async function ensureBundlesFor(cmd) {
 // -fork commands included — is captured intact. cmd goes on its own line inside
 // the group so a trailing `;`/operator in cmd can't break the `)` terminator.
 async function runShellCapture(cmd, capFile, pidFile) {
-  var script = "{ cd " + HOME + " 2>/dev/null; " + cmd + "; } > " + capFile + " 2>&1";
-  if (pidFile) script = "echo $$ > " + pidFile + "; " + script;
+  var script = (pidFile ? "echo $$ > " + pidFile + "; " : "")
+    + "exec > " + capFile + " 2>&1; cd " + HOME + " 2>/dev/null; " + cmd;
   return runExec(["/bin/sh", "-c", script]);
 }
 

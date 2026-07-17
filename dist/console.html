@@ -15,16 +15,7 @@
   .chips { display: flex; gap: 6px; flex-wrap: wrap; }
   .chips button { font: inherit; font-size: 11px; background: #1e2436; color: #cdd6f4; border: 1px solid #2a3350; border-radius: 6px; padding: 3px 8px; cursor: pointer; }
   .chips button:hover { background: #2a3350; }
-  #scrollback { flex: 1; overflow-y: auto; padding: 12px 14px; white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.45; }
-  .cmd { color: #89b4fa; }
-  .cmd::before { content: "$ "; color: #6c7086; }
-  .out { color: #cdd6f4; }
-  .err { color: #f38ba8; }
-  .sys { color: #6c7086; font-style: italic; }
-  .inputrow { display: flex; border-top: 1px solid #222838; background: #11151f; }
-  .inputrow .prompt { padding: 10px 6px 10px 14px; color: #6c7086; }
-  #input { flex: 1; background: transparent; border: 0; outline: 0; color: #cdd6f4; font: inherit; font-size: 13px; padding: 10px 14px 10px 0; }
-  #input:disabled { opacity: .5; }
+  #term { flex: 1; min-height: 0; padding: 8px; }
 </style>
 </head>
 <body>
@@ -33,45 +24,19 @@
     <span id="status" class="status boot">booting…</span>
     <span class="chips" id="examples"></span>
   </header>
-  <div id="scrollback"></div>
-  <div class="inputrow">
-    <span class="prompt">user@microvm:~$</span>
-    <input id="input" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="type a command and press Enter (try: help)" disabled>
-  </div>
+  <div id="term"></div>
 
 <script type="module">
+  // Zero-config terminal: start the VM, then hand attachTerminal a container.
+  // It locates its own xterm.js/xterm-addon-fit/xterm.css siblings and wires
+  // the REPL loop against window.vm — no manual asset/script wiring here.
   import { startVM } from "./vm-host.js";
+  import { attachTerminal } from "./vm-terminal.js";
   window.__vmDebug = false;
 
-  const sb = document.getElementById("scrollback");
-  const input = document.getElementById("input");
   const statusEl = document.getElementById("status");
-  const history = [];
-  let hix = 0;
 
-  function line(text, cls) {
-    const div = document.createElement("div");
-    div.className = cls || "out";
-    div.textContent = text;
-    sb.appendChild(div);
-    sb.scrollTop = sb.scrollHeight;
-  }
-
-  const EXAMPLES = [
-    "ls -la", "cat /etc/hosts", "echo hello | tr a-z A-Z",
-    "for i in 1 2 3; do echo row$i; done",
-    "wget -O - http://api.vm/echo",
-  ];
-  const ex = document.getElementById("examples");
-  EXAMPLES.forEach(c => {
-    const b = document.createElement("button");
-    b.textContent = c.length > 34 ? c.slice(0, 32) + "…" : c;
-    b.title = c;
-    b.onclick = () => { input.value = c; input.focus(); };
-    ex.appendChild(b);
-  });
-
-  // ── Mock host endpoint so the HTTP bridge has something to answer ──
+  // Mock host endpoint so the HTTP bridge has something to answer.
   // Product-agnostic: the runtime hardcodes no endpoints — this is a canned
   // demo endpoint the page registers. Real integrators register their own.
   function installMocks() {
@@ -79,87 +44,28 @@
     window.registerVmEndpoint("/echo", (_m, data) => ({ ok: true, note: "canned demo endpoint", got: data || null }));
   }
 
-  const HELP = [
-    "Local microvm-lite session (dash + toybox).",
-    "",
-    "Works offline:  shell, coreutils, file ops. Type any sh command.",
-    "HTTP bridge:    http://api.vm/echo → a canned demo endpoint.",
-    "Builtins:       help · clear",
-    "  run <cmd>     run via the BACKGROUND-RUN contract (window.vm.run).",
-    "  <cmd>         run via window.vm.execute() — blocking, returns the string.",
-  ].join("\n");
-
-  // vm.run: the {done, output_file, pid, output} background-run contract.
-  async function runBackground(cmd) {
-    input.disabled = true;
-    const t0 = performance.now();
-    try {
-      const r = await window.vm.run(cmd, 60000);
-      line(`{ done: ${r.done}, output_file: ${JSON.stringify(r.output_file)}, pid: ${r.pid} }`, "sys");
-      if (r.output && r.output.length) line(r.output, "out");
-      // Prove output_file is real on the guest FS by reading it back.
-      if (r.output_file) {
-        try {
-          const disk = await window.vm.readFile(r.output_file);
-          line(`  (output_file on disk = ${JSON.stringify(disk.slice(0, 60))}${disk.length > 60 ? "…" : ""})`, "sys");
-        } catch {}
-      }
-      line(`  [${Math.round(performance.now() - t0)} ms]`, "sys");
-    } catch (e) {
-      line("error: " + (e && e.message || e), "err");
-    } finally {
-      input.disabled = false; input.focus();
-    }
-  }
-
-  async function run(cmd) {
-    line(cmd, "cmd");
-    if (cmd === "clear") { sb.innerHTML = ""; return; }
-    if (cmd === "help") { line(HELP, "sys"); return; }
-    if (cmd === "run" || cmd.startsWith("run ")) {
-      const inner = cmd.slice(3).trim();
-      if (!inner) { line("usage: run <command>", "err"); return; }
-      return runBackground(inner);
-    }
-    input.disabled = true;
-    const t0 = performance.now();
-    try {
-      const out = await window.vm.execute(cmd, 60000);
-      if (out && out.length) line(out, "out");
-      line(`  [${Math.round(performance.now() - t0)} ms]`, "sys");
-    } catch (e) {
-      line("error: " + (e && e.message || e), "err");
-    } finally {
-      input.disabled = false;
-      input.focus();
-    }
-  }
-
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      const cmd = input.value.trim();
-      if (!cmd) return;
-      history.push(cmd); hix = history.length;
-      input.value = "";
-      run(cmd);
-    } else if (e.key === "ArrowUp") {
-      if (hix > 0) { hix--; input.value = history[hix]; e.preventDefault(); }
-    } else if (e.key === "ArrowDown") {
-      if (hix < history.length - 1) { hix++; input.value = history[hix]; }
-      else { hix = history.length; input.value = ""; }
-    }
-  });
+  const EXAMPLES = [
+    "ls -la", "cat /etc/hosts", "echo hello | tr a-z A-Z",
+    "for i in 1 2 3; do echo row$i; done",
+    "wget -O - http://api.vm/echo",
+  ];
 
   (async () => {
-    line("booting microvm… (~1MB base toolchain)", "sys");
-    // await startVM: it installs window.vm + registerVmEndpoint and posts init,
-    // THEN we register mocks and wait for the worker's ready signal.
     await startVM({ cdnBase: ".", workerUrl: "vm-worker.js", vmRoutes: { "api.vm": "mock" } });
     installMocks();
     await window.vm.ready();
     statusEl.textContent = "ready"; statusEl.className = "status ready";
-    input.disabled = false; input.focus();
-    line("ready. type 'help', or click an example chip above.", "sys");
+
+    const term = await attachTerminal(document.getElementById("term"));
+
+    const ex = document.getElementById("examples");
+    EXAMPLES.forEach(c => {
+      const b = document.createElement("button");
+      b.textContent = c.length > 34 ? c.slice(0, 32) + "…" : c;
+      b.title = c;
+      b.onclick = () => term.terminal.paste(c);
+      ex.appendChild(b);
+    });
   })();
 </script>
 </body>

@@ -12,7 +12,8 @@ communities below.
 - **[blink](https://github.com/jart/blink)** by Justine Tunney — the x86-64
   userspace emulator, compiled to WebAssembly (ISC). See `blink/`.
 - **[Emscripten](https://emscripten.org/)** — the WebAssembly toolchain.
-- **[xterm.js](https://xtermjs.org/)** — terminal UI in dev assets (MIT).
+- **[xterm.js](https://xtermjs.org/)** — terminal UI, shipped in `dist/` and used
+  by `vm-terminal.js` (MIT).
 
 ## This repository's own work
 

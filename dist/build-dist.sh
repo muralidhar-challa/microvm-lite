@@ -19,12 +19,14 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)"          # microvm/
 WASM="$DIR/blink-wasm"
 SRC="$DIR/src"
+ASSETS="$DIR/blink/assets"
 OUT="$DIR/dist"
 
 [ -f "$WASM/blink.wasm" ] || { echo "blink-wasm/ not built — run blink/build.sh first" >&2; exit 1; }
 
 echo "[1/3] Clean dist/"
-rm -rf "$OUT/blink.js" "$OUT/blink.wasm" "$OUT/vm-worker.js" "$OUT/vm-host.js" \
+rm -rf "$OUT/blink.js" "$OUT/blink.wasm" "$OUT/vm-worker.js" "$OUT/vm-host.js" "$OUT/vm-terminal.js" \
+       "$OUT/xterm.min.js" "$OUT/xterm-addon-fit.min.js" "$OUT/xterm.css" \
        "$OUT/bin" "$OUT/rootfs" "$OUT/manifest.json"
 mkdir -p "$OUT/bin"
 
@@ -33,6 +35,10 @@ cp -L "$WASM/blink.js"  "$OUT/blink.js"
 cp -L "$WASM/blink.wasm" "$OUT/blink.wasm"
 cp -L "$SRC/vm-worker.js" "$OUT/vm-worker.js"
 cp -L "$SRC/vm-host.js"   "$OUT/vm-host.js"
+cp -L "$SRC/vm-terminal.js" "$OUT/vm-terminal.js"
+cp -L "$ASSETS/xterm.min.js" "$OUT/xterm.min.js"
+cp -L "$ASSETS/xterm-addon-fit.min.js" "$OUT/xterm-addon-fit.min.js"
+cp -L "$ASSETS/xterm.css" "$OUT/xterm.css"
 cp -L "$WASM/dash"   "$OUT/bin/dash"         # BSD-3-Clause /bin/sh
 cp -L "$WASM/toybox"  "$OUT/bin/toybox"       # 0BSD coreutils
 
