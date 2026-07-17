@@ -54,7 +54,7 @@ no-ASYNCIFY scheduler build should also speed the interpreter).
   static-compile and proved blink's dynamic-linking path (which a realistic
   rootfs needs anyway). First dynamic exec pays a one-time loader+lib cost
   (~0.6 s); subsequent execs are warm.
-- **Static binaries**: our own Rust tools (xtool, app, runner) + busybox are
+- **Static binaries**: static Rust tool binaries + busybox are
   static non-PIE (`-C relocation-model=static`), fetched into `/bin`.
 - Numbers include full per-exec overhead (postMessage round-trip + Asyncify
   main() invocation), i.e. what the real `window.vm` contract will see.

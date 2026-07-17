@@ -29,12 +29,15 @@ self.onunhandledrejection = function (e) {
 // thread passes it in `init.cdnBase` (mirrors useV86's cdnBase). Defaults to
 // the worker's own directory so a plain static server just works.
 var BASE = ".";
-var VM_ROUTES = { "10.0.2.10": "llm.vm", "10.0.2.11": "api.vm", "10.0.2.12": "done.vm" };
 
-// Fallback lists used only when no dist manifest.json is present (e.g. a bare
-// test dir). In the packaged dist/, the manifest drives everything.
-var BINARIES = ["busybox", "xtool", "probe", "app", "runner"];
-var ROOTFS_MANIFEST = "rootfs/manifest.json";
+// Virtual HTTP routes: IP → hostname. Built from init.vmRoutes at init time —
+// the runtime is PRODUCT-AGNOSTIC and hardcodes no endpoints. Seeds the guest
+// /etc/hosts and maps guest connect() destinations back to a hostname for the
+// fetch bridge (see emHttpFetch). Fake IPs assigned 10.0.2.10, .11, … in order.
+var VM_ROUTES = {};
+
+// BusyBox applets symlinked onto the single busybox binary. manifest.applets
+// overrides; this is the fallback for a bare (no-manifest) dir.
 var APPLETS = [
   "sh", "hush", "ls", "cat", "sed", "awk", "grep", "find", "head", "tail",
   "cp", "mv", "rm", "mkdir", "rmdir", "touch", "echo", "printf",
@@ -43,14 +46,19 @@ var APPLETS = [
   "sleep", "seq", "yes", "date", "sync", "kill", "true", "false",
 ];
 
-// M5: the dist manifest (fetched in `init` before blink loads). When present it
-// lists the eager `core` bin/, the `applets`, the `lazy.poppler` closure, and
-// the `triggers` (command tokens that force a lazy fetch). null → fall back to
-// the hardcoded lists above and eager-load everything.
+// The asset manifest, fetched in `init` before blink loads. Product-agnostic:
+// named BUNDLES of files (ELF binaries, shared libs, skills, seed assets), each
+//   { tier: "eager" | "lazy", triggers?: [tokens], files: [ {url,dest,mode,applets} ] }
+// eager bundles stage at boot (block ready); lazy bundles stage on the first
+// command whose text matches one of the bundle's trigger tokens (or an explicit
+// vm.loadBundle(name)). The base build ships busybox + generic OSS
+// (sqlite/poppler); PRODUCT tools + skills come from the integrator's manifest
+// or from vm.loadBundle()/vm.writeFile() at runtime — never hardcoded here.
+// null → minimal fallback (busybox only, fetched from BASE/busybox).
 var MANIFEST = null;
-// Lazy poppler/sqlite closure: fetched at most once, on first triggering cmd.
-var _rootfsPromise = null;
+var _bundlePromises = {};   // bundle name → resolved-once staging promise (idempotent)
 
+// Working directory. From manifest.home / init.home; default /workspace.
 var HOME = "/workspace";
 
 var _moduleReadyResolve;
@@ -157,50 +165,35 @@ self.Module = {
 
   preRun: [function () {
     function mkdirp(p) { try { FS.mkdir(p); } catch (e) { /* EEXIST */ } }
-    mkdirp("/root"); mkdirp("/bin"); mkdirp("/lib");
-    mkdirp("/home"); mkdirp(HOME); mkdirp("/etc"); mkdirp("/tmp");
+    mkdirp("/root"); mkdirp("/bin"); mkdirp("/lib"); mkdirp("/etc"); mkdirp("/tmp");
+    mkdirpDeep(HOME);
     ENV["HOME"] = HOME; ENV["PATH"] = "/bin:/root"; ENV["TERM"] = "xterm";
     ENV["WORKDIR"] = HOME;
 
-    // M3 DNS seed.
+    // DNS seed from the configured routes (product-agnostic — VM_ROUTES is built
+    // from init.vmRoutes). musl/busybox getaddrinfo reads /etc/hosts first.
     var hosts = "127.0.0.1 localhost\n";
     Object.keys(VM_ROUTES).forEach(function (ip) { hosts += ip + " " + VM_ROUTES[ip] + "\n"; });
     FS.writeFile("/etc/hosts", hosts);
     FS.writeFile("/etc/resolv.conf", "nameserver 127.0.0.1\n");
 
-    function fetchInto(url, destPath, mode, applets) {
-      addRunDependency("fetch-" + destPath);
-      fetch(url).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.arrayBuffer(); })
-        .then(function (buf) {
-          FS.writeFile(destPath, new Uint8Array(buf), { mode: mode });
-          if (applets) applets.forEach(function (a) { try { FS.writeFile("/bin/" + a, new Uint8Array(buf), { mode: 0o755 }); } catch (e) {} });
-          removeRunDependency("fetch-" + destPath);
-        })
-        .catch(function (e) { self.postMessage({ type: "dbg", text: "fetch " + destPath + " skipped: " + e.message }); removeRunDependency("fetch-" + destPath); });
-    }
-
-    if (MANIFEST) {
-      // Packaged path: eager-load ONLY the core tier (busybox+applets, xtool,
-      // app, runner). Poppler/sqlite stay unfetched until a triggering command
-      // (see ensureRootfs) — this is what keeps cold boot off the ~16MB closure.
-      var applets = MANIFEST.applets || APPLETS;
-      Object.keys(MANIFEST.core).forEach(function (rel) {
-        if (rel.indexOf("bin/") !== 0) return;  // blink.js/.wasm load via Emscripten
-        var name = rel.slice(4);
-        fetchInto(BASE + "/" + rel, "/bin/" + name, 0o755, name === "busybox" ? applets : null);
+    // Stage EAGER bundles (block ready). Lazy bundles wait for a trigger token
+    // or an explicit vm.loadBundle(). No manifest → minimal busybox fallback.
+    if (MANIFEST && MANIFEST.bundles) {
+      Object.keys(MANIFEST.bundles).forEach(function (name) {
+        var b = MANIFEST.bundles[name];
+        if ((b.tier || "eager") !== "eager") return;
+        (b.files || []).forEach(function (f) {
+          addRunDependency("stage-" + f.dest);
+          stageFile(f).then(function () { removeRunDependency("stage-" + f.dest); })
+            .catch(function (e) { self.postMessage({ type: "dbg", text: "stage " + f.dest + " skipped: " + e.message }); removeRunDependency("stage-" + f.dest); });
+        });
       });
     } else {
-      // Fallback path (no manifest): eager-load everything, including poppler.
-      BINARIES.forEach(function (name) { fetchInto(BASE + "/" + name, "/bin/" + name, 0o755, name === "busybox" ? APPLETS : null); });
-      addRunDependency("fetch-rootfs");
-      fetch(BASE + "/" + ROOTFS_MANIFEST)
-        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-        .then(function (man) {
-          man.bin.forEach(function (f) { fetchInto(BASE + "/rootfs/bin/" + f, "/bin/" + f, 0o755); });
-          man.lib.forEach(function (f) { fetchInto(BASE + "/rootfs/lib/" + f, "/lib/" + f, 0o755); });
-          removeRunDependency("fetch-rootfs");
-        })
-        .catch(function (e) { self.postMessage({ type: "dbg", text: "rootfs manifest skipped: " + e.message }); removeRunDependency("fetch-rootfs"); });
+      addRunDependency("stage-busybox");
+      stageFile({ url: "busybox", dest: "/bin/busybox", mode: "0755", applets: true })
+        .then(function () { removeRunDependency("stage-busybox"); })
+        .catch(function (e) { self.postMessage({ type: "dbg", text: "busybox skipped: " + e.message }); removeRunDependency("stage-busybox"); });
     }
 
     // Keep /dev/stdout,/dev/stderr registered but discard — real capture is
@@ -261,46 +254,72 @@ async function runExec(argv) {
 
 function randHex() { return Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0"); }
 
-// ── Lazy poppler/sqlite closure (M5) ─────────────────────────────────────────
-// Fetched at most once, the first time a command references a trigger token
-// (pdftotext/pdfinfo/pdftoppm/…/sqlite3). Staged into MEMFS /bin and /lib just
-// like the eager tier; subsequent calls reuse the resolved promise.
-function ensureRootfs() {
-  if (!MANIFEST || !MANIFEST.lazy || !MANIFEST.lazy.poppler) return Promise.resolve();
-  if (_rootfsPromise) return _rootfsPromise;
-  var lazy = MANIFEST.lazy.poppler;
-  self.postMessage({ type: "dbg", text: "lazy-loading poppler closure (" + Object.keys(lazy).length + " files)" });
-  _rootfsPromise = Promise.all(Object.keys(lazy).map(function (rel) {
-    // rel is "rootfs/bin/<f>" or "rootfs/lib/<f>" → /bin/<f> or /lib/<f>
-    var dest = rel.indexOf("rootfs/bin/") === 0 ? "/bin/" + rel.slice(11)
-             : rel.indexOf("rootfs/lib/") === 0 ? "/lib/" + rel.slice(11)
-             : null;
-    if (!dest) return Promise.resolve();
-    return fetch(BASE + "/" + rel).then(function (r) {
-      if (!r.ok) throw new Error("HTTP " + r.status + " for " + rel);
-      return r.arrayBuffer();
-    }).then(function (buf) { FS.writeFile(dest, new Uint8Array(buf), { mode: 0o755 }); });
-  })).then(function () {
-    self.postMessage({ type: "dbg", text: "poppler closure ready" });
-  }).catch(function (e) {
-    _rootfsPromise = null;  // allow a retry on the next triggering command
-    self.postMessage({ type: "dbg", text: "poppler lazy-load failed: " + e.message });
-    throw e;
-  });
-  return _rootfsPromise;
+// ── Bundle staging (generic, product-agnostic asset loading) ─────────────────
+function octalMode(m) { return typeof m === "string" ? parseInt(m, 8) : (typeof m === "number" ? m : 0o755); }
+
+function mkdirpDeep(dir) {
+  dir.split("/").reduce(function (acc, seg) {
+    if (!seg) return acc;
+    var d = acc + "/" + seg;
+    try { FS.mkdir(d); } catch (e) {}
+    return d;
+  }, "");
 }
 
-// Whether a command line references any lazy-tier binary → needs ensureRootfs.
-function needsRootfs(cmd) {
-  if (!MANIFEST || !MANIFEST.triggers || !MANIFEST.triggers.length) return false;
-  for (var i = 0; i < MANIFEST.triggers.length; i++) {
-    var t = MANIFEST.triggers[i];
-    // word-ish boundary so "pdftotext" matches but a substring in a path/arg
-    // that merely contains it (e.g. "mypdftotextfile") does not.
-    var re = new RegExp("(^|[^A-Za-z0-9_])" + t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^A-Za-z0-9_]|$)");
-    if (re.test(cmd)) return true;
-  }
-  return false;
+function applyApplets(busyboxBytes) {
+  var applets = (MANIFEST && MANIFEST.applets) || APPLETS;
+  applets.forEach(function (a) { try { FS.writeFile("/bin/" + a, busyboxBytes, { mode: 0o755 }); } catch (e) {} });
+}
+
+// Stage one bundle file into MEMFS: fetch BASE/url → write to dest (mkdir -p its
+// dir), applying applet symlinks if flagged (the busybox multi-call binary).
+function stageFile(f) {
+  return fetch(BASE + "/" + f.url).then(function (r) {
+    if (!r.ok) throw new Error("HTTP " + r.status + " for " + f.url);
+    return r.arrayBuffer();
+  }).then(function (buf) {
+    var slash = f.dest.lastIndexOf("/");
+    if (slash > 0) mkdirpDeep(f.dest.slice(0, slash));
+    var bytes = new Uint8Array(buf);
+    FS.writeFile(f.dest, bytes, { mode: octalMode(f.mode) });
+    if (f.applets) applyApplets(bytes);
+  });
+}
+
+// Stage a lazy bundle by name, at most once (idempotent). Both vm.loadBundle()
+// and the trigger path funnel here — so product binaries/skills you add later
+// load exactly like the built-in generic OSS bundle.
+function ensureBundle(name) {
+  if (!MANIFEST || !MANIFEST.bundles || !MANIFEST.bundles[name]) return Promise.resolve();
+  if (_bundlePromises[name]) return _bundlePromises[name];
+  var b = MANIFEST.bundles[name];
+  self.postMessage({ type: "dbg", text: "staging bundle '" + name + "' (" + (b.files || []).length + " files)" });
+  _bundlePromises[name] = Promise.all((b.files || []).map(stageFile))
+    .then(function () { self.postMessage({ type: "dbg", text: "bundle '" + name + "' ready" }); })
+    .catch(function (e) { _bundlePromises[name] = null; self.postMessage({ type: "dbg", text: "bundle '" + name + "' failed: " + e.message }); throw e; });
+  return _bundlePromises[name];
+}
+
+// Lazy bundles a command triggers (by token match on the bundle's `triggers`).
+function bundlesForCommand(cmd) {
+  var names = [];
+  if (!MANIFEST || !MANIFEST.bundles) return names;
+  Object.keys(MANIFEST.bundles).forEach(function (name) {
+    var b = MANIFEST.bundles[name];
+    if ((b.tier || "eager") !== "lazy" || !b.triggers) return;
+    for (var i = 0; i < b.triggers.length; i++) {
+      var t = b.triggers[i];
+      // word-ish boundary so "pdftotext" matches but not "mypdftotextfile".
+      var re = new RegExp("(^|[^A-Za-z0-9_])" + t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^A-Za-z0-9_]|$)");
+      if (re.test(cmd)) { names.push(name); break; }
+    }
+  });
+  return names;
+}
+
+async function ensureBundlesFor(cmd) {
+  var names = bundlesForCommand(cmd);
+  for (var i = 0; i < names.length; i++) { try { await ensureBundle(names[i]); } catch (e) {} }
 }
 
 // Run `cmd` under sh with stdout+stderr captured via a GUEST-LEVEL redirect to
@@ -328,7 +347,7 @@ async function runShellCapture(cmd, capFile, pidFile) {
 
 // ── vm.execute (worker msg "run"): simple string capture ─────────────────────
 async function doRun(cmd) {
-  if (needsRootfs(cmd)) await ensureRootfs();
+  await ensureBundlesFor(cmd);
   var cap = "/tmp/.run-" + randHex();
   await runShellCapture(cmd, cap);
   var out = "";
@@ -342,7 +361,7 @@ async function doRun(cmd) {
 // /tmp/pid-<hex>.txt) so the app's window.vm.run pid-readback path is byte-for-
 // byte compatible. Run-to-completion → always done:true (see file header).
 async function doExecute(cmd) {
-  if (needsRootfs(cmd)) await ensureRootfs();
+  await ensureBundlesFor(cmd);
   var hex = randHex();
   var outFile = "/tmp/out-" + hex + ".txt", pidFile = "/tmp/pid-" + hex + ".txt";
   await runShellCapture(cmd, outFile, pidFile);
@@ -413,16 +432,31 @@ self.onmessage = async function (ev) {
 
   if (msg.type === "init") {
     BASE = msg.cdnBase || ".";
-    if (msg.vmRoutes) { /* host may override, but IPs are ours; keep VM_ROUTES */ }
     if (msg.stateBuffer) _initSnapshot = msg.stateBuffer;
-    // Fetch the dist manifest BEFORE blink loads: preRun reads MANIFEST to
-    // decide eager vs lazy tiers. Absent (bare test dir) → hardcoded fallback.
+    // Assign a fake IP to each configured hostname (product-agnostic: the routes
+    // come entirely from the integrator's init.vmRoutes). These seed /etc/hosts
+    // and let the fetch bridge map guest connect() dests back to a hostname.
+    if (msg.vmRoutes) {
+      var ipN = 10;
+      Object.keys(msg.vmRoutes).forEach(function (host) { VM_ROUTES["10.0.2." + (ipN++)] = host; });
+    }
+    // Fetch the manifest BEFORE blink loads: preRun reads MANIFEST.bundles to
+    // decide eager vs lazy staging. Absent → minimal busybox fallback.
     try {
       var mr = await fetch(BASE + "/manifest.json");
       if (mr.ok) MANIFEST = await mr.json();
     } catch (e) { MANIFEST = null; }
+    if (MANIFEST && MANIFEST.home) HOME = MANIFEST.home;
+    if (msg.home) HOME = msg.home;
     importScripts(BASE + "/blink.js");
     moduleReadyPromise.then(function () { self.postMessage({ type: "ready", buildId: MANIFEST && MANIFEST.buildId }); });
+    return;
+  }
+
+  if (msg.type === "load_bundle") {
+    await moduleReadyPromise;
+    try { await ensureBundle(msg.name); self.postMessage({ type: "result", id: msg.id, value: { ok: true, name: msg.name } }); }
+    catch (err) { self.postMessage({ type: "error", id: msg.id, message: String(err && err.message || err) }); }
     return;
   }
 
@@ -436,7 +470,7 @@ self.onmessage = async function (ev) {
   if (msg.type === "exec" || msg.type === "exec_raw") {
     await moduleReadyPromise;
     var argv = msg.type === "exec" ? ["/bin/" + msg.argv[0]].concat(msg.argv.slice(1)) : msg.argv;
-    if (needsRootfs(argv.join(" "))) await ensureRootfs();
+    await ensureBundlesFor(argv.join(" "));
     var r = await runExec(argv);
     self.postMessage({ type: "result", id: msg.id, output: r.output, error: r.error, exitCode: r.exitCode });
     return;
@@ -460,9 +494,12 @@ self.onmessage = async function (ev) {
     await moduleReadyPromise;
     try {
       var bytes = new Uint8Array(msg.buf);
-      var p = msg.path, dir = p.slice(0, p.lastIndexOf("/")) || "/";
-      dir.split("/").reduce(function (acc, seg) { if (!seg) return acc; var d = acc + "/" + seg; try { FS.mkdir(d); } catch (e) {} return d; }, "");
-      FS.writeFile(p, bytes);
+      var p = msg.path, slash = p.lastIndexOf("/");
+      if (slash > 0) mkdirpDeep(p.slice(0, slash));
+      // Optional mode lets integrators push an executable (ELF binary, 0o755)
+      // or a plain asset/skill (default). Enables "load binaries/skills later".
+      var opts = (msg.mode != null) ? { mode: octalMode(msg.mode) } : undefined;
+      FS.writeFile(p, bytes, opts);
       _fsDirty = true;
       self.postMessage({ type: "result", id: msg.id, value: null });
     } catch (err) { self.postMessage({ type: "error", id: msg.id, message: String(err && err.message || err) }); }

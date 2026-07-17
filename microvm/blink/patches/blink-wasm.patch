@@ -213,7 +213,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..8444a08 100644
+index 34cc01c..bdf8990 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -159,8 +159,8 @@ int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
@@ -453,10 +453,10 @@ index 34cc01c..8444a08 100644
 +
 +// ── M3: virtual sockets → HTTP fetch bridge ─────────────────────────────────
 +//
-+// The guest's HTTP clients (musl ureq in `runner`/`app`, busybox wget) do
++// The guest's HTTP clients (musl ureq clients + busybox wget) do
 +// getaddrinfo → socket → connect → write(request) → read(response) → close.
 +// getaddrinfo needs no syscall support: /etc/hosts is seeded by the worker
-+// with fake IPs for the virtual endpoints (llm.vm/api.vm/done.vm), and musl
++// with fake IPs for the virtual endpoints (the configured virtual hosts), and musl
 +// consults /etc/hosts before DNS. Everything below reproduces the rest of the
 +// path WITHOUT host sockets (Emscripten's socket layer is WebSocket-proxy
 +// emulation — unusable for plain fetch):

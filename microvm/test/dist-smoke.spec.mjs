@@ -52,20 +52,20 @@ try {
   console.log(`  · cold boot to ready: ${bootMs} ms`);
   // v86 boot is ~25-35s (bench-results.md); require a large margin under that.
   check("cold boot well under v86 (< 15s)", bootMs < 15000, `${bootMs}ms`);
-  check("poppler NOT fetched at boot", !dbg.some((l) => l.includes("lazy-loading poppler")), dbg.join(" | "));
+  check("poppler NOT fetched at boot", !dbg.some((l) => l.includes("staging bundle 'oss'")), dbg.join(" | "));
 
   // ── 2. Lazy poppler on first PDF command ──────────────────────────────────
   await page.evaluate((bytes) => window.vm.writeFile("/workspace/doc.pdf", new Uint8Array(bytes)), pdfBytes);
   const beforeLazy = dbg.length;
   const pdfOut = await page.evaluate(() => window.vm.execute("pdftotext doc.pdf - | head -c 60"));
-  check("lazy fetch triggered by pdftotext", dbg.slice(beforeLazy).some((l) => l.includes("lazy-loading poppler")), dbg.join(" | "));
-  check("poppler closure reported ready", dbg.some((l) => l.includes("poppler closure ready")));
+  check("lazy fetch triggered by pdftotext", dbg.slice(beforeLazy).some((l) => l.includes("staging bundle 'oss'")), dbg.join(" | "));
+  check("poppler closure reported ready", dbg.some((l) => l.includes("bundle 'oss' ready")));
   check("pdftotext produced text", typeof pdfOut === "string" && pdfOut.trim().length > 0, JSON.stringify(pdfOut));
 
   // Second PDF call must NOT re-fetch (closure cached).
   const beforeSecond = dbg.length;
   await page.evaluate(() => window.vm.execute("pdfinfo doc.pdf"));
-  check("second PDF call does not re-fetch", !dbg.slice(beforeSecond).some((l) => l.includes("lazy-loading poppler")));
+  check("second PDF call does not re-fetch", !dbg.slice(beforeSecond).some((l) => l.includes("staging bundle 'oss'")));
 
   // ── 3. buildId is the snapshot etag ───────────────────────────────────────
   await page.evaluate(() => window.vm.writeFile("/workspace/keep.txt", "packaged-persist"));

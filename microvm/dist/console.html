@@ -35,7 +35,7 @@
   </header>
   <div id="scrollback"></div>
   <div class="inputrow">
-    <span class="prompt">app@microvm:~$</span>
+    <span class="prompt">user@microvm:~$</span>
     <input id="input" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="type a command and press Enter (try: help)" disabled>
   </div>
 
@@ -58,13 +58,13 @@
   }
 
   const EXAMPLES = [
-    "ls -la", "xtool ping", "cat /etc/hosts",
+    "ls -la", "cat /etc/hosts", "echo hello | tr a-z A-Z",
     "sqlite3 /tmp/d.db 'create table t(x); insert into t values(1),(2),(3); select count(*),sum(x) from t;'",
     "rm -f /tmp/d.db; sqlite3 /tmp/d.db 'select 42;'",
     "pdftotext sample.pdf - | head -20",
     "for i in 1 2 3; do echo row$i; done",
     "run echo start; sleep 2; echo end",
-    "app queries --filter permit",
+    "wget -qO- http://api.vm/echo",
   ];
   const ex = document.getElementById("examples");
   EXAMPLES.forEach(c => {
@@ -75,27 +75,20 @@
     ex.appendChild(b);
   });
 
-  // ── Mock host endpoints so app/llm/done don't hang without a backend ──
-  // Clearly labelled: these are canned, not a real app/LLM.
+  // ── Mock host endpoint so the HTTP bridge has something to answer ──
+  // Product-agnostic: the runtime hardcodes no endpoints — this is a canned
+  // demo endpoint the page registers. Real integrators register their own.
   function installMocks() {
     if (typeof window.registerVmEndpoint !== "function") return setTimeout(installMocks, 20);
-    window.registerVmEndpoint("/ListQueries", (_m, d) => ({
-      queries: [{ query_id: 101, name: "Permit Lookup (mock)", description: "canned mock row — no real app backend" }],
-      total: 1, note: "MOCK",
-    }));
-    window.registerVmEndpoint("/anthropic/v1/messages", () => ({
-      content: [{ type: "text", text: "(mock LLM) no real model is wired in this local session." }],
-      stop_reason: "end_turn",
-    }));
-    window.registerVmEndpoint("/done", () => ({ ok: true }));
+    window.registerVmEndpoint("/echo", (_m, data) => ({ ok: true, note: "canned demo endpoint", got: data || null }));
   }
 
   const HELP = [
-    "Local microvm-lite session (blink backend, packaged dist).",
+    "Local microvm-lite session (generic blink runtime, packaged dist).",
     "",
-    "Works offline:  shell/coreutils, xtool, sqlite3, poppler (pdftotext/pdfinfo — lazy-",
+    "Works offline:  shell/coreutils, sqlite3, poppler (pdftotext/pdfinfo — lazy-",
     "                loaded on first use), file ops. Type any sh command.",
-    "Mocked:         api.vm / llm.vm / done.vm return CANNED data (no real backend).",
+    "HTTP bridge:    http://api.vm/echo → a canned demo endpoint (no real backend).",
     "Builtins:       help · clear",
     "  run <cmd>     run via the BACKGROUND-RUN contract (window.vm.run — the path",
     "                wasm-bridge.ts uses for run_shell_command). Shows the returned",
@@ -174,7 +167,7 @@
     line("booting blink microvm… (fetching ~10MB core; poppler loads lazily on first PDF)", "sys");
     // await startVM: it installs window.vm + registerVmEndpoint and posts init,
     // THEN we register mocks and wait for the worker's ready signal.
-    await startVM({ cdnBase: "/dist", workerUrl: "/dist/vm-worker.js", vmRoutes: {} });
+    await startVM({ cdnBase: "/dist", workerUrl: "/dist/vm-worker.js", vmRoutes: { "api.vm": "mock" } });
     installMocks();
     await window.vm.ready();
     // Seed a sample PDF for pdftotext, if the test asset is reachable.

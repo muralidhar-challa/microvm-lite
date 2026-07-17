@@ -1,11 +1,11 @@
 // Quick smoke of newly staged binaries/seeds (no poppler needed).
-// Usage: bun microvm/test/quick-test.mjs '["app","--help"]' '["ls","/workspace"]' ...
+// Usage: bun microvm/test/quick-test.mjs '["ls","/workspace"]' ...
 
 import { chromium } from "playwright";
 
 const commands = process.argv.slice(2).map((s) => JSON.parse(s));
 if (!commands.length) {
-  commands.push(["ls", "-la", "/workspace"], ["app", "--version"], ["runner", "--version"]);
+  commands.push(["ls", "-la", "/workspace"], ["runner", "--version"]);
 }
 
 const browser = await chromium.launch();

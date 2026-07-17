@@ -170,7 +170,7 @@ async function _doStartVM() {
   // binary changes buildId, which invalidates a stale IDB filesystem snapshot.
   // A caller-supplied baseEtag (opts) wins; a bare test dir with no manifest
   // keeps the default. (Poppler is excluded from buildId — it can't change
-  // persisted /workspace state — so lazy-fetching it never busts snapshots.)
+  // persisted workspace state — so lazy-fetching it never busts snapshots.)
   if (!_baseEtagExplicit) {
     try {
       const m = await fetch(_cdnBase + "/manifest.json");
@@ -224,18 +224,24 @@ async function _doStartVM() {
       }
       return r;
     },
-    writeFile: async (path, data) => {
+    // opts.mode (e.g. 0o755 or "0755") makes the file executable — how an
+    // integrator pushes an ELF binary or an executable script at runtime.
+    // Plain assets (skills, seeds) omit it. See also loadBundle().
+    writeFile: async (path, data, opts) => {
       let buf;
       if (typeof data === "string") buf = new TextEncoder().encode(data).buffer;
       else if (data instanceof Uint8Array) buf = data.buffer;
       else buf = data;
-      await _call({ type: "write_file", path, buf }, [buf]);
+      await _call({ type: "write_file", path, buf, mode: opts && opts.mode }, [buf]);
     },
     readFile: async (path) => {
       const buf = await _call({ type: "read_file", path });
       return new TextDecoder().decode(buf).replace(/\0+$/, "");
     },
     readFileRaw: async (path) => _call({ type: "read_file", path }),
+    // Stage a named manifest bundle (ELF binaries, libs, skills, seeds) on
+    // demand — the runtime-loadable path for product tools/assets added later.
+    loadBundle: (name) => _call({ type: "load_bundle", name }),
     // Diagnostic: wasm heap size + /tmp residue for long-session monitoring.
     _stat: () => _call({ type: "stat" }),
     resetToFresh: async () => {

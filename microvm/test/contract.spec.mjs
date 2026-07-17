@@ -44,29 +44,16 @@ try {
   await page.goto(`http://localhost:${PORT}/test/contract.html`);
   await page.waitForFunction(() => window.__startVM !== undefined, { timeout: 15000 });
 
-  // Boot the VM through the host API and register mock endpoints BEFORE ready
-  // so the runner round-trip below can use them.
+  // Boot the SOURCE worker (workerUrl=/src) against the packaged bundle
+  // manifest + assets in /dist, and register a generic mock endpoint BEFORE
+  // ready so the HTTP-bridge test below can use it.
   await page.evaluate(() => {
-    window.__llmCalls = [];
-    window.__startVM({ baseEtag: "test-v1", cdnBase: "/test", workerUrl: "/src/vm-worker.js",
-      vmRoutes: { "llm.vm": "mock" } });
+    window.__startVM({ baseEtag: "test-v1", cdnBase: "/dist", workerUrl: "/src/vm-worker.js",
+      vmRoutes: { "api.vm": "mock" } });
     // registerVmEndpoint isn't defined until _doStartVM sets window.vm; poll.
     const install = () => {
       if (typeof window.registerVmEndpoint !== "function") return setTimeout(install, 20);
-      window.registerVmEndpoint("/anthropic/v1/messages", (_m, data) => {
-        window.__llmCalls.push(data);
-        if (window.__llmCalls.length === 1) {
-          return { content: [
-            { type: "text", text: "ok" },
-            { type: "tool_use", id: "tu_1", name: "run_shell", input: { command: "echo hi-from-runner" } },
-          ], stop_reason: "tool_use" };
-        }
-        let toolResult = "";
-        try { const msgs = data.messages; toolResult = msgs[msgs.length - 1].content[0].content.trim(); } catch {}
-        return { content: [{ type: "text", text: "TOOL:" + toolResult }], stop_reason: "end_turn" };
-      });
-      window.registerVmEndpoint("/ListQueries", () => ({ queries: [{ query_id: 7, name: "Mock" }], total: 1 }));
-      window.registerVmEndpoint("/done", (_m, data) => { window.__done = data; return { ok: true }; });
+      window.registerVmEndpoint("/echo", (_m, data) => ({ ok: true, got: (data && data.msg) || null }));
     };
     install();
   });
@@ -99,16 +86,20 @@ try {
   const binLen = await page.evaluate(async () => (await window.vm.readFileRaw("/workspace/bin.dat")).byteLength);
   check("writeFile accepts Uint8Array binary", binLen === 5, String(binLen));
 
-  // ── HTTP bridge through the registerVmEndpoint registry ────────────────────
-  const appOut = await page.evaluate(() => window.vm.execute("app queries --filter x"));
-  check("app → /ListQueries via registry", appOut.includes('"query_id":7'), appOut);
+  // ── HTTP bridge through the registerVmEndpoint registry (guest wget) ───────
+  const echoOut = await page.evaluate(() => window.vm.execute("wget -qO- http://api.vm/echo"));
+  check("HTTP bridge → registered endpoint", echoOut.includes('"ok":true'), echoOut);
 
-  // ── Full runner tool-use round-trip (llm.vm + run_shell + done.vm) ──────────
-  const agentOut = await page.evaluate(() => window.vm.execute("runner --thread ct1 'do the thing'"));
-  const agentState = await page.evaluate(() => ({ llmCalls: window.__llmCalls.length, done: window.__done || null }));
-  check("runner completes 2 iterations", agentState.llmCalls === 2, JSON.stringify(agentState));
-  check("runner done.vm callback fired", agentState.done && agentState.done.result === "TOOL:hi-from-runner", JSON.stringify(agentState.done));
-  check("runner final output correct", (agentOut || "").includes("TOOL:hi-from-runner"), agentOut);
+  // ── loadBundle(): stage the generic OSS bundle on demand, then use it ──────
+  await page.evaluate(() => window.vm.loadBundle("oss"));
+  const sqlOut = await page.evaluate(() => window.vm.execute("sqlite3 /tmp/c.db 'select 6*7;'"));
+  check("loadBundle('oss') → sqlite3 usable", sqlOut.includes("42"), sqlOut);
+
+  // ── writeFile({mode}): install an executable at runtime, then run it ───────
+  // (how an integrator loads a binary/skill it built later — here a +x script.)
+  await page.evaluate(() => window.vm.writeFile("/bin/hello", "#!/bin/sh\necho hi-from-installed\n", { mode: "0755" }));
+  const helloOut = await page.evaluate(() => window.vm.execute("hello"));
+  check("writeFile({mode}) installs a runnable executable", helloOut.includes("hi-from-installed"), helloOut);
 
   // ── Snapshot persistence: save_state → gzip+IDB, restore across reboot ─────
   await page.evaluate(() => window.vm.writeFile("/workspace/persist.txt", "survives-reboot"));
