@@ -29,15 +29,6 @@ git checkout blink/close.c blink/errno.c blink/errno.h blink/machine.c \
             blink/syscall.h blink/blink.c 2>/dev/null || true
 git apply "$BLINK_DIR/patches/blink-wasm.patch"
 
-# WASM fix: don't inject host fds into guest during first-time program load.
-# Pre-creating guest fds 0-9 confuses musl stdio init for non-busybox binaries.
-sed -i.fdfix '/SetupCod(m);/,/ProgramLimit.*LINUX);/{
-  /SetupCod/s/^/#ifndef __EMSCRIPTEN__\
-/
-  /ProgramLimit/s/$/\
-#endif/
-}' blink/blink.c
-
 # ── 3. Copy our shell template and build config ──────────────────────────────
 echo "[3/6] Copying custom files..."
 cp "$BLINK_DIR/shell.html" "$SRC_DIR/blink/blink-shell.html"

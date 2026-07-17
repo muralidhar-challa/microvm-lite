@@ -936,3 +936,22 @@ index 87a351c..43b6cae 100644
  int SysDup(struct Machine *, i32, i32, i32, i32);
  int SysOpenat(struct Machine *, i32, i64, i32, i32);
  int SysPipe2(struct Machine *, i64, i32);
+
+diff --git a/blink/blink.c b/blink/blink.c
+--- a/blink/blink.c
++++ b/blink/blink.c
+@@ -215,10 +215,14 @@
+   if (!old) {
+     // this is the first time a program is being loaded
+     LoadProgram(m, execfn, prog, argv, envp, NULL);
++#ifndef __EMSCRIPTEN__
++    // WASM: skip host-fd injection — pre-creating guest fds 0-9
++    // confuses musl's own stdio init for non-busybox binaries.
+     SetupCod(m);
+     for (i = 0; i < 10; ++i) {
+       AddStdFd(&m->system->fds, i);
+     }
++#endif
+     ProgramLimit(m->system, RLIMIT_NOFILE, RLIMIT_NOFILE_LINUX);
+   } else {
+ #ifdef HAVE_JIT
