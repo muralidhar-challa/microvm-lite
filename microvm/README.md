@@ -102,6 +102,85 @@ cd microvm && python3 -m http.server 8080
   manifest, or push them at runtime — `vm.writeFile("/bin/mytool", bytes, {mode:"0755"})`
   for a binary, `vm.writeFile("/workspace/skills/x.md", text)` for a doc.
 
+## Bringing your own binaries
+
+The reference build ships only dash + toybox. You layer your own ELF binaries,
+shared libraries, and data files on top — either eagerly at boot or lazily on
+first use. No code changes, no recompilation.
+
+### Via manifest (recommended for CDN-hosted binaries)
+
+Drop your binaries on a CDN, then add a bundle to your manifest:
+
+```jsonc
+{
+  "bundles": {
+    // Eager: staged at boot before the VM signals ready.
+    "sqlite": {
+      "tier": "eager",
+      "files": [
+        {"url": "bins/sqlite3", "dest": "/bin/sqlite3", "mode": "0755"}
+      ]
+    },
+    // Lazy: only fetched when a command matches one of the triggers.
+    // Your 14 MB of PDF tooling never downloads until the user runs pdftotext.
+    "pdf": {
+      "tier": "lazy",
+      "triggers": ["pdftotext", "pdfinfo", "pdftoppm"],
+      "files": [
+        {"url": "bins/pdftotext",  "dest": "/bin/pdftotext",  "mode": "0755"},
+        {"url": "bins/pdfinfo",    "dest": "/bin/pdfinfo",    "mode": "0755"},
+        {"url": "libs/libpoppler.so","dest":"/lib/libpoppler.so","mode":"0755"}
+      ]
+    },
+    // Data / seeds — any file, any path.
+    "seeds": {
+      "tier": "eager",
+      "files": [
+        {"url": "data/prompts.json", "dest": "/workspace/prompts.json"}
+      ]
+    }
+  }
+}
+```
+
+### Via JS API (runtime push)
+
+No manifest change — push files from the host page at any time:
+
+```js
+// ELF binary — blink runs it as a native x86-64 process.
+const bin = await fetch("https://cdn.example.com/my-tool").then(r => r.arrayBuffer());
+await vm.writeFile("/bin/my-tool", new Uint8Array(bin), { mode: 0o755 });
+
+// Text / data / seed files.
+await vm.writeFile("/workspace/config.json", JSON.stringify({ key: "value" }));
+
+// Now run it.
+await vm.execute("my-tool --config /workspace/config.json");
+```
+
+### Dynamic ELFs with shared libraries
+
+If your binary links dynamically against musl (`.so` files), drop both the binary
+and its library closure into the VM — the musl loader (`/lib/ld-musl-x86_64.so.1`)
+resolves them from `/lib`:
+
+```jsonc
+{
+  "tier": "lazy",
+  "triggers": ["my-tool"],
+  "files": [
+    {"url": "bins/my-tool",        "dest": "/bin/my-tool",        "mode": "0755"},
+    {"url": "libs/ld-musl-x86_64.so.1","dest":"/lib/ld-musl-x86_64.so.1","mode":"0755"},
+    {"url": "libs/libfoo.so.1",    "dest": "/lib/libfoo.so.1",    "mode": "0755"}
+  ]
+}
+```
+
+> **Static linking is simpler.** A single statically-linked ELF (like dash or
+> toybox) needs no library closure — just drop it in and run.
+
 ## HTTP bridge
 
 Guest HTTP clients do the normal `getaddrinfo → socket → connect → write → read`.
