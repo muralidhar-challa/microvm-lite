@@ -4,8 +4,7 @@ BusyBox compiled to WebAssembly using Emscripten. This repo contains build scrip
 
 **Current versions:** BusyBox 1.37.0, Emscripten 4.x
 
-This repo also includes **[`microvm/`](microvm/README.md)** — an in-browser
-x86-64 runtime (dash + toybox, zero GPL) built on the blink emulator.
+This repo is an in-browser x86-64 runtime (dash + toybox, zero GPL) built on the blink emulator.
 
 ### Download
 

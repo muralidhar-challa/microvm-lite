@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Assemble the microvm-lite CDN payload into microvm/dist/ and emit a hashed,
+# Assemble the microvm-lite CDN payload into dist/ and emit a hashed,
 # BUNDLE-based manifest.json. Run after blink/build.sh (needs blink-wasm/).
 #
-#   bash microvm/dist/build-dist.sh
+#   bash dist/build-dist.sh
 #
 # Reference build: blink + dash (BSD-3-Clause /bin/sh) + toybox (0BSD coreutils).
 # No GPL. No OSS closure. Integrators add their own tools via manifest bundles

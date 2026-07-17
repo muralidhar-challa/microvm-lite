@@ -4,7 +4,7 @@
 //  3. the snapshot etag is the manifest buildId (rebuild busts stale snapshots),
 //  4. a save_state → reload round-trip restores the guest FS.
 //
-//   bun microvm/test/dist-smoke.spec.mjs
+//   bun test/dist-smoke.spec.mjs
 import { chromium } from "playwright";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";

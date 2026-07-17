@@ -1,5 +1,5 @@
 // Diagnostic: run one command under blink strace (-s) and dump blink.log.
-// Usage: bun microvm/test/strace-test.mjs probe out
+// Usage: bun test/strace-test.mjs probe out
 
 import { chromium } from "playwright";
 

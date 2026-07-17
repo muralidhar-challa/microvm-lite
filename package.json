@@ -1,14 +1,7 @@
 {
-  "name": "busybox-wasm",
+  "name": "microvm-lite",
   "private": true,
-  "type": "module",
-  "scripts": {
-    "build:worker": "vite build --config vite.worker.config.ts",
-    "serve": "bun scripts/serve-coi.ts",
-    "test:e2e": "bun playwright-real-fork-test.mjs"
-  },
   "devDependencies": {
-    "playwright": "^1.48.0",
-    "vite": "^5.4.0"
+    "playwright": "^1.40.0"
   }
 }

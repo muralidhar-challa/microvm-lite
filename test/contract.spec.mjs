@@ -1,9 +1,9 @@
 // M4 gate: drive the real vm-host.js/vm-worker.js pair through the exact
 // the host app the v86 host `window.vm` + registerVmEndpoint contract and assert the
-// shapes/strings the app depends on (the host bridge). Serves microvm/ root on
+// shapes/strings the app depends on (the host bridge). Serves project root on
 // its own port so both /src and /test are same-origin.
 //
-//   bun microvm/test/contract.spec.mjs
+//   bun test/contract.spec.mjs
 //
 // Exit code 0 = all assertions passed.
 import { chromium } from "playwright";
