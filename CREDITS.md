@@ -22,6 +22,13 @@ communities below.
 - **[SQLite](https://sqlite.org/)** — `sqlite3` (public domain).
 - **[Emscripten](https://emscripten.org/)** — the WebAssembly toolchain.
 - **[xterm.js](https://xtermjs.org/)** — terminal UI in the dev assets (MIT).
+- **[em-shell / em-busybox](https://github.com/tbfleming/em-shell)** by
+  [Todd Fleming](https://tbfleming.github.io/) — the `em-shell.c/.h/.js` files
+  are based on this work (updated for modern Emscripten 4.x).
+- **[nanozip](https://github.com/vadimkantorov/nanozip)** by Vadim Kantorov
+  ([miniz](https://github.com/richgel999/miniz)-based) and
+  **[diff3](https://github.com/openbsd/src/blob/master/usr.bin/diff3/diff3prog.c)**
+  (OpenBSD) — custom BusyBox applets bundled here.
 
 ## This repository's own work
 
@@ -30,5 +37,11 @@ The `microvm/` subtree — the product-agnostic in-browser x86-64 runtime
 HTTP bridge, and the packaging — is original work in this repository. See
 `microvm/README.md`.
 
-Component licenses are those of their respective upstream projects; retain them
-when redistributing.
+## License
+
+This repository's own code (the `microvm/` runtime and build scripts) is MIT
+licensed — see [`LICENSE`](LICENSE). The bundled/built third-party components
+above retain their own licenses (BusyBox and Poppler are **GPL-2.0**, blink is
+ISC, SQLite is public domain, xterm.js is MIT). Redistributing the built GPL
+binaries carries those projects' obligations regardless of the MIT license on
+this repo's own code.
