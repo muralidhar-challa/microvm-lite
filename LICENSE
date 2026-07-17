@@ -19,13 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Scope: this MIT license covers the ORIGINAL code in this repository (the
-`microvm/` runtime and the build scripts). Third-party components that this
-project bundles, builds, or downloads retain their own licenses — notably
-BusyBox (GPL-2.0), Poppler (GPL-2.0), blink (ISC), SQLite (public domain),
-and xterm.js (MIT). See CREDITS.md. Distributing the built GPL binaries
-(e.g. busybox, poppler) carries those projects' obligations regardless of
-this license.
