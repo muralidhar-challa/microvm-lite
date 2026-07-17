@@ -1,10 +1,13 @@
 ## BusyBox + Emscripten + nanozip + diff3
 
-[![Build](https://github.com/mayflower/busybox-wasm/actions/workflows/make.yml/badge.svg)](https://github.com/mayflower/busybox-wasm/actions/workflows/make.yml)
-
 BusyBox compiled to WebAssembly using Emscripten. This repo contains build scripts without being a full fork of BusyBox, making version upgrades easier.
 
 **Current versions:** BusyBox 1.37.0, Emscripten 4.x
+
+> The BusyBox-to-WASM build scripts here are derived from
+> [mayflower/busybox-wasm](https://github.com/mayflower/busybox-wasm) — thank you.
+> This repository adds the **`microvm/`** in-browser x86-64 runtime on top; see
+> [`microvm/README.md`](microvm/README.md). Full attribution in [`CREDITS.md`](CREDITS.md).
 
 ### Download
 
