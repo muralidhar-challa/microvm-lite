@@ -5,7 +5,7 @@ BusyBox compiled to WebAssembly using Emscripten. This repo contains build scrip
 **Current versions:** BusyBox 1.37.0, Emscripten 4.x
 
 This repo also includes **[`microvm/`](microvm/README.md)** — an in-browser
-x86-64 runtime built on this BusyBox-WASM base.
+x86-64 runtime (dash + toybox, zero GPL) built on the blink emulator.
 
 ### Download
 
@@ -47,4 +47,4 @@ This repo includes two [custom](https://git.busybox.net/busybox/plain/docs/new-a
 
 ### Credits & License
 
-This repository's own code is [MIT](LICENSE) licensed. See [`CREDITS.md`](CREDITS.md) for attribution and licenses of every bundled and derived component, and [`SHELL-LICENSING.md`](SHELL-LICENSING.md) for the status of finding a permissive (non-GPL) `/bin/sh`.
+This repository's own code is [MIT](LICENSE) licensed. See [`CREDITS.md`](CREDITS.md) for attribution and licenses of every bundled and derived component.
