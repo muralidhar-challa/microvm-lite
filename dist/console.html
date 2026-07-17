@@ -59,12 +59,8 @@
 
   const EXAMPLES = [
     "ls -la", "cat /etc/hosts", "echo hello | tr a-z A-Z",
-    "sqlite3 /tmp/d.db 'create table t(x); insert into t values(1),(2),(3); select count(*),sum(x) from t;'",
-    "rm -f /tmp/d.db; sqlite3 /tmp/d.db 'select 42;'",
-    "pdftotext sample.pdf - | head -20",
     "for i in 1 2 3; do echo row$i; done",
-    "run echo start; sleep 2; echo end",
-    "wget -qO- http://api.vm/echo",
+    "wget -O - http://api.vm/echo",
   ];
   const ex = document.getElementById("examples");
   EXAMPLES.forEach(c => {
@@ -84,25 +80,16 @@
   }
 
   const HELP = [
-    "Local microvm-lite session (generic blink runtime, packaged dist).",
+    "Local microvm-lite session (dash + toybox).",
     "",
-    "Works offline:  shell/coreutils, sqlite3, poppler (pdftotext/pdfinfo — lazy-",
-    "                loaded on first use), file ops. Type any sh command.",
-    "HTTP bridge:    http://api.vm/echo → a canned demo endpoint (no real backend).",
+    "Works offline:  shell, coreutils, file ops. Type any sh command.",
+    "HTTP bridge:    http://api.vm/echo → a canned demo endpoint.",
     "Builtins:       help · clear",
-    "  run <cmd>     run via the BACKGROUND-RUN contract (window.vm.run — the path",
-    "                wasm-bridge.ts uses for run_shell_command). Shows the returned",
-    "                {done, output_file, pid} plus the captured output. Because blink",
-    "                runs to completion, done is always true here (v86 would return",
-    "                done:false + a live pid on timeout — the known divergence).",
+    "  run <cmd>     run via the BACKGROUND-RUN contract (window.vm.run).",
     "  <cmd>         run via window.vm.execute() — blocking, returns the string.",
-    "Note:           each command runs to completion (no backgrounding/kill) — a hung",
-    "                command will block the session (reload the page to recover).",
   ].join("\n");
 
-  // vm.run: the {done, output_file, pid, output} background-run contract that
-  // SQL_Chat's run_shell_command tool calls. Same command surface as the plain
-  // REPL, but surfaces the full contract object + the on-disk output file.
+  // vm.run: the {done, output_file, pid, output} background-run contract.
   async function runBackground(cmd) {
     input.disabled = true;
     const t0 = performance.now();
@@ -164,17 +151,12 @@
   });
 
   (async () => {
-    line("booting blink microvm… (fetching ~10MB core; poppler loads lazily on first PDF)", "sys");
+    line("booting microvm… (~1MB base toolchain)", "sys");
     // await startVM: it installs window.vm + registerVmEndpoint and posts init,
     // THEN we register mocks and wait for the worker's ready signal.
-    await startVM({ cdnBase: "/dist", workerUrl: "/dist/vm-worker.js", vmRoutes: { "api.vm": "mock" } });
+    await startVM({ cdnBase: ".", workerUrl: "vm-worker.js", vmRoutes: { "api.vm": "mock" } });
     installMocks();
     await window.vm.ready();
-    // Seed a sample PDF for pdftotext, if the test asset is reachable.
-    try {
-      const r = await fetch("/test/text30.pdf");
-      if (r.ok) { await window.vm.writeFile("/workspace/sample.pdf", await r.arrayBuffer()); }
-    } catch {}
     statusEl.textContent = "ready"; statusEl.className = "status ready";
     input.disabled = false; input.focus();
     line("ready. type 'help', or click an example chip above.", "sys");
