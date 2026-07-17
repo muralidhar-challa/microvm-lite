@@ -1,52 +1,50 @@
 #!/usr/bin/env bash
-# Build blink WASM shell from scratch.
+# Build blink WASM + dash + toybox from scratch.
 # Run from repo root: bash blink/build.sh
-# Requires: emcc (Emscripten), x86_64-linux-musl-gcc (for busybox)
+# Requires: emcc (Emscripten), x86_64-linux-musl-gcc, gsed,
+#           autoconf/automake (for dash)
 
 set -e
 
-# emcc's Python shebang must resolve to >=3.10. On machines where the system
-# default `python3` is older (e.g. macOS's bundled 3.8), put Homebrew's bin
-# first so `python3` resolves to a modern interpreter for this script only —
-# don't rely on the ambient shell's PATH order.
 export PATH="/opt/homebrew/bin:$PATH"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BLINK_DIR="$REPO_ROOT/blink"
 SRC_DIR="$REPO_ROOT/blink-src"
 OUT_DIR="$REPO_ROOT/blink-wasm"
-BLINK_COMMIT="main"  # pin to a commit hash for reproducibility
+BLINK_COMMIT="main"
 
 # ── 1. Clone blink source ────────────────────────────────────────────────────
 if [ ! -d "$SRC_DIR/.git" ]; then
-  echo "[1/5] Cloning blink..."
+  echo "[1/6] Cloning blink..."
   git clone https://github.com/jart/blink "$SRC_DIR"
 else
-  echo "[1/5] blink source already present, skipping clone"
+  echo "[1/6] blink source already present, skipping clone"
 fi
 
-# ── 2. Apply patches ─────────────────────────────────────────────────────────
-echo "[2/5] Applying patches..."
+# ── 2. Apply patches + WASM fixes ────────────────────────────────────────────
+echo "[2/6] Applying patches + WASM fixes..."
 cd "$SRC_DIR"
-# Reset every file blink-wasm.patch touches before applying — keeps reruns
-# idempotent. Must list every file the patch modifies (git apply is not
-# idempotent against a dirty tree); add new ones here when the patch grows.
 git checkout blink/close.c blink/errno.c blink/errno.h blink/machine.c \
             blink/machine.h blink/pipe.c blink/realpath.c blink/syscall.c \
-            blink/syscall.h 2>/dev/null || true
+            blink/syscall.h blink/blink.c 2>/dev/null || true
 git apply "$BLINK_DIR/patches/blink-wasm.patch"
 
+# WASM fix: don't inject host fds into guest during first-time program load.
+# Pre-creating guest fds 0-9 confuses musl stdio init for non-busybox binaries.
+sed -i.fdfix '/SetupCod(m);/,/ProgramLimit.*LINUX);/{
+  /SetupCod/s/^/#ifndef __EMSCRIPTEN__\
+/
+  /ProgramLimit/s/$/\
+#endif/
+}' blink/blink.c
+
 # ── 3. Copy our shell template and build config ──────────────────────────────
-echo "[3/5] Copying custom files..."
+echo "[3/6] Copying custom files..."
 cp "$BLINK_DIR/shell.html" "$SRC_DIR/blink/blink-shell.html"
 
 # ── 4. Build blink.js + blink.wasm ───────────────────────────────────────────
-echo "[4/5] Building blink WASM..."
+echo "[4/6] Building blink WASM..."
 mkdir -p "$OUT_DIR"
-
-# blink/builtin.h does `#include "config.h"` and -I. comes first, so the copy at
-# the blink-src root is what the build actually uses. It MUST be the crafted
-# wasm config (DISABLE_JIT/THREADS/FORK...) — a `./configure`-generated native
-# config here silently poisons the wasm build with host-OS feature detection.
 cp "$BLINK_DIR/config.h" "$SRC_DIR/config.h"
 
 cd "$SRC_DIR"
@@ -68,22 +66,39 @@ emcc \
   -s STACK_SIZE=33554432 \
   -sUSE_ZLIB=1
 
-# ── 5. Build busybox (NOMMU + hush) ──────────────────────────────────────────
-echo "[5/5] Building busybox..."
-BUSY_VER="1.36.1"
-BUSY_DIR="/tmp/busybox-$BUSY_VER"
-if [ ! -d "$BUSY_DIR" ]; then
-  curl -L "https://busybox.net/downloads/busybox-$BUSY_VER.tar.bz2" | tar xj -C /tmp
+# ── 5. Build dash (BSD-3-Clause /bin/sh) ─────────────────────────────────────
+echo "[5/6] Building dash..."
+DASH_VER="0.5.12"
+DASH_DIR="/tmp/dash-$DASH_VER"
+if [ ! -d "$DASH_DIR" ]; then
+  curl -L "https://git.kernel.org/pub/scm/utils/dash/dash.git/snapshot/dash-$DASH_VER.tar.gz" | tar xz -C /tmp
+  cd "$DASH_DIR" && bash autogen.sh 2>/dev/null
 fi
-cd "$BUSY_DIR"
-# Use our saved config (NOMMU + hush, no job control, nofork applets)
-cp "$BLINK_DIR/busybox.config" .config
-# Update cross compiler prefix to local path
-sed -i.bak \
-  's|CONFIG_CROSS_COMPILER_PREFIX=.*|CONFIG_CROSS_COMPILER_PREFIX="/opt/homebrew/bin/x86_64-linux-musl-"|' \
-  .config
-make -j"$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)"
-cp busybox "$OUT_DIR/busybox"
+cd "$DASH_DIR"
+# Page-aligned for blink's linear memory: -Wl,-z,common-page-size=65536,-z,max-page-size=65536
+CC=x86_64-linux-musl-gcc CFLAGS="-O2" \
+  LDFLAGS="-static -Wl,-z,common-page-size=65536,-z,max-page-size=65536" \
+  ./configure --host=x86_64-linux-musl --enable-static 2>/dev/null
+make -j"$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)" \
+  LDFLAGS="-static -Wl,-z,common-page-size=65536,-z,max-page-size=65536" 2>/dev/null
+x86_64-linux-musl-strip src/dash
+cp src/dash "$OUT_DIR/dash"
+
+# ── 6. Build toybox (0BSD coreutils) ────────────────────────────────────────
+echo "[6/6] Building toybox..."
+TOYBOX_VER="0.8.14"
+TOYBOX_DIR="/tmp/toybox-$TOYBOX_VER"
+if [ ! -d "$TOYBOX_DIR" ]; then
+  curl -L "https://landley.net/toybox/downloads/toybox-$TOYBOX_VER.tar.gz" | tar xz -C /tmp
+fi
+cd "$TOYBOX_DIR"
+cp "$BLINK_DIR/toybox.config" .config
+CROSS_COMPILE=x86_64-linux-musl- SED=gsed LDFLAGS="-static" \
+  LDOPTIMIZE="-Wl,--gc-sections -Wl,--as-needed" \
+  make -j"$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)"
+chmod 755 toybox
+x86_64-linux-musl-strip toybox
+cp toybox "$OUT_DIR/toybox"
 
 # ── Copy static assets ───────────────────────────────────────────────────────
 cp "$BLINK_DIR"/assets/* "$OUT_DIR/"

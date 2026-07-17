@@ -13,7 +13,8 @@
 # Layout produced:
 #   dist/blink.js  dist/blink.wasm          — emulator
 #   dist/vm-worker.js  dist/vm-host.js       — contract layer
-#   dist/bin/busybox                         — base shell/coreutils (eager)
+#   dist/bin/busybox                         — hush shell (GPL, eager)
+#   dist/bin/toybox                          — 0BSD coreutils (eager)
 #   dist/rootfs/bin/*  dist/rootfs/lib/*      — generic OSS closure (lazy)
 #   dist/manifest.json                        — { buildId, home, applets,
 #                                                 bundles: { base:eager, oss:lazy } }
@@ -38,7 +39,8 @@ cp -L "$WASM/blink.js"  "$OUT/blink.js"
 cp -L "$WASM/blink.wasm" "$OUT/blink.wasm"
 cp -L "$SRC/vm-worker.js" "$OUT/vm-worker.js"
 cp -L "$SRC/vm-host.js"   "$OUT/vm-host.js"
-cp -L "$WASM/busybox" "$OUT/bin/busybox"     # base shell only; no product tools
+cp -L "$WASM/busybox" "$OUT/bin/busybox"     # GPL shell only (hush)
+cp -L "$WASM/toybox"  "$OUT/bin/toybox"      # 0BSD coreutils
 # Generic OSS closure (sqlite/poppler) — the lazy tier.
 python3 - "$ROOTFS" "$OUT" <<'PY'
 import json, shutil, sys, os
@@ -46,30 +48,37 @@ rootfs, out = sys.argv[1], sys.argv[2]
 man = json.load(open(os.path.join(rootfs, "manifest.json")))
 for f in man["bin"]: shutil.copy(os.path.join(rootfs, "bin", f), os.path.join(out, "rootfs/bin", f))
 for f in man["lib"]: shutil.copy(os.path.join(rootfs, "lib", f), os.path.join(out, "rootfs/lib", f))
-print(f"  staged busybox + {len(man['bin'])} OSS bins + {len(man['lib'])} libs")
+print(f"  staged busybox + toybox + {len(man['bin'])} OSS bins + {len(man['lib'])} libs")
 PY
 
 echo "[3/4] Hash + emit manifest.json"
 # BusyBox applets that share the single busybox binary (symlinked in the guest).
-APPLETS='["sh","hush","ls","cat","sed","awk","grep","find","head","tail","cp","mv","rm","mkdir","rmdir","touch","echo","printf","wc","sort","uniq","cut","tr","xargs","env","pwd","id","wget","chmod","stat","du","df","diff","md5sum","tar","gzip","gunzip","base64","sleep","seq","yes","date","sync","kill","true","false"]'
+# BusyBox applets that share the single busybox binary (symlinked in the guest).
+# GPL shell only (hush) — coreutils come from toybox (0BSD).
+BUSYBOX_APPLETS='["sh","hush","bash"]'
+TOYBOX_APPLETS='["ls","cat","sed","awk","grep","find","head","tail","cp","mv","rm","mkdir","rmdir","touch","echo","printf","wc","sort","uniq","cut","tr","xargs","env","pwd","id","wget","chmod","stat","du","df","diff","md5sum","tar","gzip","gunzip","base64","sleep","seq","yes","date","sync","kill","true","false"]'
+ALL_APPLETS="$BUSYBOX_APPLETS $TOYBOX_APPLETS"
 HOME_DIR="/workspace"
 
-python3 - "$OUT" "$ROOTFS" "$APPLETS" "$HOME_DIR" <<'PY'
+python3 - "$OUT" "$ROOTFS" "$BUSYBOX_APPLETS" "$TOYBOX_APPLETS" "$HOME_DIR" <<'PY'
 import json, hashlib, os, sys
-out, rootfs, applets, home = sys.argv[1], sys.argv[2], json.loads(sys.argv[3]), sys.argv[4]
-
+out, rootfs, busybox_json, toybox_json, home = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+busybox_applets = json.loads(busybox_json)
+toybox_applets = json.loads(toybox_json)
+all_applets = busybox_applets + toybox_applets
 def meta(path):
     b = open(path, "rb").read()
     return hashlib.sha256(b).hexdigest(), len(b)
-
-def bundle_file(url, dest, mode="0755", applets_flag=False):
+def bundle_file(url, dest, mode="0755", applets=None):
     sha, size = meta(os.path.join(out, url))
     e = {"url": url, "dest": dest, "mode": mode, "sha256": sha, "size": size}
-    if applets_flag: e["applets"] = True
+    if applets is not None: e["applets"] = applets
     return e
-
-# base bundle (eager): busybox + its applets.
-base_files = [bundle_file("bin/busybox", "/bin/busybox", applets_flag=True)]
+# base bundle (eager): busybox (GPL shell) + toybox (0BSD coreutils).
+base_files = [
+    bundle_file("bin/busybox", "/bin/busybox", applets=busybox_applets),
+    bundle_file("bin/toybox", "/bin/toybox", applets=toybox_applets),
+]
 
 # oss bundle (lazy): sqlite + poppler closure, staged on first pdf*/sqlite3.
 rman = json.load(open(os.path.join(rootfs, "manifest.json")))
@@ -92,7 +101,7 @@ build_id = h.hexdigest()[:16]
 manifest = {
     "buildId": build_id,
     "home": home,
-    "applets": applets,
+    "applets": all_applets,
     "bundles": {
         "base": {"tier": "eager", "files": base_files},
         "oss":  {"tier": "lazy", "triggers": triggers, "files": oss_files},

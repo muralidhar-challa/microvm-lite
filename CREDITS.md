@@ -12,8 +12,12 @@ communities below.
 
 ## Vendored / bundled components
 
-- **[BusyBox](https://busybox.net/)** — the in-VM shell and coreutils
-  (GPL-2.0). Compiled to a static x86-64 musl binary.
+- **[dash](https://git.kernel.org/pub/scm/utils/dash/dash.git/)** — the
+  in-VM `/bin/sh` (BSD-3-Clause). Compiled to a static x86-64 musl binary.
+  Replaces BusyBox `hush` as the reference shell; see `SHELL-LICENSING.md`.
+- **[toybox](https://landley.net/toybox/)** — the in-VM coreutils
+  (`ls`, `cat`, `sed`, `grep`, etc.), 0BSD licensed. Compiled to a static
+  x86-64 musl binary. See `SHELL-LICENSING.md` for the motivation.
 - **[blink](https://github.com/jart/blink)** by Justine Tunney — the x86-64
   userspace emulator, compiled to WebAssembly (ISC). The `microvm/` runtime
   patches and builds blink; see `microvm/blink/`.
@@ -41,7 +45,7 @@ HTTP bridge, and the packaging — is original work in this repository. See
 
 This repository's own code (the `microvm/` runtime and build scripts) is MIT
 licensed — see [`LICENSE`](LICENSE). The bundled/built third-party components
-above retain their own licenses (BusyBox and Poppler are **GPL-2.0**, blink is
-ISC, SQLite is public domain, xterm.js is MIT). Redistributing the built GPL
-binaries carries those projects' obligations regardless of the MIT license on
-this repo's own code.
+above retain their own licenses (dash is **BSD-3-Clause**, toybox is **0BSD**,
+Poppler is **GPL-2.0**, blink is ISC, SQLite is public domain, xterm.js is
+MIT). The reference build has zero GPL components in its base toolchain
+(dash + toybox).
