@@ -15,7 +15,7 @@ int SysIoctl(struct Machine *m, int fd, u64 request, i64 addr) {
   switch (request) {
     case FIONBIO_LINUX:
       // Rust std's set_nonblocking() — used inside TcpStream::connect_timeout,
-      // i.e. by every ureq client (runner/app). Nothing in this build actually
+      // i.e. by ureq clients. Nothing in this build actually
       // blocks (virtual sockets answer from a buffer, MEMFS files are
       // synchronous), so accepting the flag without applying it is faithful.
       return 0;
