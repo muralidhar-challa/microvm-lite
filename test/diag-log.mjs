@@ -1,6 +1,6 @@
 // Run one command under `blink -L /blink.log [-s...]` and then dump the log,
 // SEQUENTIALLY (concurrent execs wedge Asyncify). Usage:
-//   bun microvm/test/diag-log.mjs [-s] <cmd> [args...]
+//   bun test/diag-log.mjs [-s] <cmd> [args...]
 import { chromium } from "playwright";
 
 let args = process.argv.slice(2);

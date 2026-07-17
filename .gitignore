@@ -1,41 +1,29 @@
 node_modules
-build/
-source/
 test-results/
 *.bak
-busybox.js
-busybox.wasm
-busybox_unstripped.js
-busybox_unstripped.wasm
-scripts/process-worker.bundle.js
-scripts/busybox-*.js
-
-# microvm-lite (blink backend) build outputs — regenerate with: bash microvm/blink/build.sh
-microvm/blink-src/
-microvm/blink-wasm/
-# symlinks into blink-wasm/ for the dev server
-microvm/test/blink.js
-microvm/test/blink.wasm
-microvm/test/toybox
-microvm/test/dash
-microvm/test/xtool
-microvm/test/probe
-
-# microvm M1: regenerable artifacts
-# native blink build (local test harness): (cd microvm/blink-native && ./configure && gmake -j8 o//blink/blink)
-microvm/blink-native/
 blink.log
-# poppler/sqlite closure — regen: bash microvm/binaries/build-rootfs.sh
-microvm/test/rootfs/
-# test PDFs (permit/item8 copied from v86 assets; text30 via microvm/test/gen-text-pdf.sh)
-microvm/test/*.pdf
 
-# microvm M5: packaged CDN payload — regenerate with: bash microvm/dist/build-dist.sh
-# (build-dist.sh and dist.html are tracked; everything it assembles is not)
-microvm/dist/blink.js
-microvm/dist/blink.wasm
-microvm/dist/vm-worker.js
-microvm/dist/vm-host.js
-microvm/dist/manifest.json
-microvm/dist/bin/
-microvm/dist/rootfs/
+# blink backend build outputs — regenerate: bash blink/build.sh
+blink-src/
+blink-wasm/
+# native blink build
+blink-native/
+
+# symlinks into blink-wasm/ for the dev server
+test/blink.js
+test/blink.wasm
+test/toybox
+test/dash
+test/xtool
+test/probe
+test/rootfs/
+test/*.pdf
+
+# packaged CDN payload — regenerate: bash dist/build-dist.sh
+dist/blink.js
+dist/blink.wasm
+dist/vm-worker.js
+dist/vm-host.js
+dist/manifest.json
+dist/bin/
+dist/rootfs/

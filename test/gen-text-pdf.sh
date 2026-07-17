@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Generate microvm/test/text30.pdf — a 30-page, text-layer PDF used as the
+# Generate test/text30.pdf — a 30-page, text-layer PDF used as the
 # pdftotext extraction workload in bench.mjs. The bundled sample PDFs
 # (permit.pdf, item8.pdf) are SCANNED/image PDFs, so pdftotext returns near-empty
 # on them and can't measure extraction speed; this one has a real text layer.
 #
-# Requires: python3, ps2pdf (ghostscript).  Usage: bash microvm/test/gen-text-pdf.sh
+# Requires: python3, ps2pdf (ghostscript).  Usage: bash test/gen-text-pdf.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 

@@ -6,7 +6,7 @@
 //   pdftotext_100_pages    : 60-90 s
 //   excel_get/set       : 300 ms - 10 s
 //
-// Usage:  bun microvm/test/bench.mjs
+// Usage:  bun test/bench.mjs
 // Expects: static server on :8765 serving microvm/test, all binaries built.
 
 import { chromium } from "playwright";

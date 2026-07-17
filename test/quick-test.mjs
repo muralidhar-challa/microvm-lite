@@ -1,5 +1,5 @@
 // Quick smoke of newly staged binaries/seeds (no poppler needed).
-// Usage: bun microvm/test/quick-test.mjs '["ls","/workspace"]' ...
+// Usage: bun test/quick-test.mjs '["ls","/workspace"]' ...
 
 import { chromium } from "playwright";
 

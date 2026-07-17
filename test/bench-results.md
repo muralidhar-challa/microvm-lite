@@ -3,8 +3,8 @@
 Date: 2026-07-13 · Host: Apple Silicon Mac · blink.wasm **interpreter** (JIT
 disabled), `-O2`, ASYNCIFY build · Chromium headless via Playwright.
 
-Run it yourself: static server on :8765 serving `microvm/test/`, then
-`bun microvm/test/bench.mjs`.
+Run it yourself: static server on :8765 serving `test/`, then
+`bun test/bench.mjs`.
 
 ## Numbers
 

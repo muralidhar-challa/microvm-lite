@@ -4,8 +4,8 @@
 // Each command gets a FRESH page/worker so a guest hang can't cascade into the
 // commands after it (the wasm interpreter blocks the whole worker while stuck).
 //
-// Usage:  bun microvm/test/m0-test.mjs   (or node)
-// Expects the static server to be running:  cd microvm/test && python3 -m http.server 8765
+// Usage:  bun test/m0-test.mjs   (or node)
+// Expects the static server to be running:  cd ./test && python3 -m http.server 8765
 
 import { chromium } from "playwright";
 

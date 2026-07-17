@@ -7,7 +7,7 @@ communities below.
 
 - **[busybox-wasm](https://github.com/mayflower/busybox-wasm)** by
   [mayflower](https://github.com/mayflower) — the BusyBox-to-WebAssembly build
-  scripts this repository started from. The `microvm/` runtime is layered on top
+  scripts this repository started from. The runtime is layered on top
   of that base.
 
 ## Vendored / built components
@@ -17,8 +17,8 @@ communities below.
 - **[toybox](https://landley.net/toybox/)** — the in-VM coreutils
   (`ls`, `cat`, `sed`, `grep`, etc.), 0BSD licensed.
 - **[blink](https://github.com/jart/blink)** by Justine Tunney — the x86-64
-  userspace emulator, compiled to WebAssembly (ISC). The `microvm/` runtime
-  patches and builds blink; see `microvm/blink/`.
+  userspace emulator, compiled to WebAssembly (ISC). The runtime
+  patches and builds blink; see `blink/`.
 - **[Emscripten](https://emscripten.org/)** — the WebAssembly toolchain.
 - **[xterm.js](https://xtermjs.org/)** — terminal UI in the dev assets (MIT).
 - **[em-shell / em-busybox](https://github.com/tbfleming/em-shell)** by
@@ -31,14 +31,14 @@ communities below.
 
 ## This repository's own work
 
-The `microvm/` subtree — the product-agnostic in-browser x86-64 runtime
+The runtime — the product-agnostic in-browser x86-64 runtime
 ("microvm-lite"), its `window.vm` contract, the bundle-based asset loader, the
 HTTP bridge, and the packaging — is original work in this repository. See
-`microvm/README.md`.
+`README.md`.
 
 ## License
 
-This repository's own code (the `microvm/` runtime and build scripts) is MIT
+This repository's own code (the runtime and build scripts) is MIT
 licensed — see [`LICENSE`](LICENSE). The bundled/built third-party components
 above retain their own licenses (dash is **BSD-3-Clause**, toybox is **0BSD**,
 blink is ISC, xterm.js is MIT). The reference build has zero GPL components.

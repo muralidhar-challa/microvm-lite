@@ -1,9 +1,9 @@
 // M4 gate: drive the real vm-host.js/vm-worker.js pair through the exact
 // SQL_Chat useV86.ts `window.vm` + registerVmEndpoint contract and assert the
-// shapes/strings the app depends on (wasm-bridge.ts). Serves microvm/ root on
+// shapes/strings the app depends on (wasm-bridge.ts). Serves project root on
 // its own port so both /src and /test are same-origin.
 //
-//   bun microvm/test/contract.spec.mjs
+//   bun test/contract.spec.mjs
 //
 // Exit code 0 = all assertions passed.
 import { chromium } from "playwright";

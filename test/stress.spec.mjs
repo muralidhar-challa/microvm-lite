@@ -6,8 +6,8 @@
 // to surface what unit gates miss — memory growth, /tmp residue, latency drift
 // over time, and any correctness loss under churn.
 //
-//   bun microvm/test/stress.spec.mjs           # default ~140 iterations
-//   ITERS=400 bun microvm/test/stress.spec.mjs # longer soak
+//   bun test/stress.spec.mjs           # default ~140 iterations
+//   ITERS=400 bun test/stress.spec.mjs # longer soak
 //
 // Health thresholds (exit 1 on breach): zero integrity failures, zero errors on
 // the supported surface, bounded latency drift, and a heap that plateaus.
