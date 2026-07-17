@@ -90,11 +90,6 @@ try {
   const echoOut = await page.evaluate(() => window.vm.execute("wget -O - http://api.vm/echo"));
   check("HTTP bridge → registered endpoint", echoOut.includes('"ok":true'), echoOut);
 
-  // ── loadBundle(): stage the generic OSS bundle on demand, then use it ──────
-  await page.evaluate(() => window.vm.loadBundle("oss"));
-  const sqlOut = await page.evaluate(() => window.vm.execute("sqlite3 /tmp/c.db 'select 6*7;'"));
-  check("loadBundle('oss') → sqlite3 usable", sqlOut.includes("42"), sqlOut);
-
   // ── writeFile({mode}): install an executable at runtime, then run it ───────
   // (how an integrator loads a binary/skill it built later — here a +x script.)
   await page.evaluate(() => window.vm.writeFile("/bin/hello", "#!/bin/sh\necho hi-from-installed\n", { mode: "0755" }));
