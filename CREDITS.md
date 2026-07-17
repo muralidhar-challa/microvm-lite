@@ -10,20 +10,15 @@ communities below.
   scripts this repository started from. The `microvm/` runtime is layered on top
   of that base.
 
-## Vendored / bundled components
+## Vendored / built components
 
 - **[dash](https://git.kernel.org/pub/scm/utils/dash/dash.git/)** — the
   in-VM `/bin/sh` (BSD-3-Clause). Compiled to a static x86-64 musl binary.
-  Replaces BusyBox `hush` as the reference shell; see `SHELL-LICENSING.md`.
 - **[toybox](https://landley.net/toybox/)** — the in-VM coreutils
-  (`ls`, `cat`, `sed`, `grep`, etc.), 0BSD licensed. Compiled to a static
-  x86-64 musl binary. See `SHELL-LICENSING.md` for the motivation.
+  (`ls`, `cat`, `sed`, `grep`, etc.), 0BSD licensed.
 - **[blink](https://github.com/jart/blink)** by Justine Tunney — the x86-64
   userspace emulator, compiled to WebAssembly (ISC). The `microvm/` runtime
   patches and builds blink; see `microvm/blink/`.
-- **[Poppler](https://poppler.freedesktop.org/)** — PDF tooling
-  (`pdftotext`/`pdfinfo`/…), GPL-2.0, loaded as a lazy bundle.
-- **[SQLite](https://sqlite.org/)** — `sqlite3` (public domain).
 - **[Emscripten](https://emscripten.org/)** — the WebAssembly toolchain.
 - **[xterm.js](https://xtermjs.org/)** — terminal UI in the dev assets (MIT).
 - **[em-shell / em-busybox](https://github.com/tbfleming/em-shell)** by
@@ -32,7 +27,7 @@ communities below.
 - **[nanozip](https://github.com/vadimkantorov/nanozip)** by Vadim Kantorov
   ([miniz](https://github.com/richgel999/miniz)-based) and
   **[diff3](https://github.com/openbsd/src/blob/master/usr.bin/diff3/diff3prog.c)**
-  (OpenBSD) — custom BusyBox applets bundled here.
+  (OpenBSD) — custom BusyBox applets bundled in the root `busybox-wasm` build.
 
 ## This repository's own work
 
@@ -46,6 +41,4 @@ HTTP bridge, and the packaging — is original work in this repository. See
 This repository's own code (the `microvm/` runtime and build scripts) is MIT
 licensed — see [`LICENSE`](LICENSE). The bundled/built third-party components
 above retain their own licenses (dash is **BSD-3-Clause**, toybox is **0BSD**,
-Poppler is **GPL-2.0**, blink is ISC, SQLite is public domain, xterm.js is
-MIT). The reference build has zero GPL components in its base toolchain
-(dash + toybox).
+blink is ISC, xterm.js is MIT). The reference build has zero GPL components.

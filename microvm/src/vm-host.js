@@ -169,8 +169,7 @@ async function _doStartVM() {
   // Prefer the packaged manifest's buildId as the snapshot etag: a rebuilt core
   // binary changes buildId, which invalidates a stale IDB filesystem snapshot.
   // A caller-supplied baseEtag (opts) wins; a bare test dir with no manifest
-  // keeps the default. (Poppler is excluded from buildId — it can't change
-  // persisted workspace state — so lazy-fetching it never busts snapshots.)
+  // keeps the default.
   if (!_baseEtagExplicit) {
     try {
       const m = await fetch(_cdnBase + "/manifest.json");

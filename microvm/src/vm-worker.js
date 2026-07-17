@@ -36,8 +36,7 @@ var BASE = ".";
 // fetch bridge (see emHttpFetch). Fake IPs assigned 10.0.2.10, .11, … in order.
 var VM_ROUTES = {};
 
-// BusyBox applets symlinked onto the single busybox binary. manifest.applets
-// overrides; this is the fallback for a bare (no-manifest) dir.
+// Applet fallback list for the no-manifest path. manifest.applets overrides.
 var APPLETS = [
   "sh", "hush", "ls", "cat", "sed", "awk", "grep", "find", "head", "tail",
   "cp", "mv", "rm", "mkdir", "rmdir", "touch", "echo", "printf",
@@ -51,10 +50,8 @@ var APPLETS = [
 //   { tier: "eager" | "lazy", triggers?: [tokens], files: [ {url,dest,mode,applets} ] }
 // eager bundles stage at boot (block ready); lazy bundles stage on the first
 // command whose text matches one of the bundle's trigger tokens (or an explicit
-// vm.loadBundle(name)). The base build ships busybox + generic OSS
-// (sqlite/poppler); PRODUCT tools + skills come from the integrator's manifest
-// or from vm.loadBundle()/vm.writeFile() at runtime — never hardcoded here.
-// null → minimal fallback (busybox only, fetched from BASE/busybox).
+// vm.loadBundle(name)). The reference build ships dash + toybox.
+// null → minimal fallback (fetched from BASE/busybox).
 var MANIFEST = null;
 var _bundlePromises = {};   // bundle name → resolved-once staging promise (idempotent)
 
@@ -171,14 +168,14 @@ self.Module = {
     ENV["WORKDIR"] = HOME;
 
     // DNS seed from the configured routes (product-agnostic — VM_ROUTES is built
-    // from init.vmRoutes). musl/busybox getaddrinfo reads /etc/hosts first.
+    // from init.vmRoutes). getaddrinfo reads /etc/hosts first.
     var hosts = "127.0.0.1 localhost\n";
     Object.keys(VM_ROUTES).forEach(function (ip) { hosts += ip + " " + VM_ROUTES[ip] + "\n"; });
     FS.writeFile("/etc/hosts", hosts);
     FS.writeFile("/etc/resolv.conf", "nameserver 127.0.0.1\n");
 
     // Stage EAGER bundles (block ready). Lazy bundles wait for a trigger token
-    // or an explicit vm.loadBundle(). No manifest → minimal busybox fallback.
+    // or an explicit vm.loadBundle(). No manifest → minimal fallback.
     if (MANIFEST && MANIFEST.bundles) {
       Object.keys(MANIFEST.bundles).forEach(function (name) {
         var b = MANIFEST.bundles[name];
@@ -190,10 +187,10 @@ self.Module = {
         });
       });
     } else {
-      addRunDependency("stage-busybox");
+      addRunDependency("stage-fallback");
       stageFile({ url: "busybox", dest: "/bin/busybox", mode: "0755", applets: true })
-        .then(function () { removeRunDependency("stage-busybox"); })
-        .catch(function (e) { self.postMessage({ type: "dbg", text: "busybox skipped: " + e.message }); removeRunDependency("stage-busybox"); });
+        .then(function () { removeRunDependency("stage-fallback"); })
+        .catch(function (e) { self.postMessage({ type: "dbg", text: "busybox skipped: " + e.message }); removeRunDependency("stage-fallback"); });
     }
 
     // Keep /dev/stdout,/dev/stderr registered but discard — real capture is
