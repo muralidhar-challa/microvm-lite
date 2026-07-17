@@ -24,4 +24,4 @@ loader, the HTTP bridge, and the packaging — is original work. See `README.md`
 This repository's own code is MIT licensed — see [`LICENSE`](LICENSE). The
 bundled/built third-party components retain their own licenses (dash is
 **BSD-3-Clause**, toybox is **0BSD**, blink is ISC, xterm.js is MIT).
-The reference build has zero GPL components.
+The reference build is permissively licensed throughout.
