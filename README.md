@@ -45,8 +45,6 @@ This repo includes two [custom](https://git.busybox.net/busybox/plain/docs/new-a
   busybox diff3 [-exEX3] /tmp/d3a.?????????? /tmp/d3b.?????????? file1 file2 file3
   ```
 
-### Credits
+### Credits & License
 
-The BusyBox-to-WASM build here derives from [mayflower/busybox-wasm](https://github.com/mayflower/busybox-wasm). The `em-shell.c`, `em-shell.h`, `em-shell.js` files are based on the excellent work by [Todd Fleming](https://tbfleming.github.io/) ([em-shell](https://github.com/tbfleming/em-shell), [em-busybox](https://github.com/tbfleming/em-busybox)), updated for modern Emscripten (4.x).
-
-Full attribution for all bundled components (BusyBox, blink, poppler, sqlite, …) is in [`CREDITS.md`](CREDITS.md).
+This repository's own code is [MIT](LICENSE) licensed. See [`CREDITS.md`](CREDITS.md) for attribution and licenses of every bundled and derived component.
