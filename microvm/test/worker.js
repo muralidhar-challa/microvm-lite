@@ -21,7 +21,7 @@ var moduleReadyPromise = new Promise(function (r) { _moduleReadyResolve = r; });
 var _runSeq = 0;
 
 // Static binaries fetched into /bin (our Rust tools + busybox).
-var BINARIES = ["busybox", "xtool", "probe", "runner"];
+var BINARIES = ["busybox", "probe"];
 // Dynamic poppler-utils + sqlite3 come from Alpine packages (rootfs/): binaries
 // into /bin, their shared-library closure + musl loader into /lib. blink runs
 // the ELF interpreter out of MEMFS just like a real rootfs.
