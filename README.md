@@ -1,49 +1,207 @@
-## BusyBox + Emscripten + nanozip + diff3
+# microvm-lite
 
-BusyBox compiled to WebAssembly using Emscripten. This repo contains build scripts without being a full fork of BusyBox, making version upgrades easier.
+A kernel-less **x86-64 userland that runs in a browser tab** — no
+SharedArrayBuffer, no COOP/COEP headers. It executes ordinary static/dynamic
+Linux ELF binaries via the [blink](https://github.com/jart/blink) x86-64 emulator
+compiled to WebAssembly (Emscripten + Asyncify).
 
-**Current versions:** BusyBox 1.37.0, Emscripten 4.x
+**Base toolchain:** [dash](https://git.kernel.org/pub/scm/utils/dash/dash.git/)
+(BSD-3-Clause) for `/bin/sh` + [toybox](https://landley.net/toybox/) (0BSD)
+for coreutils.
 
-This repo is an in-browser x86-64 runtime (dash + toybox, zero GPL) built on the blink emulator.
+It exposes a small `window.vm` API plus an HTTP bridge, so a host page can run
+shell commands, move files in/out, and let guest tools reach the network — all
+from a plain static file server.
 
-### Download
+## Why blink (and not WASIX / compile-to-WASM)
 
-Pre-built binaries are available on the [Releases](https://github.com/mayflower/busybox-wasm/releases) page:
-- `busybox-linux-x86_64` - Native Linux binary
-- `busybox.js` / `busybox.wasm` - WebAssembly build
+- **No SAB / no COOP-COEP.** blink is pure Asyncify; it runs on any page. WASIX
+  needs SAB even single-threaded.
+- **Runs existing binaries unmodified.** No recompiling tools to a WASM target.
+- Cold boot ~130 ms; common tools run 3–11× faster than a full-system emulator
+  (v86) on the common path. See `test/bench-results.md`.
 
-### Build
+## What it ships, what you add
 
-Requires [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html) for WASM builds.
+The reference build ships blink + dash + toybox — no app-specific tools,
+endpoints, or paths baked in. You add the rest at runtime:
 
-### Deno runner
+- **Binaries / skills / assets** → manifest *bundles*, `vm.loadBundle(name)`, or
+  `vm.writeFile(path, data, { mode })`.
+- **Network endpoints** → `init.vmRoutes` (hostname → URL); the runtime seeds
+  `/etc/hosts` and routes guest HTTP to your handlers.
+- **Working dir** → `/workspace` by default (`manifest.home` / `init.home`).
 
-The WASM build is emitted as an ES module (MODULARIZE + EXPORT_ES6) so it can be used directly in Deno.
-The helper in `deno/busybox_runner.ts` loads `busybox.js`/`busybox.wasm` and exposes a simple `run()` API.
-`busybox.js`/`busybox.wasm` are expected to live next to the runner in releases or your build output.
+## Layout
 
-```shell
-# native version
-make build/native/busybox
+```
+src/vm-worker.js     the Web Worker: hosts blink, runs commands, HTTP bridge, FS
+src/vm-host.js       main thread: window.vm API, endpoint registry, IDB snapshot
+blink/               build.sh, config.h, stubs.c, patches/, toybox.config
+dist/build-dist.sh   assembles dist/ + a hashed, bundle-based manifest.json
+dist/console.html    an interactive terminal against the packaged dist
+test/                contract.spec.mjs, dist-smoke.spec.mjs, stress.spec.mjs
+```
+`blink-src/`, `blink-wasm/`, `dist/{blink.*,bin,vm-*.js,manifest.json}` are
+build outputs (gitignored — regenerate, see below).
 
-# wasm version
-make build/wasm/busybox_unstripped.js
+## Build
+
+```sh
+bash blink/build.sh          # blink.wasm + dash + toybox (needs emcc, musl-gcc, gsed)
+bash dist/build-dist.sh      # → dist/ + manifest.json (buildId, bundles)
 ```
 
-### Custom Applets
+## Run it
 
-This repo includes two [custom](https://git.busybox.net/busybox/plain/docs/new-applet-HOWTO.txt) BusyBox applets:
+```sh
+cd . && python3 -m http.server 8080
+# open http://localhost:8080/dist/console.html
+```
 
-- [nanozip](https://github.com/vadimkantorov/nanozip) - [miniz](https://github.com/richgel999/miniz)-based imitation of `zip` utility:
-  ```
-  busybox nanozip [-r] [[-x EXCLUDED_PATH] ...] OUTPUT_NAME.zip INPUT_PATH [...]
-  ```
+## The `window.vm` contract
 
-- [diff3](https://github.com/openbsd/src/blob/master/usr.bin/diff3/diff3prog.c) - OpenBSD-based implementation of diff3:
-  ```
-  busybox diff3 [-exEX3] /tmp/d3a.?????????? /tmp/d3b.?????????? file1 file2 file3
-  ```
+`vm-host.js` installs, on `startVM({ cdnBase, workerUrl, vmRoutes, baseEtag, home })`:
 
-### Credits & License
+| API | Purpose |
+|---|---|
+| `vm.execute(cmd, timeout?)` → string | run a shell command, get combined stdout+stderr |
+| `vm.run(cmd, timeout?)` → `{done, output_file, pid, output}` | file-captured run with a guest pid |
+| `vm.writeFile(path, data, {mode}?)` | push a file; `mode: 0o755` installs an executable |
+| `vm.readFile(path)` / `vm.readFileRaw(path)` | read text / bytes |
+| `vm.loadBundle(name)` | stage a named manifest bundle on demand |
+| `vm.resetToFresh()` | wipe the snapshot and reboot |
+| `vm.ready()` / `vm.isReady` | boot readiness |
+| `window.registerVmEndpoint(path, handler)` | answer guest HTTP to a virtual host |
 
-This repository's own code is [MIT](LICENSE) licensed. See [`CREDITS.md`](CREDITS.md) for attribution and licenses of every bundled and derived component.
+> **Backgrounding note:** blink runs each command to completion in one Asyncify
+> call, so `vm.run` always returns `done:true` (no preemption/kill). A truly
+> hung command blocks the worker until it exits — reload to recover.
+
+## Manifest & asset loading
+
+`dist/manifest.json` is bundle-based:
+
+```jsonc
+{
+  "buildId": "…",
+  "home": "/workspace",
+  "applets": ["sh", "bash", "ls", "cat", …],
+  "bundles": {
+    "base": { "tier": "eager", "files": [
+      {"url":"bin/dash","dest":"/bin/dash","mode":"0755","applets":["sh","bash"]},
+      {"url":"bin/toybox","dest":"/bin/toybox","mode":"0755","applets":["ls","cat",…]}
+    ]}
+  }
+}
+```
+
+- **eager** bundles stage at boot. Add your own **lazy** bundles with `triggers`
+  for on-demand loading.
+- **Add your own tools/skills**: publish them as additional bundles in *your*
+  manifest, or push them at runtime — `vm.writeFile("/bin/mytool", bytes, {mode:"0755"})`
+  for a binary, `vm.writeFile("/workspace/skills/x.md", text)` for a doc.
+
+## Bringing your own binaries
+
+The reference build ships only dash + toybox. You layer your own ELF binaries,
+shared libraries, and data files on top — either eagerly at boot or lazily on
+first use. No code changes, no recompilation.
+
+### Via manifest (recommended for CDN-hosted binaries)
+
+Drop your binaries on a CDN, then add a bundle to your manifest:
+
+```jsonc
+{
+  "bundles": {
+    // Eager: staged at boot before the VM signals ready.
+    "sqlite": {
+      "tier": "eager",
+      "files": [
+        {"url": "bins/sqlite3", "dest": "/bin/sqlite3", "mode": "0755"}
+      ]
+    },
+    // Lazy: only fetched when a command matches one of the triggers.
+    // Your 14 MB of PDF tooling never downloads until the user runs pdftotext.
+    "pdf": {
+      "tier": "lazy",
+      "triggers": ["pdftotext", "pdfinfo", "pdftoppm"],
+      "files": [
+        {"url": "bins/pdftotext",  "dest": "/bin/pdftotext",  "mode": "0755"},
+        {"url": "bins/pdfinfo",    "dest": "/bin/pdfinfo",    "mode": "0755"},
+        {"url": "libs/libpoppler.so","dest":"/lib/libpoppler.so","mode":"0755"}
+      ]
+    },
+    // Data / seeds — any file, any path.
+    "seeds": {
+      "tier": "eager",
+      "files": [
+        {"url": "data/prompts.json", "dest": "/workspace/prompts.json"}
+      ]
+    }
+  }
+}
+```
+
+### Via JS API (runtime push)
+
+No manifest change — push files from the host page at any time:
+
+```js
+// ELF binary — blink runs it as a native x86-64 process.
+const bin = await fetch("https://cdn.example.com/my-tool").then(r => r.arrayBuffer());
+await vm.writeFile("/bin/my-tool", new Uint8Array(bin), { mode: 0o755 });
+
+// Text / data / seed files.
+await vm.writeFile("/workspace/config.json", JSON.stringify({ key: "value" }));
+
+// Now run it.
+await vm.execute("my-tool --config /workspace/config.json");
+```
+
+### Dynamic ELFs with shared libraries
+
+If your binary links dynamically against musl (`.so` files), drop both the binary
+and its library closure into the VM — the musl loader (`/lib/ld-musl-x86_64.so.1`)
+resolves them from `/lib`:
+
+```jsonc
+{
+  "tier": "lazy",
+  "triggers": ["my-tool"],
+  "files": [
+    {"url": "bins/my-tool",        "dest": "/bin/my-tool",        "mode": "0755"},
+    {"url": "libs/ld-musl-x86_64.so.1","dest":"/lib/ld-musl-x86_64.so.1","mode":"0755"},
+    {"url": "libs/libfoo.so.1",    "dest": "/lib/libfoo.so.1",    "mode": "0755"}
+  ]
+}
+```
+
+> **Static linking is simpler.** A single statically-linked ELF (like dash or
+> toybox) needs no library closure — just drop it in and run.
+
+## HTTP bridge
+
+Guest HTTP clients do the normal `getaddrinfo → socket → connect → write → read`.
+The runtime implements virtual sockets in blink: `connect()` to a seeded route IP
+hands the request to JS, which routes it to your `registerVmEndpoint` handler
+(or a direct authed `fetch`, per your `vmRoutes`), and streams the HTTP response
+back. Unknown hosts get a 403.
+
+## Tests
+
+```sh
+bun test/contract.spec.mjs    # window.vm contract + writeFile-install
+bun test/dist-smoke.spec.mjs  # packaging: cold boot, buildId etag, snapshot
+bun test/stress.spec.mjs      # sustained-load soak (ITERS=N)
+```
+
+## Known limitations
+
+- **No scheduler / no true concurrency.** Run-to-completion vfork: `fork→exec→wait`
+  works (shell, pipelines, sequences, subprocess capture); `&` backgrounding,
+  preemption, and `kill` do not.
+- **Per-fork memory.** A single `sh -c` that forks heavily (deep `$()`, big
+  loops spawning many externals) can grow the wasm heap toward its ~2 GB ceiling
+  within that one invocation.
