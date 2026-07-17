@@ -1,7 +1,7 @@
 # microvm-lite
 
-A kernel-less, product-agnostic **x86-64 userland that runs in a browser tab** —
-no SharedArrayBuffer, no COOP/COEP headers. It executes ordinary static/dynamic
+A kernel-less **x86-64 userland that runs in a browser tab** — no
+SharedArrayBuffer, no COOP/COEP headers. It executes ordinary static/dynamic
 Linux ELF binaries (a real shell + coreutils, sqlite3, poppler, and whatever
 tools you supply) via the [blink](https://github.com/jart/blink) x86-64 emulator
 compiled to WebAssembly (Emscripten + Asyncify).
@@ -20,11 +20,10 @@ from a plain static file server.
   than a full-system emulator (v86) on the common path. See
   `test/bench-results.md`.
 
-## Runtime vs. integrator
+## What it ships, what you add
 
-This project ships **only the generic runtime** — blink + busybox + generic OSS
-(sqlite/poppler). It hardcodes **no** product tools, endpoints, or paths.
-Everything product-specific is supplied by the integrator at runtime:
+The runtime ships just blink + busybox + generic OSS (sqlite/poppler) — no
+app-specific tools, endpoints, or paths baked in. You add the rest at runtime:
 
 - **Binaries / skills / assets** → manifest *bundles*, `vm.loadBundle(name)`, or
   `vm.writeFile(path, data, { mode })`.
