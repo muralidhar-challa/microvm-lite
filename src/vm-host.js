@@ -104,11 +104,51 @@ async function callHandler(fn) {
   try { return { status: 200, body: JSON.stringify(await fn()) }; }
   catch (e) { return { status: 500, body: JSON.stringify({ __error__: String(e) }) }; }
 }
-async function handleVirtualRequest(pathname, method, bodyText, url) {
+// Headers a browser fetch() forbids/overrides on the outgoing request; stripped
+// from the guest's forwarded headers before a route passthrough (see below).
+const FORBIDDEN_REQUEST_HEADERS = new Set([
+  "host", "connection", "content-length", "keep-alive",
+  "transfer-encoding", "upgrade", "proxy-connection",
+]);
+
+// Fallback for hosts with no registerVmEndpoint handler: if the caller's
+// vmRoutes config has an entry for this hostname, proxy the request there —
+// a real fetch(), with the guest's headers forwarded and the route's own
+// headers (e.g. an Authorization the guest must never see) merged in on top.
+// No hostname is special-cased here; any *.vm entry in vmRoutes behaves the
+// same way, config-only, same as the explicit-handler path above it.
+async function proxyToRoute(route, pathname, method, bodyText, url, guestHeaders) {
+  try {
+    const routeUrl = typeof route === "string" ? route : route.url;
+    const extraHeaders = typeof route === "object" ? route.headers : null;
+    let search = "";
+    try { search = new URL(url).search; } catch { /* no query */ }
+    const target = routeUrl.replace(/\/+$/, "") + pathname + search;
+    const headers = {};
+    if (guestHeaders) {
+      for (const k of Object.keys(guestHeaders)) {
+        if (!FORBIDDEN_REQUEST_HEADERS.has(k.toLowerCase())) headers[k] = guestHeaders[k];
+      }
+    }
+    if (extraHeaders) Object.assign(headers, extraHeaders);
+    const hasBody = bodyText && method !== "GET" && method !== "HEAD";
+    const res = await fetch(target, { method, headers, body: hasBody ? bodyText : undefined });
+    const body = await res.text();
+    const outHeaders = {};
+    res.headers.forEach((v, k) => { outHeaders[k] = v; });
+    return { status: res.status, body, headers: outHeaders };
+  } catch (e) {
+    return { status: 502, body: JSON.stringify({ __error__: String(e) }) };
+  }
+}
+
+async function handleVirtualRequest(pathname, method, bodyText, url, hostname, guestHeaders) {
   let data = {};
   try { if (bodyText) data = JSON.parse(bodyText); } catch { /* keep {} */ }
   const handler = _endpoints.get(pathname);
   if (handler) return callHandler(() => handler(method, data, url));
+  const route = hostname && _vmRoutes[hostname];
+  if (route) return proxyToRoute(route, pathname, method, bodyText, url, guestHeaders);
   return { status: 404, body: JSON.stringify({ __error__: "no handler for: " + pathname }) };
 }
 
@@ -194,8 +234,8 @@ async function _doStartVM() {
     }
     if (msg.type === "proxy_request") {
       const w = _worker;
-      handleVirtualRequest(msg.pathname, msg.method, msg.body, msg.url)
-        .then(({ status, body }) => w && w.postMessage({ type: "proxy_response", id: msg.id, status, body }))
+      handleVirtualRequest(msg.pathname, msg.method, msg.body, msg.url, msg.hostname, msg.headers)
+        .then(({ status, body, headers }) => w && w.postMessage({ type: "proxy_response", id: msg.id, status, body, headers }))
         .catch((err) => w && w.postMessage({ type: "proxy_response", id: msg.id, status: 500, body: JSON.stringify({ __error__: String(err) }) }));
       return;
     }

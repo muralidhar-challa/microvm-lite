@@ -21,12 +21,25 @@ else
   echo "[1/6] blink source already present, skipping clone"
 fi
 
-# ── 2. Apply patches + WASM fixes ────────────────────────────────────────────
-echo "[2/6] Applying patches + WASM fixes..."
+# ── 2. Apply patches ─────────────────────────────────────────────────────────
+# blink-wasm.patch carries every C change this project needs on top of stock
+# blink: the M2 process model (vfork/execve/wait4 in syscall.c), the M3 HTTP
+# bridge (virtual sockets), a real guest-memory snapshot/restore around every
+# Fork() (true fork isolation without host COW — fixes a crash on any pipe or
+# $() whose child never execve()s and corrupts the parent's shared memory),
+# an EmSaveFds/EmRestoreFds fix (fd table save/restore at every fork nesting
+# level, not just the outermost), a getdents() fix (real directory listing
+# only requires the fd to BE a directory, not that O_DIRECTORY was passed to
+# open() — toybox's ls opens plain O_RDONLY and was silently seeing 0 entries),
+# and em_reset_children() (clears blink's own child-status table between
+# top-level commands in this long-lived worker — see stubs.c's
+# em_reset_getopt comment for why blink's C globals need this at all).
+echo "[2/6] Applying patches..."
 cd "$SRC_DIR"
-git checkout blink/close.c blink/errno.c blink/errno.h blink/machine.c \
-            blink/machine.h blink/pipe.c blink/realpath.c blink/syscall.c \
-            blink/syscall.h blink/blink.c 2>/dev/null || true
+git checkout blink/close.c blink/debug.c blink/errno.c blink/errno.h \
+            blink/machine.c blink/machine.h blink/open.c blink/pipe.c \
+            blink/realpath.c blink/syscall.c blink/syscall.h blink/blink.c \
+            blink/throw.c 2>/dev/null || true
 git apply "$BLINK_DIR/patches/blink-wasm.patch"
 
 # ── 3. Copy our shell template and build config ──────────────────────────────
@@ -51,7 +64,7 @@ emcc \
   -O2 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s EXPORTED_RUNTIME_METHODS='["callMain","ccall","FS","TTY","ENV","HEAPU32","stringToNewUTF8","UTF8ToString"]' \
-  -s EXPORTED_FUNCTIONS='["_main","_malloc","_free","_em_reset_getopt","_em_main","_em_last_exit"]' \
+  -s EXPORTED_FUNCTIONS='["_main","_malloc","_free","_em_reset_getopt","_em_reset_children","_em_main","_em_last_exit"]' \
   -s INVOKE_RUN=0 -s EXIT_RUNTIME=0 -s FORCE_FILESYSTEM=1 \
   -s ASYNCIFY -s ASYNCIFY_IMPORTS='["emscripten_sleep","__asyncjs__em_http_fetch"]' \
   -s STACK_SIZE=33554432 \
