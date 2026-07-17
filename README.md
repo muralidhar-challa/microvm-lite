@@ -47,4 +47,4 @@ This repo includes two [custom](https://git.busybox.net/busybox/plain/docs/new-a
 
 ### Credits & License
 
-This repository's own code is [MIT](LICENSE) licensed. See [`CREDITS.md`](CREDITS.md) for attribution and licenses of every bundled and derived component.
+This repository's own code is [MIT](LICENSE) licensed. See [`CREDITS.md`](CREDITS.md) for attribution and licenses of every bundled and derived component, and [`SHELL-LICENSING.md`](SHELL-LICENSING.md) for the status of finding a permissive (non-GPL) `/bin/sh`.
