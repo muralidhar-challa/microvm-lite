@@ -4,10 +4,8 @@ BusyBox compiled to WebAssembly using Emscripten. This repo contains build scrip
 
 **Current versions:** BusyBox 1.37.0, Emscripten 4.x
 
-> The BusyBox-to-WASM build scripts here are derived from
-> [mayflower/busybox-wasm](https://github.com/mayflower/busybox-wasm) — thank you.
-> This repository adds the **`microvm/`** in-browser x86-64 runtime on top; see
-> [`microvm/README.md`](microvm/README.md). Full attribution in [`CREDITS.md`](CREDITS.md).
+This repo also includes **[`microvm/`](microvm/README.md)** — an in-browser
+x86-64 runtime built on this BusyBox-WASM base.
 
 ### Download
 
@@ -49,8 +47,6 @@ This repo includes two [custom](https://git.busybox.net/busybox/plain/docs/new-a
 
 ### Credits
 
-The `em-shell.c`, `em-shell.h`, `em-shell.js` files are based on the excellent work by [Todd Fleming](https://tbfleming.github.io/):
-- [tbfleming/em-shell](https://github.com/tbfleming/em-shell)
-- [tbfleming/em-busybox](https://github.com/tbfleming/em-busybox)
+The BusyBox-to-WASM build here derives from [mayflower/busybox-wasm](https://github.com/mayflower/busybox-wasm). The `em-shell.c`, `em-shell.h`, `em-shell.js` files are based on the excellent work by [Todd Fleming](https://tbfleming.github.io/) ([em-shell](https://github.com/tbfleming/em-shell), [em-busybox](https://github.com/tbfleming/em-busybox)), updated for modern Emscripten (4.x).
 
-These have been updated for modern Emscripten (4.x) compatibility.
+Full attribution for all bundled components (BusyBox, blink, poppler, sqlite, …) is in [`CREDITS.md`](CREDITS.md).
