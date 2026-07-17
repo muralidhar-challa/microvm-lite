@@ -6,6 +6,10 @@ Linux ELF binaries (a real shell + coreutils, sqlite3, poppler, and whatever
 tools you supply) via the [blink](https://github.com/jart/blink) x86-64 emulator
 compiled to WebAssembly (Emscripten + Asyncify).
 
+**Base toolchain:** [dash](https://git.kernel.org/pub/scm/utils/dash/dash.git/)
+(BSD-3-Clause) for `/bin/sh` + [toybox](https://landley.net/toybox/) (0BSD)
+for coreutils. Zero GPL. See `SHELL-LICENSING.md` for background.
+
 It exposes a small `window.vm` API plus an HTTP bridge, so a host page can run
 shell commands, move files in/out, and let guest tools reach the network — all
 from a plain static file server.
@@ -26,7 +30,8 @@ The runtime ships just blink + busybox + generic OSS (sqlite/poppler) — no
 app-specific tools, endpoints, or paths baked in. You add the rest at runtime:
 
 - **Binaries / skills / assets** → manifest *bundles*, `vm.loadBundle(name)`, or
-  `vm.writeFile(path, data, { mode })`.
+  `vm.writeFile(path, data, { mode })`. The base bundle ships dash (shell) +
+  toybox (coreutils); you add your own tools on top.
 - **Network endpoints** → `init.vmRoutes` (hostname → URL); the runtime seeds
   `/etc/hosts` and routes guest HTTP to your handlers.
 - **Working dir** → `/workspace` by default (`manifest.home` / `init.home`).
@@ -36,18 +41,21 @@ app-specific tools, endpoints, or paths baked in. You add the rest at runtime:
 ```
 src/vm-worker.js     the Web Worker: hosts blink, runs commands, HTTP bridge, FS
 src/vm-host.js       main thread: window.vm API, endpoint registry, IDB snapshot
-blink/               build.sh, config.h, stubs.c, patches/  (blink → wasm)
+blink/               build.sh, config.h, stubs.c, patches/, toybox.config
+blink/               dash+toybox cross-compiled by build.sh
+dist/build-dist.sh   assembles dist/ + a hashed, bundle-based manifest.json
 dist/build-dist.sh   assembles dist/ + a hashed, bundle-based manifest.json
 dist/console.html    an interactive terminal against the packaged dist
 test/                contract.spec.mjs, dist-smoke.spec.mjs, stress.spec.mjs
 ```
 `blink-src/`, `blink-wasm/`, `dist/{blink.*,bin,rootfs,vm-*.js,manifest.json}`,
 and `test/rootfs/` are build outputs (gitignored — regenerate, see below).
+`dist/bin/` ships `dash` + `toybox` (no GPL).
 
 ## Build
 
 ```sh
-bash blink/build.sh          # blink.wasm + busybox (needs emcc, x86_64-linux-musl-gcc)
+bash blink/build.sh          # blink.wasm + dash + toybox (needs emcc, musl-gcc, gsed)
 # stage the generic OSS closure (sqlite/poppler) into test/rootfs/ (build-rootfs.sh)
 bash dist/build-dist.sh      # → dist/ + manifest.json (buildId, bundles)
 ```

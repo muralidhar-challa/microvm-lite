@@ -87,7 +87,7 @@ try {
   check("writeFile accepts Uint8Array binary", binLen === 5, String(binLen));
 
   // ── HTTP bridge through the registerVmEndpoint registry (guest wget) ───────
-  const echoOut = await page.evaluate(() => window.vm.execute("wget -qO- http://api.vm/echo"));
+  const echoOut = await page.evaluate(() => window.vm.execute("wget -O - http://api.vm/echo"));
   check("HTTP bridge → registered endpoint", echoOut.includes('"ok":true'), echoOut);
 
   // ── loadBundle(): stage the generic OSS bundle on demand, then use it ──────

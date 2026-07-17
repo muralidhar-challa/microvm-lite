@@ -5,6 +5,8 @@ test-results/
 *.bak
 busybox.js
 busybox.wasm
+busybox_unstripped.js
+busybox_unstripped.wasm
 scripts/process-worker.bundle.js
 scripts/busybox-*.js
 
@@ -14,7 +16,8 @@ microvm/blink-wasm/
 # symlinks into blink-wasm/ for the dev server
 microvm/test/blink.js
 microvm/test/blink.wasm
-microvm/test/busybox
+microvm/test/toybox
+microvm/test/dash
 microvm/test/xtool
 microvm/test/probe
 

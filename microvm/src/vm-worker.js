@@ -266,13 +266,15 @@ function mkdirpDeep(dir) {
   }, "");
 }
 
-function applyApplets(busyboxBytes) {
-  var applets = (MANIFEST && MANIFEST.applets) || APPLETS;
-  applets.forEach(function (a) { try { FS.writeFile("/bin/" + a, busyboxBytes, { mode: 0o755 }); } catch (e) {} });
+function applyApplets(binBytes, appletList) {
+  if (!appletList || !appletList.length) return;
+  appletList.forEach(function (a) { try { FS.writeFile("/bin/" + a, binBytes, { mode: 0o755 }); } catch (e) {} });
 }
 
 // Stage one bundle file into MEMFS: fetch BASE/url → write to dest (mkdir -p its
-// dir), applying applet symlinks if flagged (the busybox multi-call binary).
+// dir), applying applet symlinks if flagged.
+//   f.applets: true → use the global manifest.applets list (backward compat)
+//   f.applets: ["sh","hush"] → create only those applets from this binary
 function stageFile(f) {
   return fetch(BASE + "/" + f.url).then(function (r) {
     if (!r.ok) throw new Error("HTTP " + r.status + " for " + f.url);
@@ -282,7 +284,11 @@ function stageFile(f) {
     if (slash > 0) mkdirpDeep(f.dest.slice(0, slash));
     var bytes = new Uint8Array(buf);
     FS.writeFile(f.dest, bytes, { mode: octalMode(f.mode) });
-    if (f.applets) applyApplets(bytes);
+    if (f.applets === true) {
+      applyApplets(bytes, (MANIFEST && MANIFEST.applets) || APPLETS);
+    } else if (Array.isArray(f.applets)) {
+      applyApplets(bytes, f.applets);
+    }
   });
 }
 
@@ -333,15 +339,8 @@ async function ensureBundlesFor(cmd) {
 // -fork commands included — is captured intact. cmd goes on its own line inside
 // the group so a trailing `;`/operator in cmd can't break the `)` terminator.
 async function runShellCapture(cmd, capFile, pidFile) {
-  // Brace group `{ }`, NOT a subshell `( )`: a brace group runs in the current
-  // shell with NO extra fork, so it doesn't add a fork per command (the
-  // run-to-completion vfork model leaks memory per fork, so an extra fork on
-  // every exec drives the wasm heap to its ~2GB ceiling under sustained load).
-  // The redirect still makes the shell open the capture file itself, so fd 1 is
-  // an ordinary guest Fd that survives the vfork fd save/restore. cmd sits on
-  // its own line so a trailing `;`/`&` in it can't collide with the `}`.
-  var script = (pidFile ? "echo $$ > " + pidFile + "\n" : "")
-    + "{ cd " + HOME + " 2>/dev/null\n" + cmd + "\n} > " + capFile + " 2>&1\n";
+  var script = "{ cd " + HOME + " 2>/dev/null; " + cmd + "; } > " + capFile + " 2>&1";
+  if (pidFile) script = "echo $$ > " + pidFile + "; " + script;
   return runExec(["/bin/sh", "-c", script]);
 }
 
