@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Phase 2 selftest</title></head>
+<body>
+<script>
+  window.Module = {
+    locateFile: function (path) { return "/dist/" + path; },
+    emHttpFetch: async function () { return 0; },
+    emHttpLog: function (text) { console.log("[vm-dbg]", text); },
+  };
+  window.__phase2SelftestReady = new Promise(function (resolve) {
+    window.Module.onRuntimeInitialized = function () { resolve(); };
+  });
+  window.__runPhase2Selftest = function () {
+    return Module.ccall("em_sched_phase2_test", "number", [], []);
+  };
+</script>
+<script src="/dist/blink.js"></script>
+</body>
+</html>

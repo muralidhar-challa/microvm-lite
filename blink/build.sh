@@ -47,9 +47,11 @@ echo "[3/6] Copying custom files..."
 cp "$BLINK_DIR/shell.html" "$SRC_DIR/blink/blink-shell.html"
 
 # mvl_sched.c: cooperative scheduler context-switch primitives (Emscripten
-# Fibers backend). Not yet exported/called from anywhere — see
-# SCHEDULER-DESIGN.md, Phase 0. Compiled in from Phase 0 onward so later
-# phases only need to add exports, not touch this file list again.
+# Fibers backend) — see SCHEDULER-DESIGN.md. mvl_sched_phase2_test.c: two
+# Machines sharing one System, memory-shared across a fiber swap (Phase 2
+# gate), exported as em_sched_phase2_test() for test/fiber-selftest.spec.mjs-
+# style playwright verification against the real backend. Neither is called
+# from the production command path yet.
 # ── 4. Build blink.js + blink.wasm ───────────────────────────────────────────
 echo "[4/6] Building blink WASM..."
 mkdir -p "$OUT_DIR"
@@ -60,6 +62,7 @@ emcc \
   $(ls blink/*.c | grep -vE 'blinkenlights|cga\.c|mda\.c|panel\.c|ppc\.c|xnu\.c|jit\.c|jitflush\.c|magikarp|ancillary|sysinfo|statfs|cpucount|mkfifo|devfs|procfs|pty|ioctl|realpath|seekdir|memccpy|mkfifoat|wcwidth|vasprintf|oneoff') \
   "$BLINK_DIR/stubs.c" \
   "$BLINK_DIR/mvl_sched.c" \
+  "$BLINK_DIR/mvl_sched_phase2_test.c" \
   -I. -I"$BLINK_DIR" \
   -o "$OUT_DIR/blink.js" \
   -DNDEBUG \
@@ -69,7 +72,7 @@ emcc \
   -O2 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s EXPORTED_RUNTIME_METHODS='["callMain","ccall","FS","TTY","ENV","HEAPU32","stringToNewUTF8","UTF8ToString"]' \
-  -s EXPORTED_FUNCTIONS='["_main","_malloc","_free","_em_reset_getopt","_em_reset_children","_em_main","_em_last_exit","_em_fiber_selftest","_em_fiber_selftest_log"]' \
+  -s EXPORTED_FUNCTIONS='["_main","_malloc","_free","_em_reset_getopt","_em_reset_children","_em_main","_em_last_exit","_em_fiber_selftest","_em_fiber_selftest_log","_em_sched_phase2_test"]' \
   -s INVOKE_RUN=0 -s EXIT_RUNTIME=0 -s FORCE_FILESYSTEM=1 \
   -s ASYNCIFY -s ASYNCIFY_IMPORTS='["emscripten_sleep","__asyncjs__em_http_fetch"]' \
   -s STACK_SIZE=33554432 \

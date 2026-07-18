@@ -181,15 +181,62 @@ run (the real scheduler will call this repeatedly in one long-lived worker).
 after wiring `mvl_sched.c` into the real `blink/build.sh` — zero behavior
 change, cold boot still ~76-96ms.
 
-**Phase 2 — two trivial Machines sharing one System, no dash.**
-`em_sched_submit_thread(entry_fn, stack)` creates two `Machine`s via
-`NewMachine(shared_system, parent)` (mirroring `SysSpawn` directly, no guest
-ELF/shell involved yet) — each writes to a *shared* guest memory location
-(not separate files) and the test asserts BOTH interleaved writes are
-visible to a third read after both finish, proving literal shared-memory
-visibility across the fiber swap. Also assert `g_machine` is correctly
-reassigned on every swap (checked under native `lldb`). Gate: native harness
-+ playwright.
+**Phase 2 — two trivial Machines sharing one System, no dash. DONE.**
+`blink/mvl_sched_phase2_test.c`'s `MvlSchedPhase2Test()` (exported as
+`em_sched_phase2_test()` for the wasm side) creates two `Machine`s via
+`NewMachine(system, parent)` (mirroring `SysSpawn` directly — `m2 =
+NewMachine(sys, m1)` shares `sys`, `memcpy`s `m1`'s register state) — no
+guest ELF/shell involved. Each writes a byte to a *shared* guest memory page
+(via `CopyToUser`/`CopyFromUser`, not separate files) across a fiber swap,
+and a third read (from the original, never-fibered context, after both
+fiber bodies finish) sees BOTH writes — proving literal shared-memory
+visibility, not just mid-flight cross-visibility.
+
+Two real things this surfaced, beyond the `g_machine` hazard it was
+explicitly designed to catch:
+
+- **Standing up a `Machine`/`System` pair outside blink's normal ELF-load
+  bootstrap needs one explicit step the loader normally hides.**
+  `ReserveVirtual` walks page tables starting from `system->cr3`, which is
+  ordinarily allocated by `loader.c:782` (`m->system->cr3 =
+  AllocatePageTable(m->system)`) as part of loading a guest binary. Skip the
+  loader (as Phase 2 does — no ELF, no shell) and `cr3` stays `0`, so the
+  very first `ReserveVirtual` call trips `unassert(s->real)` inside
+  `GetPageAddress` — `s->real` is a *real-mode* (16-bit) memory region, only
+  ever allocated when `NewSystem`'s mode is `XED_MODE_REAL`; our test
+  correctly uses `XED_MACHINE_MODE_LONG` (64-bit), so `s->real` is
+  legitimately null, and the actual bug is the missing `AllocatePageTable`
+  call, not a bad assert. Fixed by calling it explicitly right after
+  `NewSystem`, mirroring what `loader.c` does. Found via native `lldb`
+  (`unassert` compiles to a real trap under `-DNDEBUG`... except this
+  harness doesn't set that for asserts specifically — `unassert` always
+  fires — so the backtrace pointed straight at `GetPageAddress` →
+  `ReserveVirtual` → `main`).
+- **Native linking of the full blink source tree (needed here, unlike
+  Phase 0/1's self-contained `mvl_sched.c`) pulls in symbols that are
+  reachable at native-link time but not at real wasm-build time.**
+  `FastCall`/`FastCallAbs`/`FastLeave`/`Jitter` (JIT-only, `stack.c` calls
+  them unconditionally even though `DISABLE_JIT` makes them unreachable at
+  runtime — a known issue from the earlier debugging session) plus a NEW
+  one: `FixXnuSignal` (`xnu.c`, deliberately excluded from the file list),
+  referenced unconditionally by `blink.c`'s `OnFatalSystemSignal` — this
+  reference is normally dead code under emcc (which never defines
+  `__APPLE__`), so the real wasm build never hits it; native clang on macOS
+  does. Fixed with trivial stubs in
+  `blink/native-debug/native-stubs.c` (link-only, never part of the wasm
+  build). Also needed `-D_DARWIN_C_SOURCE` alongside `-D_XOPEN_SOURCE=600`
+  — the latter alone hides `AT_FDCWD`/`O_CLOEXEC`/`openat`/`MAP_ANONYMOUS`
+  on macOS's headers.
+
+Gate: `test/native-phase2-selftest.sh` (native `lldb` — confirmed via actual
+breakpoint inspection that `g_machine == g_m2` immediately after resuming
+into `Body1`, i.e. still stale from `Body2`, exactly the hazard the design
+calls out, before the next line corrects it) + `bun
+test/phase2-selftest.spec.mjs` (live Chromium, real `dist/blink.js`, passed
+on the first try — no new wasm-specific bugs this time, unlike Phase 1).
+`contract.spec.mjs`/`dist-smoke.spec.mjs` regression-checked after wiring
+`mvl_sched_phase2_test.c` into `blink/build.sh` — zero behavior change, cold
+boot ~86ms.
 
 **Phase 3 — real `CLONE_THREAD` support (re-enable `SysSpawn`).**
 Register `SysSpawn` under `__EMSCRIPTEN__` (currently compiled out by
