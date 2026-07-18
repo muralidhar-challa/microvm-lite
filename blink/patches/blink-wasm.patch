@@ -1,14 +1,23 @@
 diff --git a/blink/blink.c b/blink/blink.c
-index 3571b61..ca03f7c 100644
+index 3571b61..06da822 100644
 --- a/blink/blink.c
 +++ b/blink/blink.c
-@@ -215,10 +215,14 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
+@@ -215,10 +215,23 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
    if (!old) {
      // this is the first time a program is being loaded
      LoadProgram(m, execfn, prog, argv, envp, NULL);
-+#ifndef __EMSCRIPTEN__
-+    // WASM: skip host-fd injection — pre-creating guest fds 0-9
-+    // confuses musl's own stdio init for non-busybox binaries.
++    // Real wasm build (__EMSCRIPTEN__, MVL_NATIVE_DEBUG undefined): skip
++    // host-fd injection — pre-creating guest fds 0-9 confuses musl's own
++    // stdio init for non-busybox binaries, AND Emscripten's own runtime
++    // already wires up fds 0-2 automatically. The native MVL_NATIVE_DEBUG
++    // harness forces __EMSCRIPTEN__ too (to exercise blink's wasm-only
++    // code paths under lldb) but has no such runtime doing that wiring —
++    // without this, every write to stdout/stderr silently fails (SysWrite
++    // requires a registered Fd). MVL_NATIVE_DEBUG is never defined in the
++    // shipped wasm build, so this can't reproduce the wasm regression a
++    // prior, broader (__EMSCRIPTEN__-unconditional) attempt at this exact
++    // fix caused.
++#if !defined(__EMSCRIPTEN__) || defined(MVL_NATIVE_DEBUG)
      SetupCod(m);
      for (i = 0; i < 10; ++i) {
        AddStdFd(&m->system->fds, i);
@@ -17,7 +26,7 @@ index 3571b61..ca03f7c 100644
      ProgramLimit(m->system, RLIMIT_NOFILE, RLIMIT_NOFILE_LINUX);
    } else {
  #ifdef HAVE_JIT
-@@ -356,7 +360,24 @@ void exit(int status) {
+@@ -356,7 +369,24 @@ void exit(int status) {
  }
  #endif
  
@@ -147,10 +156,35 @@ index 42d0955..91b588e 100644
  long enoent(void);
  long enomem(void);
 diff --git a/blink/machine.c b/blink/machine.c
-index ad309eb..16c1cf7 100644
+index ad309eb..fc53cca 100644
 --- a/blink/machine.c
 +++ b/blink/machine.c
-@@ -2272,6 +2272,67 @@ void Blink(struct Machine *m) {
+@@ -56,6 +56,10 @@
+ #include "blink/x86.h"
+ #include "blink/xlat.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include "mvl_dispatch.h"
++#endif
++
+ _Thread_local siginfo_t g_siginfo;
+ _Thread_local struct Machine *g_machine;
+ 
+@@ -2246,6 +2250,13 @@ void Actor(struct Machine *mm) {
+     } else {
+       CheckForSignals(m);
+     }
++#ifdef __EMSCRIPTEN__
++    // Real CLONE_THREAD support (SCHEDULER-DESIGN.md, Phase 3): near-zero
++    // cost when no thread has ever been spawned this command (the
++    // overwhelmingly common case) — a single global bool read, no atomic,
++    // no function call unless it's actually true.
++    if (g_mvl_sched_active) MvlSchedMaybeYield();
++#endif
+   }
+ }
+ 
+@@ -2272,6 +2283,67 @@ void Blink(struct Machine *m) {
    }
  }
  
@@ -335,10 +369,10 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..038f6c6 100644
+index 34cc01c..9c39d8b 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
-@@ -87,6 +87,10 @@
+@@ -87,8 +87,13 @@
  #include <sys/prctl.h>
  #endif
  
@@ -348,8 +382,11 @@ index 34cc01c..038f6c6 100644
 +
  #ifdef __EMSCRIPTEN__
  #include <emscripten.h>
++#include "mvl_dispatch.h"
  #endif
-@@ -159,8 +163,8 @@ int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+ 
+ #ifdef __HAIKU__
+@@ -159,8 +164,8 @@ int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
  }
  
  ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
@@ -360,7 +397,29 @@ index 34cc01c..038f6c6 100644
      struct pollfd pfd;
      pfd.fd = fd;
      pfd.events = POLLIN;
-@@ -399,6 +403,7 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
+@@ -394,11 +399,29 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
+     FreeMachine(m);
+     pthread_exit(EXIT_SUCCESS);
+   }
++#elif defined(__EMSCRIPTEN__)
++  // Real CLONE_THREAD support (SCHEDULER-DESIGN.md, Phase 3). Mirrors the
++  // HAVE_THREADS branch's INTENT (a non-orphan thread exits on its own
++  // without killing the whole process) but not its mechanism: there's no
++  // real pthread to pthread_exit() out of — every spawned thread is a
++  // fiber sharing this process's one real OS thread. ClearChildTid fires
++  // the FUTEX_WAKE a waiting pthread_join() needs; HaltMachine siglongjmps
++  // straight back to this thread's own driver loop (mvl_dispatch.c's
++  // MvlThreadEntry), which marks it done and swaps away for good. `m` is
++  // deliberately NOT freed here — MvlThreadEntry needs it valid up to and
++  // through that siglongjmp; real cleanup is Phase 6's job.
++  if (m->threaded && !IsOrphan(m)) {
++    ClearChildTid(m);
++    HaltMachine(m, kMachineExitTrap);
++  } else {
++    SysExitGroup(m, rc);
++  }
+ #else
+   SysExitGroup(m, rc);
  #endif
  }
  
@@ -368,7 +427,7 @@ index 34cc01c..038f6c6 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +488,766 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +506,769 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -428,6 +487,9 @@ index 34cc01c..038f6c6 100644
 +void em_reset_children(void);
 +void em_reset_children(void) {
 +  memset(g_em_children, 0, sizeof(g_em_children));
++#ifdef __EMSCRIPTEN__
++  MvlSchedReset();
++#endif
 +}
 +
 +static void EmStashChildStatus(int pid, int exitcode) {
@@ -1135,7 +1197,113 @@ index 34cc01c..038f6c6 100644
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -1316,8 +2081,18 @@ static int SysDup1(struct Machine *m, i32 fildes) {
+@@ -498,20 +1284,22 @@ static void *OnSpawn(void *arg) {
+   Blink(m);
+ }
+ 
+-#ifdef HAVE_THREADS
++#if defined(HAVE_THREADS) || defined(__EMSCRIPTEN__)
+ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+                     u64 tls, u64 func) {
+   int tid;
+-  int err;
+   int ignored;
+-  pthread_t thread;
+   unsigned supported;
+   unsigned mandatory;
+   sigset_t ss, oldss;
+-  pthread_attr_t attr;
+   _Atomic(int) *ptid_ptr;
+   _Atomic(int) *ctid_ptr;
+   struct Machine *m2 = 0;
++#ifdef HAVE_THREADS
++  int err;
++  pthread_t thread;
++  pthread_attr_t attr;
++#endif
+   THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
+   if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
+     LOGF("unsupported clone() signal: %" PRId64, flags & 255);
+@@ -567,6 +1355,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+   Put64(m2->ax, 0);
+   Put64(m2->sp, stack);
+   m2->spawn_sigmask = oldss;
++#ifdef HAVE_THREADS
+   unassert(!pthread_attr_init(&attr));
+   unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
+   err = pthread_create(&thread, &attr, OnSpawn, m2);
+@@ -576,6 +1365,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+     unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
+     return eagain();
+   }
++#elif defined(__EMSCRIPTEN__)
++  // Real CLONE_THREAD support (SCHEDULER-DESIGN.md, Phase 3): m2 runs as a
++  // fiber sharing this process's one real OS thread, scheduled by
++  // mvl_dispatch.c instead of a real pthread_create. Genuinely concurrent
++  // with `m` — Actor()'s per-instruction loop preempts between them, not
++  // just at syscall boundaries.
++  if (MvlSchedSpawnThread(m2) != 0) {
++    FreeMachine(m2);
++    unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
++    return eagain();
++  }
++#endif
+   if (flags & CLONE_PARENT_SETTID_LINUX) {
+     atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
+   }
+@@ -601,7 +1402,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+     return enosys();
+ #endif
+   }
+-#ifdef HAVE_THREADS
++#if defined(HAVE_THREADS) || defined(__EMSCRIPTEN__)
+   return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
+ #else
+   LOGF("threading support disabled");
+@@ -717,13 +1518,35 @@ static int SysFutexWait(struct Machine *m,  //
+     if (Load32(mem) != expect) {
+       rc = 0;
+     } else {
+-      tick = AddTime(tick, FromMilliseconds(kPollingMs));
+-      if (CompareTime(tick, deadline) > 0) tick = deadline;
+-      rc = pthread_cond_timedwait(&f->cond, &f->lock, &tick);
+-      if (rc == ETIMEDOUT) {
+-        THR_LOGF("futex wait timed out");
+-      } else {
+-        THR_LOGF("futex wait returned %s", DescribeHostErrno(rc));
++#ifdef __EMSCRIPTEN__
++      if (g_mvl_sched_active) {
++        // Real CLONE_THREAD support (SCHEDULER-DESIGN.md, Phase 3):
++        // pthread_cond_timedwait would block this process's ONE real OS
++        // thread — since every spawned thread is a fiber sharing it, that
++        // stalls the ENTIRE scheduler, not just this fiber, and nothing
++        // will ever wake it (there's no other real OS thread to signal
++        // the condvar). Give another ready fiber a turn instead, then
++        // recheck — matches this loop's existing "woke up, go recheck the
++        // condition" contract, just via cooperative yield instead of a
++        // real timed wait. `tick` must track real elapsed time here (not
++        // the polling-interval stepping below) or the outer loop's own
++        // deadline check would never fire.
++        UNLOCK(&f->lock);
++        MvlSchedYieldOnce();
++        LOCK(&f->lock);
++        tick = GetTime();
++        rc = ETIMEDOUT;
++      } else
++#endif
++      {
++        tick = AddTime(tick, FromMilliseconds(kPollingMs));
++        if (CompareTime(tick, deadline) > 0) tick = deadline;
++        rc = pthread_cond_timedwait(&f->cond, &f->lock, &tick);
++        if (rc == ETIMEDOUT) {
++          THR_LOGF("futex wait timed out");
++        } else {
++          THR_LOGF("futex wait returned %s", DescribeHostErrno(rc));
++        }
+       }
+     }
+     UNLOCK(&f->lock);
+@@ -1316,8 +2139,18 @@ static int SysDup1(struct Machine *m, i32 fildes) {
        return emfile();
      }
      LOCK(&m->system->fds.lock);
@@ -1156,7 +1324,7 @@ index 34cc01c..038f6c6 100644
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -1345,6 +2120,9 @@ static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
+@@ -1345,6 +2178,9 @@ static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
  static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
    int rc, oflags;
    struct Fd *fd;
@@ -1166,7 +1334,7 @@ index 34cc01c..038f6c6 100644
    if (newfildes < 0) {
      LOGF("dup2() ebadf");
      return ebadf();
-@@ -1366,8 +2144,14 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
+@@ -1366,8 +2202,14 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
        dll_remove(&m->system->fds.list, &fd->elem);
        FreeFd(fd);
      }
@@ -1183,7 +1351,7 @@ index 34cc01c..038f6c6 100644
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -1378,6 +2162,9 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
+@@ -1378,6 +2220,9 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
    int rc;
    int oflags;
    struct Fd *fd;
@@ -1193,7 +1361,7 @@ index 34cc01c..038f6c6 100644
    if (newfildes < 0) return ebadf();
    if (fildes == newfildes) return einval();
    if (flags & ~O_CLOEXEC_LINUX) return einval();
-@@ -1395,8 +2182,14 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
+@@ -1395,8 +2240,14 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
        dll_remove(&m->system->fds.list, &fd->elem);
        FreeFd(fd);
      }
@@ -1210,7 +1378,7 @@ index 34cc01c..038f6c6 100644
      if (flags & O_CLOEXEC_LINUX) {
        oflags |= O_CLOEXEC;
      }
-@@ -1416,8 +2209,18 @@ static int SysDupf(struct Machine *m, i32 fildes, i32 minfildes, int cmd) {
+@@ -1416,8 +2267,18 @@ static int SysDupf(struct Machine *m, i32 fildes, i32 minfildes, int cmd) {
        return emfile();
      }
      LOCK(&m->system->fds.lock);
@@ -1231,7 +1399,7 @@ index 34cc01c..038f6c6 100644
      if (cmd == F_DUPFD_CLOEXEC) {
        oflags |= O_CLOEXEC;
      }
-@@ -2344,6 +3147,9 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2344,6 +3205,9 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    struct Iovs iv;
    ssize_t (*readv_impl)(int, const struct iovec *, int);
    if (size > NUMERIC_MAX(size_t)) return eoverflow();
@@ -1241,7 +1409,7 @@ index 34cc01c..038f6c6 100644
    LOCK(&m->system->fds.lock);
    if ((fd = GetFd(&m->system->fds, fildes))) {
      unassert(fd->cb);
-@@ -2559,6 +3365,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2559,6 +3423,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  }
  
  static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
@@ -1251,7 +1419,7 @@ index 34cc01c..038f6c6 100644
    return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
  }
  
-@@ -2652,9 +3461,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+@@ -2652,9 +3519,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
    struct dirent *ent;
    struct dirent_linux rec;
    if (size < sizeof(rec) - sizeof(rec.name)) return einval();
@@ -1269,7 +1437,7 @@ index 34cc01c..038f6c6 100644
    if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
      return -1;
    }
-@@ -3526,6 +4342,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -3526,6 +4400,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -1277,7 +1445,7 @@ index 34cc01c..038f6c6 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +4444,132 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4502,132 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -1410,7 +1578,7 @@ index 34cc01c..038f6c6 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
-@@ -5620,6 +6563,20 @@ void OpSyscall(P) {
+@@ -5620,6 +6621,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -1431,7 +1599,7 @@ index 34cc01c..038f6c6 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +6677,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6735,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);
