@@ -120,20 +120,66 @@ next. New scheduler code lives in `blink/sched.c` + `blink/sched.h`, added to
 the emcc source list in `blink/build.sh` alongside a `ucontext`-based shim
 for the native debug build (Emscripten fibers don't exist natively).
 
-**Phase 0 — context-switch shim, no behavior change.**
-`SchedYield`/`SchedSwap` behind a thin abstraction: `emscripten_fiber_*`
-under `__EMSCRIPTEN__`, `ucontext`/`swapcontext` under `MVL_NATIVE_DEBUG`.
-Gate: a `sched_selftest()` swaps between two `ucontext` contexts sharing a
-plain global (not per-context) counter — proving the shared-memory model at
-the most trivial level — verified under `lldb` on the native harness.
+**Phase 0 — context-switch shim, no behavior change. DONE.**
+`SchedMakeContext`/`SchedSwap` behind a thin abstraction in
+`blink/mvl_sched.c`+`mvl_sched.h` (named `mvl_sched.*`, not `sched.*` — a
+plain `sched.h` shadows the system `<sched.h>` that `throw.c`'s
+`sched_yield()` needs, since `blink/` is on the include path): `ucontext`/
+`swapcontext` under `MVL_NATIVE_DEBUG`, `emscripten_fiber_*` under
+`__EMSCRIPTEN__`. Gate: `SchedSelftest()` swaps between two `ucontext`
+contexts sharing a plain global (not per-context) counter — proving the
+shared-memory model at the most trivial level — verified under `lldb` on the
+native harness (`test/native-sched-selftest.sh --lldb`): breakpoints inside
+the shared body show alternating `who='A'`/`who='B'` on the same OS thread.
 
-**Phase 1 — fiber PoC in total isolation (no Machine, no shell).**
-New export `em_fiber_selftest()`: 2 Emscripten fibers ping-pong a counter N
-times, recording interleave order. Validates `emscripten_fiber_init`/
-`emscripten_fiber_swap` actually work under this project's exact emcc flags
-and worker environment — the single biggest open unknown. Gate: a
-`contract.spec.mjs`-style playwright test asserts the recorded interleave
-sequence.
+**Phase 1 — fiber PoC in total isolation (no Machine, no shell). DONE.**
+`em_fiber_selftest()`/`em_fiber_selftest_log()` (same `SchedSelftest()` body,
+now exercised through the real `__EMSCRIPTEN__` backend) exported and driven
+by `test/fiber-selftest.spec.mjs` — a live-browser playwright test, not just
+a C-side self-check. Validated `emscripten_fiber_init`/`emscripten_fiber_swap`
+actually work under this project's exact emcc/Asyncify flags — the single
+biggest open unknown — and it does, but only after fixing two real bugs the
+naive port from `ucontext` doesn't warn you about:
+
+- **A context that's only ever a *target* (never created via
+  `SchedMakeContext`) must still be explicitly initialized.** `ucontext`'s
+  `swapcontext(&from->uc, &to->uc)` populates `from` unconditionally, so a
+  zeroed `ucontext_t` "just works" as a future swap target. Emscripten
+  Fibers don't: `emscripten_fiber_t`'s `finishContextSwitch` distinguishes
+  "fresh entry point" from "resume" via a `stack_base`/`stack_max` pair that,
+  on a never-initialized struct, reads as `0`/`0` — swapping into it sets
+  the wasm stack limits to `[0,0]` and the very next stack operation traps
+  `unreachable`. Fixed by adding `SchedInitCurrentContext(ctx)`
+  (`emscripten_fiber_init_from_current_context` / a harmless `getcontext`),
+  which MUST be called on any context — typically the scheduler's own "main"
+  context — that a fiber swaps back into but that was never itself created
+  via `SchedMakeContext`.
+- **The entry function's actual wasm-level type must be `void(void*)`,
+  exactly — casting a C function pointer does not change it.** A
+  `void(void)` function cast to `void(*)(void*)` and handed to
+  `emscripten_fiber_init` traps with "function signature mismatch" the
+  moment Fibers calls it through the wasm function table via a typed
+  `dynCall_vi` — wasm enforces function-table call signatures at the type
+  level, unlike native ABIs where an unused extra argument is silently
+  ignored. Fixed by making `SchedMakeContext`'s `entry` genuinely take a
+  `void *arg` everywhere (both backends), which also meant giving the
+  `ucontext` backend its own per-context entry/arg storage and a shared
+  trampoline (`makecontext`'s varargs are int-sized and can't portably carry
+  a pointer on LP64) rather than passing the pointer through `makecontext`
+  directly.
+
+`ASYNCIFY_STACK_SIZE` was NOT the issue, despite Emscripten's own error
+message suggesting it — a red herring worth remembering before chasing it
+again in a later phase.
+
+Gate: `bun test/fiber-selftest.spec.mjs` — live Chromium, real
+`dist/blink.js`/`blink.wasm`, asserts the exact interleaved log string
+(`"ABABABABABABABABABAB"`) and reruns the whole thing a second time in the
+SAME module instance to confirm no leftover Asyncify state corrupts a later
+run (the real scheduler will call this repeatedly in one long-lived worker).
+`contract.spec.mjs` (17/17) and `dist-smoke.spec.mjs` regression-checked
+after wiring `mvl_sched.c` into the real `blink/build.sh` — zero behavior
+change, cold boot still ~76-96ms.
 
 **Phase 2 — two trivial Machines sharing one System, no dash.**
 `em_sched_submit_thread(entry_fn, stack)` creates two `Machine`s via
