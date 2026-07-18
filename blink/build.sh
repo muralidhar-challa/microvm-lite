@@ -46,6 +46,10 @@ git apply "$BLINK_DIR/patches/blink-wasm.patch"
 echo "[3/6] Copying custom files..."
 cp "$BLINK_DIR/shell.html" "$SRC_DIR/blink/blink-shell.html"
 
+# mvl_sched.c: cooperative scheduler context-switch primitives (Emscripten
+# Fibers backend). Not yet exported/called from anywhere — see
+# SCHEDULER-DESIGN.md, Phase 0. Compiled in from Phase 0 onward so later
+# phases only need to add exports, not touch this file list again.
 # ── 4. Build blink.js + blink.wasm ───────────────────────────────────────────
 echo "[4/6] Building blink WASM..."
 mkdir -p "$OUT_DIR"
@@ -55,6 +59,7 @@ cd "$SRC_DIR"
 emcc \
   $(ls blink/*.c | grep -vE 'blinkenlights|cga\.c|mda\.c|panel\.c|ppc\.c|xnu\.c|jit\.c|jitflush\.c|magikarp|ancillary|sysinfo|statfs|cpucount|mkfifo|devfs|procfs|pty|ioctl|realpath|seekdir|memccpy|mkfifoat|wcwidth|vasprintf|oneoff') \
   "$BLINK_DIR/stubs.c" \
+  "$BLINK_DIR/mvl_sched.c" \
   -I. -I"$BLINK_DIR" \
   -o "$OUT_DIR/blink.js" \
   -DNDEBUG \
