@@ -49,9 +49,13 @@ cp "$BLINK_DIR/shell.html" "$SRC_DIR/blink/blink-shell.html"
 # mvl_sched.c: cooperative scheduler context-switch primitives (Emscripten
 # Fibers backend) — see SCHEDULER-DESIGN.md. mvl_sched_phase2_test.c: two
 # Machines sharing one System, memory-shared across a fiber swap (Phase 2
-# gate), exported as em_sched_phase2_test() for test/fiber-selftest.spec.mjs-
-# style playwright verification against the real backend. Neither is called
-# from the production command path yet.
+# gate), exported as em_sched_phase2_test(). mvl_dispatch.c: the real
+# round-robin scheduler (Phase 3) — a guest program's pthread_create() now
+# gets genuine preemptive, shared-memory concurrency (SysSpawn/SysExit/
+# SysFutexWait in blink-wasm.patch's syscall.c route through it; Actor()'s
+# per-instruction loop in machine.c calls MvlSchedMaybeYield). This one IS
+# on the production command path the moment a guest calls pthread_create —
+# near-zero cost otherwise (a single global bool check per instruction).
 # ── 4. Build blink.js + blink.wasm ───────────────────────────────────────────
 echo "[4/6] Building blink WASM..."
 mkdir -p "$OUT_DIR"
@@ -63,6 +67,7 @@ emcc \
   "$BLINK_DIR/stubs.c" \
   "$BLINK_DIR/mvl_sched.c" \
   "$BLINK_DIR/mvl_sched_phase2_test.c" \
+  "$BLINK_DIR/mvl_dispatch.c" \
   -I. -I"$BLINK_DIR" \
   -o "$OUT_DIR/blink.js" \
   -DNDEBUG \

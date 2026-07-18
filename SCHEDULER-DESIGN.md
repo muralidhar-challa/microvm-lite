@@ -238,15 +238,117 @@ on the first try — no new wasm-specific bugs this time, unlike Phase 1).
 `mvl_sched_phase2_test.c` into `blink/build.sh` — zero behavior change, cold
 boot ~86ms.
 
-**Phase 3 — real `CLONE_THREAD` support (re-enable `SysSpawn`).**
-Register `SysSpawn` under `__EMSCRIPTEN__` (currently compiled out by
-`DISABLE_THREADS`), routing its `pthread_create(OnSpawn, m2)` call through
-`em_sched_submit_thread` from Phase 2 instead. A guest program that calls
-`pthread_create` now gets genuine concurrent, shared-memory execution. Gate:
-a small guest C test binary with two `pthread_create`d workers incrementing
-a shared counter under a mutex (or observing each other's writes without
-one, to explicitly test the "no torn writes across a yield" claim above) —
-verified both natively and via `contract.spec.mjs`.
+**Phase 3 — real `CLONE_THREAD` support (re-enable `SysSpawn`). DONE.**
+`SysSpawn` now compiles and works under `__EMSCRIPTEN__` too (was
+`#ifdef HAVE_THREADS`-only, still compiled out by `DISABLE_THREADS` for
+non-wasm native builds — that's unchanged). This was the first phase to
+touch existing blink files rather than only add new ones, and to require a
+genuine round-robin scheduler (new `blink/mvl_dispatch.c`+`.h`) rather than
+Phase 0-2's point-to-point fiber swapping — a guest program's
+`pthread_create()` now gets real preemptive, shared-memory concurrency with
+whatever spawned it, not just correct-looking output.
+
+**Design**: `struct MvlThread` (a wrapper this module owns — deliberately
+does NOT add fields to `struct Machine`, keeping the change additive) holds
+a `Machine*`, a `SchedCtx` fiber, a host fiber stack, and a `next` pointer
+forming a circular ring. `Actor()`'s per-instruction loop (`machine.c`)
+gets one new line: `if (g_mvl_sched_active) MvlSchedMaybeYield();` — a
+single global bool read when nothing's ever been spawned (the
+overwhelming common case), a counter-increment-and-compare
+(`MVL_YIELD_PERIOD` = 4096 instructions) once something has. `SysSpawn`'s
+`__EMSCRIPTEN__` branch (`syscall.c`) keeps ALL of its existing flag
+validation and `NewMachine(m->system, m)` call unchanged — only the very
+last step (`pthread_create(OnSpawn, m2)`) is swapped for
+`MvlSchedSpawnThread(m2)`, which lazily captures the calling machine as the
+ring's "main" member on first use (`SchedInitCurrentContext`, no separate
+init call needed from `blink.c`'s bootstrap) and splices `m2` in as a new
+ring member. `SysExit`'s `__EMSCRIPTEN__` branch mirrors the
+`HAVE_THREADS` branch's *intent* (a non-orphan thread exits without
+killing the process) but not its mechanism: there's no real pthread to
+`pthread_exit()` out of, so it calls `ClearChildTid` (fires the
+`FUTEX_WAKE` a waiting `pthread_join()` needs — unchanged, reused as-is)
+then `HaltMachine(m, kMachineExitTrap)`, which `siglongjmp`s straight back
+into that thread's own driver loop (`MvlThreadEntry`), which marks it done
+and permanently unlinks it from the ring. `m` is deliberately never freed
+— real cleanup is Phase 6's job; this leaks, doesn't corrupt.
+
+**A load-bearing bug found by just thinking through the model, confirmed
+before it could bite**: `SysFutexWait`'s existing implementation calls
+`pthread_cond_timedwait()` on contention — correct for real
+`HAVE_THREADS` (each guest thread is a real OS pthread; blocking one
+doesn't block the others) but fatal under the fiber model, where every
+"thread" shares the ONE real OS thread — blocking it would stall the
+entire scheduler, not just the waiter, and nothing else exists to wake it.
+Fixed with a parallel `__EMSCRIPTEN__`-gated, `g_mvl_sched_active`-gated
+branch that cooperatively yields (`MvlSchedYieldOnce`, unconditional
+single swap, vs. `MvlSchedMaybeYield`'s periodic check) and rechecks the
+condition instead of blocking — same retry-loop contract, `tick` set to
+real wall-clock time (not the polling-interval stepping the original path
+uses) so the caller's own deadline check still fires correctly for timed
+waits. This is exactly the class of bug `pthread_mutex_lock` contention
+would have hit immediately in the guest test below.
+
+**A second real bug, found empirically**: the guest test binary ran but
+produced NO output at all (clean exit, no error) the first time. Root
+cause: `blink.c`'s `Exec()` skips `AddStdFd` (registering guest fds 0-2)
+under `#ifndef __EMSCRIPTEN__` — correct for the real wasm build
+(Emscripten's own runtime wires up fds 0-2 automatically) but the native
+`MVL_NATIVE_DEBUG` harness forces `__EMSCRIPTEN__` too (to exercise
+blink's wasm-only code paths under `lldb`) and has no such runtime, so
+`SysWrite` (`if (!fd) return -1;`) silently fails on every write to
+stdout/stderr. This exact issue was hit and *reverted* in an earlier
+session because a broader fix broke the real wasm build. Fixed narrowly
+this time: `#if !defined(__EMSCRIPTEN__) || defined(MVL_NATIVE_DEBUG)`
+instead of `#ifndef __EMSCRIPTEN__` — `MVL_NATIVE_DEBUG` is never defined
+in the shipped wasm build, so this cannot reproduce that regression; it
+only changes behavior for the native debug harness, which had no working
+stdout at all before this.
+
+**Gate, verified two ways, both green:**
+- `test/native-phase3-pthread-selftest.sh` — a REAL guest binary
+  (`blink/native-debug/pthread-counter-test.c`, cross-compiled with
+  `x86_64-linux-musl-gcc`, unmodified musl `pthread_create`/
+  `pthread_mutex_lock`/`pthread_join`) run through a native blink CLI
+  build (blink.c's real `main()`, not a custom test driver) with the
+  scheduler linked in: two threads incrementing a shared counter 20,000
+  times each under a mutex, joined, checked — `PASS: counter=40000`.
+  Passed on the first real attempt once the fd fix landed. **Critically,
+  a mutex-protected counter test alone can't distinguish genuine
+  concurrency from accidentally-correct sequential execution** — both
+  produce the right final total. Verified the difference directly under
+  `lldb`: a breakpoint on `MvlSchedSwapToNext`, hit repeatedly, shows
+  `g_mvl_current` cycling through three distinct addresses (main, worker1,
+  worker2) in a *repeating* round-robin — concrete proof of real,
+  continuing preemption during the loop, not one thread running to
+  completion before the next starts.
+- `test/phase3-pthread-selftest.spec.mjs` — the SAME guest binary, but run
+  through the actual production contract: `window.vm.writeFile(...,
+  {mode: "0755"})` + `window.vm.execute(...)` against the real
+  `dist/blink.js`, live Chromium, real Emscripten Fibers — passed on the
+  first try. Reran twice more in the same long-lived worker instance (the
+  scheduler's per-command reset, `MvlSchedReset`, wired into the existing
+  `em_reset_children()` hook) and confirmed an ordinary non-threaded
+  command still works correctly afterward. `contract.spec.mjs` (17/17),
+  `dist-smoke.spec.mjs`, `fiber-selftest.spec.mjs`, and
+  `phase2-selftest.spec.mjs` all still pass unchanged — zero regression on
+  every earlier phase's gate and the original synchronous fast path, cold
+  boot still ~100ms.
+
+**Known gaps, deliberately deferred (not silently missed):**
+- A thread hitting a fatal signal (SIGSEGV etc.) is treated the same as a
+  clean exit by `MvlThreadEntry` — silently ends the fiber rather than
+  propagating the signal properly.
+- Per-fiber signal masks aren't preserved across swaps — `pthread_sigmask`
+  affects the one real OS thread all fibers share, so one fiber's mask
+  change is visible to all others. Doesn't matter for the current gate (no
+  guest signal masking); would need real per-`MvlThread` mask save/restore
+  in `MvlSchedSwapToNext` before this carries a guest workload that uses
+  signals.
+- No real memory cleanup on thread exit (`m`/the fiber stack both leak) —
+  intentional, Phase 6's job.
+- A spawned thread calling `exit_group()` (not `exit()`/returning from its
+  function) still goes through the ordinary `SysExitGroup` path, untested
+  against the scheduler.
 
 **Phase 4 — fork/vfork-backed background jobs (`{done:false, pid}`
 contract), still no JS timeout wiring.** Same `NewMachine(m->system, parent)`
