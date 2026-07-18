@@ -369,7 +369,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..9c39d8b 100644
+index 34cc01c..67d9fdd 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -397,7 +397,39 @@ index 34cc01c..9c39d8b 100644
      struct pollfd pfd;
      pfd.fd = fd;
      pfd.events = POLLIN;
-@@ -394,11 +399,29 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
+@@ -349,9 +354,31 @@ static void ClearChildTid(struct Machine *m) {
+ #endif
+ }
+ 
++#ifdef __EMSCRIPTEN__
++static void EmStashChildStatus(int, int);  // defined below; forward-declared
++                                            // for use here.
++#endif
++
+ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
+   THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
+   ClearChildTid(m);
++#ifdef __EMSCRIPTEN__
++  if (m->em_vfork_child) {
++    // Real fork/vfork-backed background jobs (SCHEDULER-DESIGN.md, Phase
++    // 4): m is a scheduled child sharing m->system with a live parent —
++    // and possibly OTHER concurrently-scheduled siblings. The
++    // trapexit/exited fields below are System-level and would race if
++    // more than one such child is in flight on this System at once (a
++    // second child finishing while a first is still yielded out would
++    // stomp exited/exitcode before the first ever reads them). Mirrors
++    // SysExit's __EMSCRIPTEN__ thread-exit branch: stash status directly,
++    // using this Machine's own tid (== the pid Fork() returned to the
++    // parent), and halt THIS machine only — no System-level state
++    // touched, so concurrent siblings can't collide.
++    EmStashChildStatus(m->tid, rc);  // encodes WIFEXITED internally
++    HaltMachine(m, kMachineExitTrap);
++  }
++#endif
+   if (m->system->isfork) {
+ #ifndef NDEBUG
+     if (FLAG_statistics) {
+@@ -394,11 +421,29 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
      FreeMachine(m);
      pthread_exit(EXIT_SUCCESS);
    }
@@ -427,7 +459,7 @@ index 34cc01c..9c39d8b 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +506,769 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +528,862 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -795,6 +827,43 @@ index 34cc01c..9c39d8b 100644
 +  return n;
 +}
 +
++#ifdef __EMSCRIPTEN__
++// Real fork/vfork-backed background jobs (SCHEDULER-DESIGN.md, Phase 4):
++// builds a NEW, independent fd list for a scheduled fork child — reusing
++// EmSaveFds's dup-to-a-new-host-fd technique, but instead of stashing the
++// dups for a later restore (the old synchronous path's trick), installs
++// them as a genuinely separate `struct Dll` list mvl_dispatch.c swaps into
++// `m->system->fds.list` whenever this child is the one running (see
++// MvlSchedSpawnWithEntry's doc in mvl_dispatch.h for why fds need their own
++// list at all, unlike memory). Returns the new list (possibly NULL if the
++// parent had nothing open — a legitimate empty list, not a failure; the
++// caller passes `independent_fds=true` alongside it either way so mvl_
++// dispatch.c never confuses "empty" with "share the parent's").
++static struct Dll *EmDupFdsForChild(struct Machine *m) {
++  struct Fds tmp;
++  struct Dll *e;
++  InitFds(&tmp);
++  LOCK(&m->system->fds.lock);
++  for (e = dll_first(m->system->fds.list); e;
++       e = dll_next(m->system->fds.list, e)) {
++    struct Fd *fd = FD_CONTAINER(e);
++    int dupfildes;
++    if (fd->fildes < 0 || fd->fildes >= kMinBlinkFd) continue;  // skip vm fds
++    if ((dupfildes = VfsFcntl(fd->fildes, F_DUPFD_CLOEXEC, kMinBlinkFd)) == -1) {
++      LOGF("EmDupFdsForChild: could not dup fd %d (errno %d)", fd->fildes, errno);
++      continue;  // best effort, matching EmSaveFds
++    }
++    if (!ForkFd(&tmp, fd, dupfildes, fd->oflags)) {
++      LOGF("EmDupFdsForChild: ForkFd failed for fd %d", fd->fildes);
++      VfsClose(dupfildes);
++    }
++  }
++  UNLOCK(&m->system->fds.lock);
++  unassert(!pthread_mutex_destroy(&tmp.lock));  // only tmp.list is kept
++  return tmp.list;
++}
++#endif
++
 +// Undo whatever the vfork child did to the shared fd table: tear down the
 +// child's Fd list (freeing structs, closing the host fds it left in the guest
 +// range), then restore each parent fd from its saved slot and rebuild the Fd
@@ -831,80 +900,136 @@ index 34cc01c..9c39d8b 100644
 +  UNLOCK(&m->system->fds.lock);
 +}
 +
++// Real fork/vfork-backed background jobs (SCHEDULER-DESIGN.md, Phase 4).
++// The fiber driver for a scheduled fork child: mirrors MvlThreadEntry
++// (mvl_dispatch.c) but lives here because completing a fork child needs
++// EmStashChildStatus/g_em_children, which mvl_dispatch.c deliberately
++// doesn't know about (it's syscall.c-private, reused as-is from the old
++// synchronous path).
++static void EmForkChildEntry(struct Machine *m) {
++  int rc;
++  g_machine = m;
++  if (!(rc = sigsetjmp(m->onhalt, 1))) {
++    m->canhalt = true;
++    // Runs until HaltMachine(m, kMachineExitTrap) — either from
++    // SysExitGroup's em_vfork_child branch below (no execve: status
++    // already stashed directly before the halt), or from SysExecve's
++    // EXISTING vfork-child branch (execve'd: ran the new program to
++    // completion via a NESTED RunMachineUntilExit(m2) — safe under the
++    // scheduler because Actor()'s yield hook fires regardless of C call
++    // stack depth, so other fibers still get scheduled time while this
++    // fiber sits inside that nested call).
++    Actor(m);
++  }
++  (void)rc;
++  if (m->system->exited) {
++    // Came from SysExecve's vfork-child branch: it stashed the exec'd
++    // program's exit status in system->exitcode (a System-level field —
++    // safe here ONLY because there's no yield point between it setting
++    // this and us reading it right now, no Actor()/guest-instruction
++    // execution runs in between). Reset immediately so a sibling
++    // scheduled fork child sharing this System never misreads it.
++    EmStashChildStatus(m->tid, m->system->exitcode);
++    m->system->exited = false;
++  }
++  // Else: SysExitGroup's own em_vfork_child branch already stashed status
++  // directly before calling HaltMachine — nothing more to do here.
++  MvlSchedThreadExitAndYield();
++}
++
 +static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
-+  static int next_pid = 1000;
-+  int child_pid, rc, nsv = 0;
-+  bool saved_vfork_child;
-+  u64 saved_ip;
-+  u32 saved_flags;
-+  u8 saved_beg[128];   // the general register file
-+  u8 saved_xmm[256];   // the vector register file (16 x 16 bytes)
-+  struct EmFdSave sv[kMinBlinkFd];  // at most one entry per guest fd
++  struct Machine *m2;
 +  (void)flags;
 +  (void)ctid;
-+  child_pid = ++next_pid;
++  // Shares m->system with the parent — memory AND fd table (fds live on
++  // struct System, not struct Machine, so there is no way to share memory
++  // but NOT fds without splitting that struct; accepted as the same v1
++  // "share, don't isolate" simplification Phase 0-3 already made for
++  // memory — see SCHEDULER-DESIGN.md's Phase 4 notes). This REPLACES the
++  // old run-to-completion model (EmSaveMem/EmRestoreMem/EmSaveFds/
++  // EmRestoreFds/RunMachineUntilExit(m) reusing the SAME Machine for both
++  // parent and child) — a backgrounded child now genuinely runs
++  // concurrently with its parent instead of blocking it until done.
++  if (!(m2 = NewMachine(m->system, m))) {
 +#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[Fork] enter child_pid=%d\n", child_pid);
++    fprintf(g_mvldbg, "[Fork] NewMachine FAILED\n");
 +#endif
-+  // Save the caller's fd table AND guest memory at EVERY nesting level: real
-+  // fork() gives the child copies of both, so each Fork()'s "parent" — whoever
-+  // called it, including a child that forks again — must get its own state
-+  // back when its child finishes.
-+  nsv = EmSaveFds(m, sv, kMinBlinkFd);
-+  struct EmMemSnap memsnap;
-+  EmSaveMem(m, &memsnap);
-+
-+  // vfork() runs the child on the SAME Machine `m` as the parent (they share
-+  // one address space, exactly as real vfork() specifies). The child mutates
-+  // registers, the fd table, and — until it execve()s — the shared memory, so
-+  // we snapshot everything the parent needs to resume from its vfork() call
-+  // site and restore it once the child has execve()d or _exit()ed. The child's
-+  // execve() runs the new program in a FRESH machine (see SysExecve) so it
-+  // never clobbers this parent memory — the crucial difference from a plain
-+  // in-place execve, which would destroy the shared program image.
-+  saved_ip = m->ip;
-+  saved_flags = m->flags;
-+  memcpy(saved_beg, m->beg, sizeof(saved_beg));
-+  memcpy(saved_xmm, m->xmm, sizeof(saved_xmm));
-+  saved_vfork_child = m->em_vfork_child;
-+
-+  Put64(m->ax, 0);  // child's view of fork()/vfork()/clone()'s return value
-+  // Raw vfork()/fork() (stack==0, e.g. busybox hush NOMMU) implicitly shares
-+  // the parent's stack; musl's posix_spawn (Rust's std::process::Command)
-+  // calls clone(CLONE_VM|CLONE_VFORK, explicit_stack, ...) with its own
-+  // trampoline stack so the child does NOT touch the parent's stack. The full
-+  // register restore below covers sp either way, but set it up for the child.
++    return eagain();
++  }
++  Put64(m2->ax, 0);  // child's view of fork()/vfork()/clone()'s return value
 +  if (stack) {
-+    Put64(m->sp, stack);
++    // musl's posix_spawn (Rust's std::process::Command) calls
++    // clone(CLONE_VM|CLONE_VFORK, explicit_stack, ...) with its own
++    // trampoline stack — the guest already gave the child a stack that
++    // doesn't overlap the parent's, nothing more to do.
++    Put64(m2->sp, stack);
++  } else {
++    // Plain fork()/vfork() (stack==0, e.g. busybox hush NOMMU) — unlike
++    // the explicit-stack case above, NewMachine's memcpy left m2->sp equal
++    // to the PARENT's sp: both machines pointing at the SAME shared stack
++    // memory. That's correct for real vfork() (the parent is SUSPENDED
++    // until the child execve()s/exits, so only one of them ever actually
++    // runs) but wrong here — the child now runs CONCURRENTLY with the
++    // parent, so both would push/pop the identical stack addresses
++    // simultaneously, corrupting each other within microseconds
++    // (confirmed via lldb: FindPageTableEntry crash-looping on garbage
++    // addresses almost immediately, traced to exactly this). Give the
++    // child its own stack region and copy the parent's currently-live
++    // stack bytes into it, relocating sp by the same offset — sp/bp-
++    // relative frame access keeps working; an absolute pointer computed
++    // pre-fork to a stack local and dereferenced post-fork without an
++    // intervening execve() is a known, accepted gap (rare for the
++    // fork-then-quickly-execve pattern this targets, and real fork()'s
++    // full COW isolation is deliberately out of scope for v1 — see
++    // SCHEDULER-DESIGN.md).
++    i64 old_sp = Get64(m->sp);
++    i64 copy_bytes = kStackSize;  // whole reserved region, not just above sp
++    i64 new_stack;
++    // ReserveVirtual(virt=0) does NOT mean "auto-place" outside the
++    // HasLinearMapping() case (confirmed via lldb: it returned literal
++    // address 0, silently colliding with low/reserved memory — the actual
++    // cause of the crash this comment replaces). SysMmap's own addr=0
++    // handling (syscall.c ~2108) shows the real pattern: resolve a free
++    // address via FindVirtual() first, THEN pass that to ReserveVirtual().
++    new_stack = FindVirtual(m->system, m->system->automap, kStackSize);
++    if (new_stack != -1) {
++      i64 newautomap = ROUNDUP(new_stack + kStackSize, FLAG_pagesize);
++      new_stack = ReserveVirtual(m->system, new_stack, kStackSize,
++                                 PAGE_FILE | PAGE_U | PAGE_RW, -1, 0, 0, 0);
++      if (new_stack != -1) {
++        m->system->automap =
++            newautomap < FLAG_automapend ? newautomap : FLAG_automapstart;
++      }
++    }
++    if (new_stack != -1) {
++      u8 *copybuf = (u8 *)malloc(copy_bytes);
++      if (copybuf) {
++        CopyFromUser(m, copybuf, kStackTop - kStackSize, copy_bytes);
++        CopyToUser(m2, new_stack, copybuf, copy_bytes);
++        free(copybuf);
++        Put64(m2->sp, new_stack + (old_sp - (kStackTop - kStackSize)));
++      }
++    }
++    if (new_stack == -1) {
++      LOGF("Fork: couldn't give child its own stack; sharing parent's "
++           "(unsafe under concurrent scheduling)");
++    }
 +  }
-+  m->em_vfork_child = true;
-+  rc = RunMachineUntilExit(m);
-+  m->em_vfork_child = saved_vfork_child;
-+
-+  // Restore the parent's full pre-vfork() register + fd state so it resumes at
-+  // its vfork() call site as if the child had run in a separate process.
-+  m->ip = saved_ip;
-+  m->flags = saved_flags;
-+  memcpy(m->beg, saved_beg, sizeof(saved_beg));
-+  memcpy(m->xmm, saved_xmm, sizeof(saved_xmm));
-+  EmRestoreMem(m, &memsnap);
-+  EmFreeMemSnap(&memsnap);
-+  EmRestoreFds(m, sv, nsv);
-+
++  m2->em_vfork_child = true;  // ends the sharing on execve — see SysExecve.
++  if (MvlSchedSpawnWithEntry(m2, EmForkChildEntry, EmDupFdsForChild(m)) != 0) {
 +#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[Fork] exit child_pid=%d rc=%d\n", child_pid, rc);
-+  {
-+    struct Fd *chk1 = GetFd(&m->system->fds, 1);
-+    struct Fd *chk2 = GetFd(&m->system->fds, 2);
-+    fprintf(g_mvldbg, "[Fork] post-restore fd1=%s(fildes=%d,oflags=%#x) fd2=%s(fildes=%d,oflags=%#x)\n",
-+            chk1 ? "OK" : "MISSING", chk1 ? chk1->fildes : -1, chk1 ? chk1->oflags : 0,
-+            chk2 ? "OK" : "MISSING", chk2 ? chk2->fildes : -1, chk2 ? chk2->oflags : 0);
-+  }
++    fprintf(g_mvldbg, "[Fork] MvlSchedSpawnWithEntry FAILED\n");
 +#endif
-+  EmStashChildStatus(child_pid, rc);
-+  THR_LOGF("pid=%d Fork (wasm, run-to-completion) -> child_pid=%d exit=%d",
-+           m->system->pid, child_pid, rc);
-+  return child_pid;  // OpSyscall writes this to m->ax for the resumed parent
++    FreeMachine(m2);
++    return eagain();
++  }
++  THR_LOGF("pid=%d Fork (wasm, scheduled) -> child_pid=%d", m->system->pid,
++           m2->tid);
++#ifdef MVL_NATIVE_DEBUG
++  fprintf(g_mvldbg, "[Fork] scheduled child_pid=%d m2=%p m2->system=%p\n",
++          m2->tid, (void *)m2, (void *)m2->system);
++#endif
++  return m2->tid;  // OpSyscall writes this to m->ax for the resumed parent
 +}
 +
 +static int SysFork(struct Machine *m) {
@@ -1197,7 +1322,7 @@ index 34cc01c..9c39d8b 100644
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -498,20 +1284,22 @@ static void *OnSpawn(void *arg) {
+@@ -498,20 +1399,22 @@ static void *OnSpawn(void *arg) {
    Blink(m);
  }
  
@@ -1224,7 +1349,7 @@ index 34cc01c..9c39d8b 100644
    THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
    if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
      LOGF("unsupported clone() signal: %" PRId64, flags & 255);
-@@ -567,6 +1355,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -567,6 +1470,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
    Put64(m2->ax, 0);
    Put64(m2->sp, stack);
    m2->spawn_sigmask = oldss;
@@ -1232,7 +1357,7 @@ index 34cc01c..9c39d8b 100644
    unassert(!pthread_attr_init(&attr));
    unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
    err = pthread_create(&thread, &attr, OnSpawn, m2);
-@@ -576,6 +1365,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -576,6 +1480,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
      return eagain();
    }
@@ -1251,7 +1376,7 @@ index 34cc01c..9c39d8b 100644
    if (flags & CLONE_PARENT_SETTID_LINUX) {
      atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
    }
-@@ -601,7 +1402,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -601,7 +1517,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      return enosys();
  #endif
    }
@@ -1260,7 +1385,7 @@ index 34cc01c..9c39d8b 100644
    return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
  #else
    LOGF("threading support disabled");
-@@ -717,13 +1518,35 @@ static int SysFutexWait(struct Machine *m,  //
+@@ -717,13 +1633,35 @@ static int SysFutexWait(struct Machine *m,  //
      if (Load32(mem) != expect) {
        rc = 0;
      } else {
@@ -1303,7 +1428,7 @@ index 34cc01c..9c39d8b 100644
        }
      }
      UNLOCK(&f->lock);
-@@ -1316,8 +2139,18 @@ static int SysDup1(struct Machine *m, i32 fildes) {
+@@ -1316,8 +2254,18 @@ static int SysDup1(struct Machine *m, i32 fildes) {
        return emfile();
      }
      LOCK(&m->system->fds.lock);
@@ -1324,7 +1449,7 @@ index 34cc01c..9c39d8b 100644
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -1345,6 +2178,9 @@ static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
+@@ -1345,6 +2293,9 @@ static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
  static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
    int rc, oflags;
    struct Fd *fd;
@@ -1334,7 +1459,7 @@ index 34cc01c..9c39d8b 100644
    if (newfildes < 0) {
      LOGF("dup2() ebadf");
      return ebadf();
-@@ -1366,8 +2202,14 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
+@@ -1366,8 +2317,14 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
        dll_remove(&m->system->fds.list, &fd->elem);
        FreeFd(fd);
      }
@@ -1351,7 +1476,7 @@ index 34cc01c..9c39d8b 100644
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -1378,6 +2220,9 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
+@@ -1378,6 +2335,9 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
    int rc;
    int oflags;
    struct Fd *fd;
@@ -1361,7 +1486,7 @@ index 34cc01c..9c39d8b 100644
    if (newfildes < 0) return ebadf();
    if (fildes == newfildes) return einval();
    if (flags & ~O_CLOEXEC_LINUX) return einval();
-@@ -1395,8 +2240,14 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
+@@ -1395,8 +2355,14 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
        dll_remove(&m->system->fds.list, &fd->elem);
        FreeFd(fd);
      }
@@ -1378,7 +1503,7 @@ index 34cc01c..9c39d8b 100644
      if (flags & O_CLOEXEC_LINUX) {
        oflags |= O_CLOEXEC;
      }
-@@ -1416,8 +2267,18 @@ static int SysDupf(struct Machine *m, i32 fildes, i32 minfildes, int cmd) {
+@@ -1416,8 +2382,18 @@ static int SysDupf(struct Machine *m, i32 fildes, i32 minfildes, int cmd) {
        return emfile();
      }
      LOCK(&m->system->fds.lock);
@@ -1399,7 +1524,7 @@ index 34cc01c..9c39d8b 100644
      if (cmd == F_DUPFD_CLOEXEC) {
        oflags |= O_CLOEXEC;
      }
-@@ -2344,6 +3205,9 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2344,6 +3320,9 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    struct Iovs iv;
    ssize_t (*readv_impl)(int, const struct iovec *, int);
    if (size > NUMERIC_MAX(size_t)) return eoverflow();
@@ -1409,7 +1534,7 @@ index 34cc01c..9c39d8b 100644
    LOCK(&m->system->fds.lock);
    if ((fd = GetFd(&m->system->fds, fildes))) {
      unassert(fd->cb);
-@@ -2559,6 +3423,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2559,6 +3538,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  }
  
  static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
@@ -1419,7 +1544,7 @@ index 34cc01c..9c39d8b 100644
    return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
  }
  
-@@ -2652,9 +3519,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+@@ -2652,9 +3634,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
    struct dirent *ent;
    struct dirent_linux rec;
    if (size < sizeof(rec) - sizeof(rec.name)) return einval();
@@ -1437,7 +1562,7 @@ index 34cc01c..9c39d8b 100644
    if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
      return -1;
    }
-@@ -3526,6 +4400,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -3526,6 +4515,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -1445,7 +1570,7 @@ index 34cc01c..9c39d8b 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +4502,132 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4617,145 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -1558,10 +1683,23 @@ index 34cc01c..9c39d8b 100644
 +    return -1;
 +  }
 +  rc = EmReapChildStatus(pid, &status);
++  // Real fork/vfork-backed background jobs (SCHEDULER-DESIGN.md, Phase 4):
++  // Fork() no longer runs children synchronously before returning — the
++  // awaited child may genuinely still be running (scheduled concurrently,
++  // not yet reaped) rather than nonexistent. Yield repeatedly via the
++  // scheduler instead of immediately failing, matching real wait4()'s
++  // blocking semantics. MvlSchedHasLiveChild distinguishes "still running"
++  // from "no such child" — without it, waiting on a bogus pid would spin
++  // forever instead of correctly failing with ECHILD below.
++  while (rc == -1 && MvlSchedHasLiveChild(pid)) {
++    MvlSchedYieldOnce();
++    rc = EmReapChildStatus(pid, &status);
++  }
 +  if (rc == -1) {
-+    // Fork() runs children synchronously before returning, so a matching
-+    // status should always be waiting unless the caller passes a pid we
-+    // never spawned, or calls wait() twice for the same child.
++    // Either genuinely no such child was ever forked/spawned, or (pre-
++    // Phase-4 wording, still true when nothing's ever been scheduled)
++    // the caller passed a pid we never spawned, or called wait() twice
++    // for the same child.
 +    return echild();
 +  }
 +  if (opt_out_wstatus_addr) {
@@ -1578,7 +1716,26 @@ index 34cc01c..9c39d8b 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
-@@ -5620,6 +6621,20 @@ void OpSyscall(P) {
+@@ -3922,6 +5051,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+   for (;;) {
+     if (CompareTime(now, deadline) >= 0) return 0;
+     ts = SubtractTime(deadline, now);
++#ifdef __EMSCRIPTEN__
++    if (g_mvl_sched_active) {
++      // Real fork/vfork-backed background jobs (SCHEDULER-DESIGN.md, Phase
++      // 4): a real blocking nanosleep() here would block the ONE real OS
++      // thread every fiber shares for up to the full requested duration —
++      // the exact SysFutexWait hazard already fixed for futex waits.
++      // Yield cooperatively instead and recheck the deadline; this only
++      // suspends THIS fiber, not the whole scheduler, letting the parent's
++      // wait4() (and any other ready fiber) make progress meanwhile.
++      MvlSchedYieldOnce();
++    } else
++#endif
+     if (nanosleep(&ts, 0)) {
+       unassert(errno == EINTR);
+       // this may run a guest signal handler before returning
+@@ -5620,6 +6761,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -1599,7 +1756,7 @@ index 34cc01c..9c39d8b 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +6735,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6875,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);

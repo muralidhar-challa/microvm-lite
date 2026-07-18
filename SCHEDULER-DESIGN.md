@@ -350,18 +350,149 @@ stdout at all before this.
   function) still goes through the ordinary `SysExitGroup` path, untested
   against the scheduler.
 
-**Phase 4 — fork/vfork-backed background jobs (`{done:false, pid}`
-contract), still no JS timeout wiring.** Same `NewMachine(m->system, parent)`
-shared-memory spawn as Phase 3, but: (a) fd table is independently copied at
-spawn time (reusing `EmSaveFds`'s dup-and-swap mechanics, kept rather than
-restored for the job's lifetime — matching real `fork()`'s
-independent-but-initially-identical fd table), and (b) `SysWait4`
-(`syscall.c` ~4550) yields in a loop via the scheduler until the awaited
-child is `DONE`, instead of `echild()`ing immediately. `Fork()`'s existing
-snapshot/restore fast path stays untouched for everything else. Gate:
-`sh -c 'sleep 1 & wait'` returns the correct exit code; full regression of
-sequential (`A; B; C`) and pipeline commands through `contract.spec.mjs` +
-`stress.spec.mjs` — the fast path must show zero behavior change.
+**Phase 4 — fork/vfork-backed background jobs. PARTIALLY DONE — literal
+gate passes, zero regression, but a real architectural limitation remains
+and is NOT safe for production background-job use yet. Read the whole
+section before building on this.**
+
+**What changed.** `Fork()`'s `__EMSCRIPTEN__` implementation was rewritten
+to route through the scheduler instead of running synchronously to
+completion: `m2 = NewMachine(m->system, m)` (same as Phase 3's `SysSpawn`
+— shared memory), then `MvlSchedSpawnWithEntry(m2, EmForkChildEntry,
+fds_list)` instead of the old `RunMachineUntilExit(m)` reusing the SAME
+Machine for both parent and child. This is a bigger, riskier change than
+Phases 0-3: it's the first phase to modify an EXISTING, heavily-used
+function (`Fork()`) rather than only add new files, and it replaces the
+`EmSaveMem`/`EmRestoreMem`/`EmSaveFds`/`EmRestoreFds`/`RunMachineUntilExit`
+synchronous fast path for every fork/vfork call, not just backgrounded
+ones — a deliberate unification (dash's own choice of whether to `wait()`
+immediately, which it always does correctly, is what makes sequential
+`cmd1; cmd2` behave identically to before while `cmd &` now genuinely
+backgrounds).
+
+**Four real bugs found and fixed** (each confirmed via native `lldb`, not
+guessed):
+
+1. **Shared-stack corruption.** A plain `fork()`/`vfork()` (no explicit
+   `clone()` stack argument — the common case) left `m2->sp` equal to the
+   parent's `sp`, via `NewMachine`'s memcpy. Correct for real `vfork()`
+   (the parent is *suspended* until the child execve()s/exits — only one
+   of them ever runs), wrong here: the child now runs *concurrently*, so
+   both push/pop the identical stack addresses simultaneously. Confirmed
+   via `lldb`: `FindPageTableEntry` crash-looping on garbage addresses
+   within microseconds of the fork. Fixed by giving the child its own
+   stack region (`ReserveVirtual`) and copying the parent's live stack
+   bytes into it, relocating `sp` by the same offset.
+2. **`ReserveVirtual(virt=0)` misuse.** Passing `virt=0` does NOT mean
+   "auto-place" outside `HasLinearMapping()`'s branch — confirmed via
+   `lldb` it returns the literal address 0, silently colliding with
+   low/reserved memory. `SysMmap`'s own `addr=0` handling (`syscall.c`
+   ~2108) shows the real pattern: resolve a free address via
+   `FindVirtual()` first, then pass that to `ReserveVirtual()`.
+3. **Argument-unwrapping bug.** `mvl_dispatch.c`'s spawn machinery always
+   passes the internal `struct MvlThread` wrapper as the fiber's `void*`
+   arg, never the `Machine*` directly — `MvlThreadEntry` (Phase 3) already
+   knew this. The new caller-supplied entry (`EmForkChildEntry`) cast
+   `arg` straight to `struct Machine*`, which was actually the wrapper;
+   since the wrapper's `m` field and `Machine`'s `ip` field both sit at
+   offset 0, the misread silently produced a plausible-looking pointer
+   (the wrapper's own address, read as if it were `m->ip`) instead of
+   crashing immediately — which is exactly why it took real `fprintf`
+   tracing, not just `lldb` stepping, to spot. Fixed by making
+   `MvlSchedSpawnWithEntry`'s contract genuinely pass `Machine*` to the
+   caller's entry (an internal trampoline in `mvl_dispatch.c` does the
+   real unwrap), and documented the exact failure mode so it doesn't
+   recur.
+4. **Blocking `nanosleep()`.** Same class of bug as the Phase 3 futex fix,
+   different syscall: `SysNanosleep` calls real blocking `nanosleep()` for
+   up to the full requested duration — fine when every guest thread is a
+   real OS pthread, fatal when every fiber shares the one real OS thread a
+   blocking call stalls entirely. Fixed with the same cooperative
+   yield-and-recheck pattern, gated on `g_mvl_sched_active` so the
+   untouched path is byte-identical when nothing's ever been scheduled.
+
+**What's verified working**, both natively (`lldb`) and through the real
+production contract in a live browser (`window.vm.execute` against the
+actual `dist/blink.js`):
+- The literal stated gate — `sh -c 'sleep 1 & wait'` — returns the correct
+  exit code, confirmed with correct ~1s timing (not synchronously blocked).
+- Sequential multi-fork commands (`cmd1; cmd2`) run correctly and produce
+  correct output, matching pre-Phase-4 behavior exactly.
+- `contract.spec.mjs` (17/17), `dist-smoke.spec.mjs`,
+  `fiber-selftest.spec.mjs`, `phase2-selftest.spec.mjs`, and
+  `phase3-pthread-selftest.spec.mjs` all pass unchanged — **zero
+  regression** on every earlier phase's gate and the original synchronous
+  fast path.
+
+**What's NOT safe yet: real memory isolation for concurrently-scheduled
+fork children.** Confirmed with a controlled, repeatable experiment:
+`toybox echo A & wait; echo EXIT:$?` on ONE line (dash reads the whole
+line before executing any of it, so the child never runs concurrently
+with a parent that's also doing memory-touching work) works correctly.
+The exact same command split across TWO lines — forcing dash to read a
+*second* script line from the script file while the backgrounded child
+is still alive and scheduled — reliably crashes (`SIGSEGV`, the top-level
+machine executing at a garbage `pc`). This is NOT one of the four bugs
+above; it reproduces identically before and after fixing all four,
+including after building genuine per-fiber fd table independence (a real
+fix for a real, separate bug — see below) specifically to rule out fd
+sharing as the cause.
+
+The root cause is the scheduler's shared-memory design itself, chosen
+deliberately back in Phase 0-3 and explicitly written into this doc's
+"Explicitly out of scope for v1" section: fork-style children share
+memory with **zero copy-on-write divergence**. That was a reasonable bet
+when the accepted risk was "a backgrounded child's pre-execve writes
+might leak to the parent" (rare, narrow window, usually resolved by a
+near-immediate `execve()`). It's a much bigger problem now that it's
+concretely observed as "the *parent's own* unrelated work (reading its
+next script line into its own buffers) gets corrupted by a totally
+unrelated concurrently-scheduled child touching the same unisolated
+address space" — not a narrow edge case, but the ordinary shape of any
+multi-line script that backgrounds something. Fixing this for real means
+bringing back some form of memory isolation for fork children that's
+compatible with genuine interleaving (both sides actively running, not
+one suspended while the other mutates) — a materially harder problem than
+`EmSaveMem`/`EmRestoreMem`'s snapshot/restore, which only works because
+the old model was synchronous (never two sides truly concurrent). Scoping
+that fix is real design work for a future session, not a bug to patch
+blind.
+
+**A related, likely-connected symptom**, found while validating the gate
+through the real VM contract: `window.vm.execute("sh -c 'sleep 1 & wait; echo EXIT:$?'")`
+completes with the correct ~1s timing but returns **empty output** — the
+inner shell's own stdout write appears not to reach the worker's capture
+mechanism in this specific nested-shell-plus-backgrounding shape. Not
+separately root-caused; worth investigating together with the memory-
+isolation gap above, since both are manifestations of "concurrent
+scheduling exposes gaps in resources this scheduler currently shares
+uncritically" (memory for the crash; very possibly fd-table capture
+plumbing interacting with the new independent-fds mechanism for this one).
+
+**Also newly built** (a real, separately-useful fix, verified via the
+one-line-vs-two-line experiment above to NOT be the memory-isolation
+root cause, but load-bearing on its own): per-fiber fd table
+independence. `struct Fds` lives on `struct System`, bundled with the
+page tables that make shared memory work — there's no way to share
+memory with a fork child but keep fds independent without either
+splitting that struct (a much bigger change) or transparently swapping
+`fds.list` in and out on every scheduler context switch, which is what
+was built: `MvlSchedSpawnWithEntry` now takes a `fds_list` parameter (a
+duplicate of the parent's fds at fork time, built by a new
+`EmDupFdsForChild` helper mirroring `EmSaveFds`'s dup technique but
+building a genuinely separate list instead of a save-for-later-restore
+array), and `mvl_dispatch.c`'s swap path installs the right list — a
+fork child's own, or the canonical shared one for the main/thread-style
+fibers — on every swap, symmetric with the existing `g_machine`
+save/restore. This is real, needed groundwork regardless of the memory
+gap; it's just not sufficient by itself.
+
+**Recommendation:** do not enable Fork()'s new concurrent path for
+anything beyond the verified-safe shapes above (single background job
+immediately followed by `wait` on the same logical statement, or
+sequential non-backgrounded commands) until the memory-isolation gap is
+addressed. Phase 5 (JS contract wiring for `{done:false, pid}`) should
+wait for that work, not build on top of a known-corruptible foundation.
 
 **Phase 5 — wire the JS contract.** `doExecute` (`vm-worker.js`) is wired to
 a scheduler tick loop (`em_sched_run(budget_ms)` called repeatedly from a JS
