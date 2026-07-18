@@ -69,7 +69,7 @@ emcc \
   -O2 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s EXPORTED_RUNTIME_METHODS='["callMain","ccall","FS","TTY","ENV","HEAPU32","stringToNewUTF8","UTF8ToString"]' \
-  -s EXPORTED_FUNCTIONS='["_main","_malloc","_free","_em_reset_getopt","_em_reset_children","_em_main","_em_last_exit"]' \
+  -s EXPORTED_FUNCTIONS='["_main","_malloc","_free","_em_reset_getopt","_em_reset_children","_em_main","_em_last_exit","_em_fiber_selftest","_em_fiber_selftest_log"]' \
   -s INVOKE_RUN=0 -s EXIT_RUNTIME=0 -s FORCE_FILESYSTEM=1 \
   -s ASYNCIFY -s ASYNCIFY_IMPORTS='["emscripten_sleep","__asyncjs__em_http_fetch"]' \
   -s STACK_SIZE=33554432 \

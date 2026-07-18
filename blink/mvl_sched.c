@@ -5,27 +5,52 @@
 
 #if defined(MVL_NATIVE_DEBUG)
 
-void SchedMakeContext(SchedCtx *ctx, void (*entry)(void), char *stack,
-                      size_t stacksize, SchedCtx *link) {
+// makecontext's varargs are int-sized; passing a pointer through them isn't
+// portable (breaks on LP64 where sizeof(void*) > sizeof(int)). Instead, each
+// SchedCtx carries its OWN entry/arg (set at SchedMakeContext time, so
+// creating context B can't clobber context A's pending entry/arg the way a
+// single shared "pending" global would). SchedSwap records which ctx it's
+// swapping into; SchedTrampoline — only ever invoked by ucontext on that
+// context's first activation, never on a resume — reads it from there.
+static SchedCtx *g_sched_launching;
+
+static void SchedTrampoline(void) {
+  SchedCtx *ctx = g_sched_launching;
+  ctx->entry(ctx->arg);
+}
+
+void SchedInitCurrentContext(SchedCtx *ctx) {
+  getcontext(&ctx->uc);  // Harmless here; swapcontext populates `from` too.
+}
+
+void SchedMakeContext(SchedCtx *ctx, void (*entry)(void *arg), char *stack,
+                      size_t stacksize, SchedCtx *link, void *arg) {
   getcontext(&ctx->uc);
   ctx->uc.uc_stack.ss_sp = stack;
   ctx->uc.uc_stack.ss_size = stacksize;
   ctx->uc.uc_link = link ? &link->uc : 0;
-  makecontext(&ctx->uc, entry, 0);
+  ctx->entry = entry;
+  ctx->arg = arg;
+  makecontext(&ctx->uc, SchedTrampoline, 0);
 }
 
 void SchedSwap(SchedCtx *from, SchedCtx *to) {
+  g_sched_launching = to;
   swapcontext(&from->uc, &to->uc);
 }
 
 #elif defined(__EMSCRIPTEN__)
 
-void SchedMakeContext(SchedCtx *ctx, void (*entry)(void), char *stack,
-                      size_t stacksize, SchedCtx *link) {
+void SchedInitCurrentContext(SchedCtx *ctx) {
+  emscripten_fiber_init_from_current_context(&ctx->fiber, ctx->asyncify_stack,
+                                             sizeof(ctx->asyncify_stack));
+}
+
+void SchedMakeContext(SchedCtx *ctx, void (*entry)(void *arg), char *stack,
+                      size_t stacksize, SchedCtx *link, void *arg) {
   (void)link;  // Fibers have no uc_link equivalent; entry must not return.
-  emscripten_fiber_init(&ctx->fiber, (em_arg_callback_func)entry, 0, stack,
-                        stacksize, ctx->asyncify_stack,
-                        sizeof(ctx->asyncify_stack));
+  emscripten_fiber_init(&ctx->fiber, entry, arg, stack, stacksize,
+                        ctx->asyncify_stack, sizeof(ctx->asyncify_stack));
 }
 
 void SchedSwap(SchedCtx *from, SchedCtx *to) {
@@ -49,7 +74,10 @@ static SchedCtx g_st_main, g_st_a, g_st_b;
 static char g_st_stack_a[SCHED_SELFTEST_STACK];
 static char g_st_stack_b[SCHED_SELFTEST_STACK];
 static int g_st_counter;  // SHARED, not per-context — the whole point.
-static char g_st_log[SCHED_SELFTEST_SWAPS];
+// +1: never written by the swap loop (it stops at SCHED_SELFTEST_SWAPS
+// bytes), stays 0 from the memset() below — a free NUL terminator so JS can
+// read this straight as a C string (see em_fiber_selftest_log, Phase 1).
+static char g_st_log[SCHED_SELFTEST_SWAPS + 1];
 static int g_st_logn;
 
 static void SchedSelftestBody(char who) {
@@ -66,8 +94,8 @@ static void SchedSelftestBody(char who) {
   }
 }
 
-static void SchedSelftestA(void) { SchedSelftestBody('A'); }
-static void SchedSelftestB(void) { SchedSelftestBody('B'); }
+static void SchedSelftestA(void *arg) { (void)arg; SchedSelftestBody('A'); }
+static void SchedSelftestB(void *arg) { (void)arg; SchedSelftestBody('B'); }
 
 int SchedSelftest(void) {
   int i, fail = 0;
@@ -75,10 +103,11 @@ int SchedSelftest(void) {
   g_st_logn = 0;
   memset(g_st_log, 0, sizeof(g_st_log));
 
+  SchedInitCurrentContext(&g_st_main);
   SchedMakeContext(&g_st_a, SchedSelftestA, g_st_stack_a, sizeof(g_st_stack_a),
-                   &g_st_main);
+                   &g_st_main, 0);
   SchedMakeContext(&g_st_b, SchedSelftestB, g_st_stack_b, sizeof(g_st_stack_b),
-                   &g_st_main);
+                   &g_st_main, 0);
 
   SchedSwap(&g_st_main, &g_st_a);
 
@@ -105,4 +134,20 @@ int SchedSelftest(void) {
             g_st_logn, g_st_counter);
   }
   return fail;
+}
+
+// Phase 1 (SCHEDULER-DESIGN.md): exported to JS so a playwright test can run
+// this SAME ping-pong through whichever backend this build was compiled
+// with. In the real wasm build (MVL_NATIVE_DEBUG undefined) that's the
+// __EMSCRIPTEN__ branch above — this IS the validation that
+// emscripten_fiber_init/emscripten_fiber_swap actually work under this
+// project's exact emcc flags and worker environment, the open question
+// Phase 1 exists to answer. Listed directly in build.sh's
+// EXPORTED_FUNCTIONS (same convention as stubs.c's em_main/em_last_exit).
+int em_fiber_selftest(void) {
+  return SchedSelftest();
+}
+
+const char *em_fiber_selftest_log(void) {
+  return g_st_log;
 }
