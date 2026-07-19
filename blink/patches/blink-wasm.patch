@@ -52,10 +52,10 @@ index 3571b61..06da822 100644
    GetStartDir();
  #ifndef NDEBUG
 diff --git a/blink/close.c b/blink/close.c
-index daf01d6..2bea083 100644
+index daf01d6..a99c1b5 100644
 --- a/blink/close.c
 +++ b/blink/close.c
-@@ -36,6 +36,11 @@
+@@ -36,10 +36,21 @@
  static int CloseFd(struct Fd *fd) {
    int rc;
    unassert(fd->cb);
@@ -63,11 +63,22 @@ index daf01d6..2bea083 100644
 +  // Covers close(), close_range(), and O_CLOEXEC exec teardown — every path
 +  // that retires a guest fd for good must drop its virtual-socket entry.
 +  EmSockOnClose(fd->fildes);
++  // Same coverage, for the file-backed pipe write-end refcount (fds.h's
++  // MvlPipeRef) — this is the ONLY place a pipe write-end fd ever goes away
++  // for good, so it's the right (and only) place to decrement.
++  if (fd->pipe_ref && fd->pipe_is_write) {
++    fd->pipe_ref->refcount--;
++  }
 +#endif
    if (fd->dirstream) {
      rc = VfsClosedir(fd->dirstream);
    } else {
-@@ -63,6 +68,10 @@ static int FinishClose(struct Machine *m, int rc) {
+-    rc = fd->cb->close(fd->fildes);
++    rc = fd->cb->close(fd->realfd);
+   }
+   FreeFd(fd);
+   return rc;
+@@ -63,6 +74,10 @@ static int FinishClose(struct Machine *m, int rc) {
  
  int SysClose(struct Machine *m, i32 fildes) {
    struct Fd *fd;
@@ -155,6 +166,125 @@ index 42d0955..91b588e 100644
  long enfile(void);
  long enoent(void);
  long enomem(void);
+diff --git a/blink/fds.c b/blink/fds.c
+index dbb19df..9abcc18 100644
+--- a/blink/fds.c
++++ b/blink/fds.c
+@@ -48,6 +48,7 @@ struct Fd *AddFd(struct Fds *fds, int fildes, int oflags) {
+       dll_init(&fd->elem);
+       fd->cb = &kFdCbHost;
+       fd->fildes = fildes;
++      fd->realfd = fildes;  // identity by default — see fds.h's realfd comment
+       fd->oflags = oflags;
+       unassert(!pthread_mutex_init(&fd->lock, 0));
+       dll_make_first(&fds->list, &fd->elem);
+@@ -67,11 +68,28 @@ struct Fd *ForkFd(struct Fds *fds, struct Fd *fd, int fildes, int oflags) {
+       fd2->socktype = fd->socktype;
+       fd2->norestart = fd->norestart;
+       memcpy(&fd2->saddr, &fd->saddr, sizeof(fd->saddr));
++      // Every duplicate of a pipe's write end (fork's fd-table copy, or a
++      // real dup()/dup2()/dup3()/fcntl(F_DUPFD) — ForkFd is the one path all
++      // of those funnel through) is another live reference the reader must
++      // wait out before concluding real EOF. See fds.h's MvlPipeRef comment.
++      if ((fd2->pipe_ref = fd->pipe_ref)) {
++        fd2->pipe_is_write = fd->pipe_is_write;
++        if (fd2->pipe_is_write) fd2->pipe_ref->refcount++;
++      }
+     }
+   }
+   return fd2;
+ }
+ 
++// See fds.h's realfd comment. Falls back to `fildes` itself (identity) when
++// unregistered — matches the existing convention elsewhere in this file
++// (SysDup1 etc.) of treating an untracked fd as a genuinely raw host number.
++int GetRealFd(struct Fds *fds, int fildes) {
++  struct Fd *fd;
++  if ((fd = GetFd(fds, fildes))) return fd->realfd;
++  return fildes;
++}
++
+ struct Fd *GetFd(struct Fds *fds, int fildes) {
+   bool lru;
+   struct Dll *e;
+diff --git a/blink/fds.h b/blink/fds.h
+index 6fbaabf..940606e 100644
+--- a/blink/fds.h
++++ b/blink/fds.h
+@@ -17,6 +17,26 @@
+ 
+ struct winsize;
+ 
++// File-backed pipe emulation (SysPipe2, __EMSCRIPTEN__): a plain temp file
++// stands in for a real pipe (WASM has no host fork/real blocking pipes — see
++// pipe.c's own comment for why). A regular file's read() returns 0 the
++// instant the read offset reaches the current end of content, regardless of
++// whether a writer might still append more later — unlike a real pipe, which
++// blocks until either more data arrives or every write end is closed. That
++// distinction stopped being free once every fork (Phase 4) — including the
++// implicit ones dash creates for each pipeline stage — went through the
++// scheduler instead of running to completion before returning: nothing
++// guarantees the writer stage runs (or finishes) before the reader stage
++// gets its first turn now, so the reader can see "0 bytes so far" and wrongly
++// conclude real EOF. This refcount is the fix: track how many write-end Fds
++// (across every independent fork-child fd table a dup can land in) are still
++// open for a given pipe, so the read side can tell "genuinely done" from
++// "nothing written yet, try again" (see SysRead) — the same distinction a
++// real kernel pipe makes internally.
++struct MvlPipeRef {
++  int refcount;  // live write-end Fd references; 0 = true EOF for the reader
++};
++
+ struct FdCb {
+   int (*close)(int);
+   ssize_t (*readv)(int, const struct iovec *, int);
+@@ -29,7 +49,28 @@ struct FdCb {
+ };
+ 
+ struct Fd {
+-  int fildes;      // file descriptor
++  int fildes;      // GUEST-visible fd number (what GetFd/syscalls address it by)
++  int realfd;      // the REAL host descriptor to actually do I/O on — usually
++                    // == fildes (true for every fd opened/duped in the single-
++                    // Machine synchronous path, where guest and host numbering
++                    // always coincided). Diverges only for a scheduled fork
++                    // child's independently-copied fd table (EmDupFdsForChild,
++                    // syscall.c): real POSIX fork() preserves fd NUMBERS in the
++                    // child (same integer, fresh open-file reference), but this
++                    // process has exactly one real host fd namespace shared by
++                    // every concurrently-scheduled fiber — two live copies of
++                    // "fd 5" can't both really BE host fd 5 at once. So the
++                    // child's copy keeps fildes==5 (what the guest, having been
++                    // memcpy'd mid-flight from the parent, still calls it) while
++                    // realfd gets a fresh, private, never-colliding host number
++                    // (see kMinBlinkFd) for the actual duplicated resource.
++                    // SysRead/SysWrite/CloseFd/SysDup1/SysDup2/SysDup3/SysDupf
++                    // are the only host-I/O call sites in the fork/pipe/pipeline
++                    // path and all resolve through this field (GetRealFd) —
++                    // other syscalls (fcntl subcommands, lseek, sockets, ioctl)
++                    // still address host fds by the raw guest number, an
++                    // accepted gap since forked children don't exercise them
++                    // for shell pipelines.
+   int oflags;      // host O_XXX constants
+   int socktype;    // host SOCK_XXX constants
+   bool norestart;  // is SO_RCVTIMEO in play?
+@@ -38,6 +79,8 @@ struct Fd {
+   pthread_mutex_t_ lock;
+   const struct FdCb *cb;
+   char *path;
++  struct MvlPipeRef *pipe_ref;  // NULL unless one end of a file-backed pipe
++  bool pipe_is_write;           // meaningful only when pipe_ref != NULL
+   union {
+     struct sockaddr sa;
+     struct sockaddr_in sin;
+@@ -56,6 +99,7 @@ void InitFds(struct Fds *);
+ struct Fd *AddFd(struct Fds *, int, int);
+ struct Fd *ForkFd(struct Fds *, struct Fd *, int, int);
+ struct Fd *GetFd(struct Fds *, int);
++int GetRealFd(struct Fds *, int);
+ void LockFd(struct Fd *);
+ void UnlockFd(struct Fd *);
+ int CountFds(struct Fds *);
 diff --git a/blink/machine.c b/blink/machine.c
 index ad309eb..fc53cca 100644
 --- a/blink/machine.c
@@ -297,18 +427,19 @@ index f717c07..e92247a 100644
      if (fildes >= lim) {
        close(fildes);
 diff --git a/blink/pipe.c b/blink/pipe.c
-index 011e442..a1c64b0 100644
+index 011e442..11d21ff 100644
 --- a/blink/pipe.c
 +++ b/blink/pipe.c
-@@ -18,6 +18,7 @@
+@@ -18,6 +18,8 @@
  ╚─────────────────────────────────────────────────────────────────────────────*/
  #include <errno.h>
  #include <fcntl.h>
++#include <stdio.h>
 +#include <stdlib.h>
  #include <sys/mman.h>
  #include <sys/stat.h>
  #include <sys/types.h>
-@@ -51,6 +52,47 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
+@@ -51,6 +53,63 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
      return efault();
    }
    if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
@@ -343,10 +474,26 @@ index 011e442..a1c64b0 100644
 +      close(wfd);
 +      return emfile();
 +    }
-+    LOCK(&m->system->fds.lock);
-+    unassert(AddFd(&m->system->fds, rfd, O_RDONLY | oflags));
-+    unassert(AddFd(&m->system->fds, wfd, O_WRONLY | oflags));
-+    UNLOCK(&m->system->fds.lock);
++    {
++      struct Fd *rfdo, *wfdo;
++      struct MvlPipeRef *ref = 0;
++      LOCK(&m->system->fds.lock);
++      unassert(rfdo = AddFd(&m->system->fds, rfd, O_RDONLY | oflags));
++      unassert(wfdo = AddFd(&m->system->fds, wfd, O_WRONLY | oflags));
++      // See fds.h's MvlPipeRef comment: lets SysRead tell "writer hasn't run
++      // yet" from "writer is genuinely done" now that pipeline-stage forks
++      // are no longer guaranteed to run to completion before the next one
++      // starts. refcount starts at 1 for the write end just created here;
++      // ForkFd/CloseFd keep it in sync as this fd gets duplicated/closed.
++      if ((ref = (struct MvlPipeRef *)calloc(1, sizeof(*ref)))) {
++        ref->refcount = 1;
++        rfdo->pipe_ref = ref;
++        rfdo->pipe_is_write = false;
++        wfdo->pipe_ref = ref;
++        wfdo->pipe_is_write = true;
++      }
++      UNLOCK(&m->system->fds.lock);
++    }
 +    Write32(fds_linux[0], rfd);
 +    Write32(fds_linux[1], wfd);
 +    unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));
@@ -369,7 +516,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..67d9fdd 100644
+index 34cc01c..5f726ad 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -459,7 +606,7 @@ index 34cc01c..67d9fdd 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +528,862 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +528,870 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -847,15 +994,23 @@ index 34cc01c..67d9fdd 100644
 +  for (e = dll_first(m->system->fds.list); e;
 +       e = dll_next(m->system->fds.list, e)) {
 +    struct Fd *fd = FD_CONTAINER(e);
++    struct Fd *fd2;
 +    int dupfildes;
 +    if (fd->fildes < 0 || fd->fildes >= kMinBlinkFd) continue;  // skip vm fds
-+    if ((dupfildes = VfsFcntl(fd->fildes, F_DUPFD_CLOEXEC, kMinBlinkFd)) == -1) {
++    if ((dupfildes = VfsFcntl(fd->realfd, F_DUPFD_CLOEXEC, kMinBlinkFd)) == -1) {
 +      LOGF("EmDupFdsForChild: could not dup fd %d (errno %d)", fd->fildes, errno);
 +      continue;  // best effort, matching EmSaveFds
 +    }
-+    if (!ForkFd(&tmp, fd, dupfildes, fd->oflags)) {
++    // Guest-visible number MUST stay fd->fildes (real fork() preserves fd
++    // numbers in the child; the guest's own C state was memcpy'd mid-flight
++    // from the parent and still refers to it by that number) even though the
++    // actual duplicated resource lives at a different real host descriptor —
++    // see fds.h's realfd comment for why.
++    if (!(fd2 = ForkFd(&tmp, fd, fd->fildes, fd->oflags))) {
 +      LOGF("EmDupFdsForChild: ForkFd failed for fd %d", fd->fildes);
 +      VfsClose(dupfildes);
++    } else {
++      fd2->realfd = dupfildes;
 +    }
 +  }
 +  UNLOCK(&m->system->fds.lock);
@@ -1322,7 +1477,7 @@ index 34cc01c..67d9fdd 100644
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -498,20 +1399,22 @@ static void *OnSpawn(void *arg) {
+@@ -498,20 +1407,22 @@ static void *OnSpawn(void *arg) {
    Blink(m);
  }
  
@@ -1349,7 +1504,7 @@ index 34cc01c..67d9fdd 100644
    THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
    if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
      LOGF("unsupported clone() signal: %" PRId64, flags & 255);
-@@ -567,6 +1470,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -567,6 +1478,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
    Put64(m2->ax, 0);
    Put64(m2->sp, stack);
    m2->spawn_sigmask = oldss;
@@ -1357,7 +1512,7 @@ index 34cc01c..67d9fdd 100644
    unassert(!pthread_attr_init(&attr));
    unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
    err = pthread_create(&thread, &attr, OnSpawn, m2);
-@@ -576,6 +1480,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -576,6 +1488,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
      return eagain();
    }
@@ -1376,7 +1531,7 @@ index 34cc01c..67d9fdd 100644
    if (flags & CLONE_PARENT_SETTID_LINUX) {
      atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
    }
-@@ -601,7 +1517,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -601,7 +1525,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      return enosys();
  #endif
    }
@@ -1385,7 +1540,7 @@ index 34cc01c..67d9fdd 100644
    return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
  #else
    LOGF("threading support disabled");
-@@ -717,13 +1633,35 @@ static int SysFutexWait(struct Machine *m,  //
+@@ -717,13 +1641,35 @@ static int SysFutexWait(struct Machine *m,  //
      if (Load32(mem) != expect) {
        rc = 0;
      } else {
@@ -1428,7 +1583,22 @@ index 34cc01c..67d9fdd 100644
        }
      }
      UNLOCK(&f->lock);
-@@ -1316,8 +2254,18 @@ static int SysDup1(struct Machine *m, i32 fildes) {
+@@ -1306,45 +2252,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
+ static int SysDup1(struct Machine *m, i32 fildes) {
+   int lim;
+   int oflags;
+-  int newfildes;
++  int newfildes, realfd;
+   struct Fd *fd;
+   if (fildes < 0) return ebadf();
+   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+-  if ((newfildes = VfsDup(fildes)) != -1) {
++  LOCK(&m->system->fds.lock);
++  realfd = GetRealFd(&m->system->fds, fildes);
++  UNLOCK(&m->system->fds.lock);
++  if ((newfildes = VfsDup(realfd)) != -1) {
+     if (newfildes >= lim) {
+       VfsClose(newfildes);
        return emfile();
      }
      LOCK(&m->system->fds.lock);
@@ -1441,82 +1611,190 @@ index 34cc01c..67d9fdd 100644
 +    // know is "untracked". Fall back to querying the REAL flags rather than
 +    // asserting the guest did something wrong.
 +    if (!(fd = GetFd(&m->system->fds, fildes))) {
-+      int qflags = VfsFcntl(fildes, F_GETFL, 0);
++      int qflags = VfsFcntl(realfd, F_GETFL, 0);
 +      oflags = qflags >= 0 ? qflags : 0;
 +    } else {
 +      oflags = fd->oflags & ~O_CLOEXEC;
 +    }
++    // dup() has no target-number constraint, so the fresh host descriptor
++    // VfsDup() just allocated can serve as both the guest-visible AND real
++    // host number — AddFd's default (fds.h's realfd comment) is already
++    // correct here. Divergence is only needed for dup2/dup3/fcntl(F_DUPFD*)
++    // below, which ARE given a specific target guest number that may not be
++    // safe to reuse as a real host descriptor (some other concurrently-
++    // scheduled fiber's independent fd table may have its own, unrelated
++    // resource sitting at that exact real host number right now).
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -1345,6 +2293,9 @@ static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
+   return newfildes;
+ }
+ 
+-static int Dup2(struct Machine *m, int fildes, int newfildes) {
+-  int rc;
+-  // POSIX.1-2007 lists dup2() as raising EINTR which seems impossible
+-  // so it'd be wonderful to learn what kernel(s) actually return this
+-  // noting Linux reproduces that in both its dup(2) and dup(3) manual
+-  RESTARTABLE(rc = VfsDup2(fildes, newfildes));
+-  return rc;
+-}
+-
+-#ifdef HAVE_DUP3
+-static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
+-  int rc;
+-  // The Linux Programmer's Manual also lists this as interruptible.
+-  RESTARTABLE(rc = VfsDup3(fildes, newfildes, flags));
+-  return rc;
++// See fds.h's realfd comment. dup2()/dup3()/fcntl(F_DUPFD*) with an explicit
++// target guest number must never do a REAL host dup onto that literal
++// number — this process has exactly one real host fd namespace shared by
++// every concurrently-scheduled fiber, and some sibling fiber's independent
++// fd table may have its OWN, unrelated resource sitting at that exact real
++// descriptor right now. Always allocate a fresh, private, never-colliding
++// real descriptor instead (same F_DUPFD_CLOEXEC trick as EmDupFdsForChild/
++// EmSaveFds) and let the caller record it as the new entry's realfd, while
++// the guest-visible fd keeps exactly the number the guest asked for.
++static int DupToRealfd(struct Fds *fds, int fildes) {
++  return VfsFcntl(GetRealFd(fds, fildes), F_DUPFD_CLOEXEC, kMinBlinkFd);
+ }
+-#endif
+ 
  static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
-   int rc, oflags;
-   struct Fd *fd;
-+#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[SysDup2] fildes=%d newfildes=%d\n", fildes, newfildes);
-+#endif
+-  int rc, oflags;
+-  struct Fd *fd;
++  int rc, oflags, newrealfd;
++  struct Fd *fd, *fd2;
    if (newfildes < 0) {
      LOGF("dup2() ebadf");
      return ebadf();
-@@ -1366,8 +2317,14 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
-       dll_remove(&m->system->fds.list, &fd->elem);
-       FreeFd(fd);
-     }
+@@ -1352,75 +2314,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
+   if (fildes == newfildes) {
+     // no-op system call, but still must validate
+     LOCK(&m->system->fds.lock);
+-    if (GetFd(&m->system->fds, fildes)) {
+-      rc = fildes;
+-    } else {
+-      rc = -1;
+-    }
++    rc = GetFd(&m->system->fds, fildes) ? fildes : -1;
+     UNLOCK(&m->system->fds.lock);
+-  } else if (newfildes >= GetFileDescriptorLimit(m->system)) {
+-    return ebadf();
+-  } else if ((rc = Dup2(m, fildes, newfildes)) != -1) {
+-    LOCK(&m->system->fds.lock);
+-    if ((fd = GetFd(&m->system->fds, newfildes))) {
+-      dll_remove(&m->system->fds.list, &fd->elem);
+-      FreeFd(fd);
+-    }
 -    unassert(fd = GetFd(&m->system->fds, fildes));
 -    oflags = fd->oflags & ~O_CLOEXEC;
-+    // See SysDup1's comment: fildes may be a real, valid host fd (0/1/2 under
-+    // __EMSCRIPTEN__) that was never registered in blink's own Fd table.
-+    if (!(fd = GetFd(&m->system->fds, fildes))) {
-+      int qflags = VfsFcntl(fildes, F_GETFL, 0);
-+      oflags = qflags >= 0 ? qflags : 0;
-+    } else {
-+      oflags = fd->oflags & ~O_CLOEXEC;
-+    }
-     unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
+-    unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
++    return rc;
++  }
++  if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
++  LOCK(&m->system->fds.lock);
++  if ((newrealfd = DupToRealfd(&m->system->fds, fildes)) == -1) {
      UNLOCK(&m->system->fds.lock);
++    return -1;
    }
-@@ -1378,6 +2335,9 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
-   int rc;
-   int oflags;
-   struct Fd *fd;
-+#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[SysDup3] fildes=%d newfildes=%d flags=%d\n", fildes, newfildes, flags);
-+#endif
+-  return rc;
++  if ((fd = GetFd(&m->system->fds, newfildes))) {
++    dll_remove(&m->system->fds.list, &fd->elem);
++    VfsClose(fd->realfd);
++    FreeFd(fd);
++  }
++  // See SysDup1's comment: fildes may be a real, valid host fd (0/1/2 under
++  // __EMSCRIPTEN__) that was never registered in blink's own Fd table.
++  if (!(fd = GetFd(&m->system->fds, fildes))) {
++    int qflags = VfsFcntl(GetRealFd(&m->system->fds, fildes), F_GETFL, 0);
++    oflags = qflags >= 0 ? qflags : 0;
++  } else {
++    oflags = fd->oflags & ~O_CLOEXEC;
++  }
++  unassert(fd2 = ForkFd(&m->system->fds, fd, newfildes, oflags));
++  fd2->realfd = newrealfd;
++  UNLOCK(&m->system->fds.lock);
++  return newfildes;
+ }
+ 
+ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
+-  int rc;
+-  int oflags;
+-  struct Fd *fd;
++  int oflags, newrealfd;
++  struct Fd *fd, *fd2;
    if (newfildes < 0) return ebadf();
    if (fildes == newfildes) return einval();
    if (flags & ~O_CLOEXEC_LINUX) return einval();
-@@ -1395,8 +2355,14 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
-       dll_remove(&m->system->fds.list, &fd->elem);
-       FreeFd(fd);
-     }
+   if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
+-#ifdef HAVE_DUP3
+-  if ((rc = Dup3(m, fildes, newfildes, XlatOpenFlags(flags))) != -1) {
+-#else
+-  if ((rc = Dup2(m, fildes, newfildes)) != -1) {
+-    if (flags & O_CLOEXEC_LINUX) {
+-      unassert(!VfsFcntl(newfildes, F_SETFD, FD_CLOEXEC));
+-    }
+-#endif
+-    LOCK(&m->system->fds.lock);
+-    if ((fd = GetFd(&m->system->fds, newfildes))) {
+-      dll_remove(&m->system->fds.list, &fd->elem);
+-      FreeFd(fd);
+-    }
 -    unassert(fd = GetFd(&m->system->fds, fildes));
 -    oflags = fd->oflags & ~O_CLOEXEC;
-+    // See SysDup1's comment: fildes may be a real, valid host fd (0/1/2 under
-+    // __EMSCRIPTEN__) that was never registered in blink's own Fd table.
-+    if (!(fd = GetFd(&m->system->fds, fildes))) {
-+      int qflags = VfsFcntl(fildes, F_GETFL, 0);
-+      oflags = qflags >= 0 ? qflags : 0;
-+    } else {
-+      oflags = fd->oflags & ~O_CLOEXEC;
-+    }
-     if (flags & O_CLOEXEC_LINUX) {
-       oflags |= O_CLOEXEC;
-     }
-@@ -1416,8 +2382,18 @@ static int SysDupf(struct Machine *m, i32 fildes, i32 minfildes, int cmd) {
+-    if (flags & O_CLOEXEC_LINUX) {
+-      oflags |= O_CLOEXEC;
+-    }
+-    unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
++  LOCK(&m->system->fds.lock);
++  if ((newrealfd = DupToRealfd(&m->system->fds, fildes)) == -1) {
+     UNLOCK(&m->system->fds.lock);
++    return -1;
+   }
+-  return rc;
++  if ((fd = GetFd(&m->system->fds, newfildes))) {
++    dll_remove(&m->system->fds.list, &fd->elem);
++    VfsClose(fd->realfd);
++    FreeFd(fd);
++  }
++  // See SysDup1's comment: fildes may be a real, valid host fd (0/1/2 under
++  // __EMSCRIPTEN__) that was never registered in blink's own Fd table.
++  if (!(fd = GetFd(&m->system->fds, fildes))) {
++    int qflags = VfsFcntl(GetRealFd(&m->system->fds, fildes), F_GETFL, 0);
++    oflags = qflags >= 0 ? qflags : 0;
++  } else {
++    oflags = fd->oflags & ~O_CLOEXEC;
++  }
++  if (flags & O_CLOEXEC_LINUX) {
++    oflags |= O_CLOEXEC;
++  }
++  unassert(fd2 = ForkFd(&m->system->fds, fd, newfildes, oflags));
++  fd2->realfd = newrealfd;
++  UNLOCK(&m->system->fds.lock);
++  return newfildes;
+ }
+ 
+ static int SysDupf(struct Machine *m, i32 fildes, i32 minfildes, int cmd) {
+   struct Fd *fd;
+-  int lim, oflags, newfildes;
++  int lim, oflags, newfildes, realfd;
+   if (minfildes >= (lim = GetFileDescriptorLimit(m->system))) return emfile();
+-  if ((newfildes = VfsFcntl(fildes, cmd, minfildes)) != -1) {
++  LOCK(&m->system->fds.lock);
++  realfd = GetRealFd(&m->system->fds, fildes);
++  UNLOCK(&m->system->fds.lock);
++  if ((newfildes = VfsFcntl(realfd, cmd, minfildes)) != -1) {
+     if (newfildes >= lim) {
+       VfsClose(newfildes);
        return emfile();
      }
      LOCK(&m->system->fds.lock);
 -    unassert(fd = GetFd(&m->system->fds, fildes));
 -    oflags = fd->oflags & ~O_CLOEXEC;
-+#ifdef MVL_NATIVE_DEBUG
-+    fprintf(g_mvldbg, "[SysDupf] fildes=%d minfildes=%d cmd=%d -> newfildes=%d (fd registered? %d)\n",
-+            fildes, minfildes, cmd, newfildes, GetFd(&m->system->fds, fildes) != 0);
-+#endif
 +    // See SysDup1's comment: fildes may be a real, valid host fd (0/1/2 under
 +    // __EMSCRIPTEN__) that was never registered in blink's own Fd table.
 +    if (!(fd = GetFd(&m->system->fds, fildes))) {
-+      int qflags = VfsFcntl(fildes, F_GETFL, 0);
++      int qflags = VfsFcntl(realfd, F_GETFL, 0);
 +      oflags = qflags >= 0 ? qflags : 0;
 +    } else {
 +      oflags = fd->oflags & ~O_CLOEXEC;
@@ -1524,7 +1802,17 @@ index 34cc01c..67d9fdd 100644
      if (cmd == F_DUPFD_CLOEXEC) {
        oflags |= O_CLOEXEC;
      }
-@@ -2344,6 +3320,9 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
++    // No target-number constraint (like SysDup1) — see its comment.
+     unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
+     UNLOCK(&m->system->fds.lock);
+   }
+@@ -2339,19 +3320,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
+ 
+ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+   i64 rc;
+-  int oflags;
++  int oflags, realfd;
+   struct Fd *fd;
    struct Iovs iv;
    ssize_t (*readv_impl)(int, const struct iovec *, int);
    if (size > NUMERIC_MAX(size_t)) return eoverflow();
@@ -1534,7 +1822,151 @@ index 34cc01c..67d9fdd 100644
    LOCK(&m->system->fds.lock);
    if ((fd = GetFd(&m->system->fds, fildes))) {
      unassert(fd->cb);
-@@ -2559,6 +3538,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+     unassert(readv_impl = fd->cb->readv);
+     oflags = fd->oflags;
++    realfd = fd->realfd;
+   } else {
+     readv_impl = 0;
+     oflags = 0;
++    realfd = fildes;
+   }
+   UNLOCK(&m->system->fds.lock);
+   if (!fd) return -1;
+@@ -2359,7 +3345,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+   if (size) {
+     InitIovs(&iv);
+     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
+-      RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
++      RESTARTABLE(rc = readv_impl(realfd, iv.p, iv.i));
++#ifdef __EMSCRIPTEN__
++      // fd->cb->readv on a file-backed pipe read-end (fds.h's MvlPipeRef) is
++      // an ordinary regular-file read: rc==0 means "at the current end of
++      // content", not "the writer is done" — those used to be the same fact
++      // (every fork ran to completion before the next one started), but
++      // Phase 4 stopped guaranteeing that for pipeline-stage forks too. If a
++      // write end is still open somewhere, this is "nothing written yet",
++      // not real EOF — yield and let the writer's fiber run, then look
++      // again. Ends the moment either more data shows up (rc>0, loop exits
++      // normally) or the last write end closes (refcount hits 0, genuine
++      // EOF, matches what a real blocking pipe read would do).
++      if (rc == 0 && fd->pipe_ref && !fd->pipe_is_write) {
++        int spins = 0;
++        while (rc == 0 && fd->pipe_ref->refcount > 0 && g_mvl_sched_active &&
++               ++spins < 200000) {
++          MvlSchedYieldOnce();
++          RESTARTABLE(rc = readv_impl(realfd, iv.p, iv.i));
++        }
++      }
++#endif
+       if (rc != -1) SetWriteAddr(m, addr, rc);
+     }
+     FreeIovs(&iv);
+@@ -2371,7 +3377,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+ 
+ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+   i64 rc;
+-  int oflags;
++  int oflags, realfd;
+   struct Fd *fd;
+   struct Iovs iv;
+   ssize_t (*writev_impl)(int, const struct iovec *, int);
+@@ -2381,9 +3387,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+     unassert(fd->cb);
+     unassert(writev_impl = fd->cb->writev);
+     oflags = fd->oflags;
++    realfd = fd->realfd;
+   } else {
+     writev_impl = 0;
+     oflags = 0;
++    realfd = fildes;
+   }
+   UNLOCK(&m->system->fds.lock);
+   if (!fd) return -1;
+@@ -2391,7 +3399,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+   if (size) {
+     InitIovs(&iv);
+     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
+-      RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
++      RESTARTABLE(rc = writev_impl(realfd, iv.p, iv.i));
+       if (rc != -1) SetReadAddr(m, addr, rc);
+     }
+     FreeIovs(&iv);
+@@ -2464,7 +3472,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
+ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+                       i64 offset, i32 flags) {
+   i64 rc;
+-  int oflags;
++  int oflags, realfd;
+   struct Fd *fd;
+   struct Iovs iv;
+   ssize_t (*readv_impl)(int, const struct iovec *, int);
+@@ -2478,9 +3486,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+     unassert(fd->cb);
+     unassert(readv_impl = fd->cb->readv);
+     oflags = fd->oflags;
++    realfd = fd->realfd;
+   } else {
+     readv_impl = 0;
+     oflags = 0;
++    realfd = fildes;
+   }
+   UNLOCK(&m->system->fds.lock);
+   if (!fd) return -1;
+@@ -2490,13 +3500,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+     if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
+       if (iv.i) {
+         if (offset == -1) {
+-          RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
++          RESTARTABLE(rc = readv_impl(realfd, iv.p, iv.i));
+         } else if (offset < 0) {
+           return einval();
+         } else if (offset > NUMERIC_MAX(off_t)) {
+           return eoverflow();
+         } else {
+-          RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
++          RESTARTABLE(rc = VfsPreadv(realfd, iv.p, iv.i, offset));
+         }
+       } else {
+         rc = 0;
+@@ -2512,7 +3522,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+                        i64 offset, i32 flags) {
+   i64 rc;
+-  int oflags;
++  int oflags, realfd;
+   struct Fd *fd;
+   struct Iovs iv;
+   ssize_t (*writev_impl)(int, const struct iovec *, int);
+@@ -2526,9 +3536,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+     unassert(fd->cb);
+     unassert(writev_impl = fd->cb->writev);
+     oflags = fd->oflags;
++    realfd = fd->realfd;
+   } else {
+     writev_impl = 0;
+     oflags = 0;
++    realfd = fildes;
+   }
+   UNLOCK(&m->system->fds.lock);
+   if (!fd) return -1;
+@@ -2538,14 +3550,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+     if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
+       if (iv.i) {
+         if (offset == -1) {
+-          RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
++          RESTARTABLE(rc = writev_impl(realfd, iv.p, iv.i));
+           rc = HandleSigpipe(m, rc, 0);
+         } else if (offset < 0) {
+           return einval();
+         } else if (offset > NUMERIC_MAX(off_t)) {
+           return eoverflow();
+         } else {
+-          RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
++          RESTARTABLE(rc = VfsPwritev(realfd, iv.p, iv.i, offset));
+         }
+       } else {
+         rc = 0;
+@@ -2559,6 +3571,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  }
  
  static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
@@ -1544,7 +1976,7 @@ index 34cc01c..67d9fdd 100644
    return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
  }
  
-@@ -2652,9 +3634,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+@@ -2652,9 +3667,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
    struct dirent *ent;
    struct dirent_linux rec;
    if (size < sizeof(rec) - sizeof(rec.name)) return einval();
@@ -1562,7 +1994,50 @@ index 34cc01c..67d9fdd 100644
    if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
      return -1;
    }
-@@ -3526,6 +4515,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -2743,7 +3765,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
+   if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
+   if (!(fd = GetAndLockFd(m, fildes))) return -1;
+   if (!fd->dirstream) {
+-    rc = VfsSeek(fd->fildes, offset, XlatWhence(whence));
++    rc = VfsSeek(fd->realfd, offset, XlatWhence(whence));
+   } else if (whence == SEEK_SET_LINUX) {
+     if (!offset) {
+       VfsRewinddir(fd->dirstream);
+@@ -2806,10 +3828,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
+ }
+ 
+ static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
+-  int rc;
++  int rc, realfd;
+   struct stat st;
+   struct stat_linux gst;
+-  if ((rc = VfsFstat(fd, &st)) != -1) {
++  LOCK(&m->system->fds.lock);
++  realfd = GetRealFd(&m->system->fds, fd);
++  UNLOCK(&m->system->fds.lock);
++  if ((rc = VfsFstat(realfd, &st)) != -1) {
+     XlatStatToLinux(&gst, &st);
+     if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
+   }
+@@ -3253,7 +4278,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+     rc = UnXlatOpenFlags(fd->oflags);
+   } else if (cmd == F_SETFD_LINUX) {
+     if (!(arg & ~FD_CLOEXEC_LINUX)) {
+-      if (VfsFcntl(fd->fildes, F_SETFD, arg ? FD_CLOEXEC : 0) != -1) {
++      if (VfsFcntl(fd->realfd, F_SETFD, arg ? FD_CLOEXEC : 0) != -1) {
+         fd->oflags &= ~O_CLOEXEC;
+         if (arg) fd->oflags |= O_CLOEXEC;
+         rc = 0;
+@@ -3266,7 +4291,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+   } else if (cmd == F_SETFL_LINUX) {
+     fl = XlatOpenFlags(arg & (O_APPEND_LINUX | O_ASYNC_LINUX | O_DIRECT_LINUX |
+                               O_NOATIME_LINUX | O_NDELAY_LINUX));
+-    if (VfsFcntl(fd->fildes, F_SETFL, fl) != -1) {
++    if (VfsFcntl(fd->realfd, F_SETFL, fl) != -1) {
+       fd->oflags &= ~SETFL_FLAGS;
+       fd->oflags |= fl;
+       rc = 0;
+@@ -3526,6 +4551,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -1570,7 +2045,7 @@ index 34cc01c..67d9fdd 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +4617,145 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4653,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -1691,9 +2166,12 @@ index 34cc01c..67d9fdd 100644
 +  // blocking semantics. MvlSchedHasLiveChild distinguishes "still running"
 +  // from "no such child" — without it, waiting on a bogus pid would spin
 +  // forever instead of correctly failing with ECHILD below.
-+  while (rc == -1 && MvlSchedHasLiveChild(pid)) {
-+    MvlSchedYieldOnce();
-+    rc = EmReapChildStatus(pid, &status);
++  {
++    int spins = 0;
++    while (rc == -1 && MvlSchedHasLiveChild(pid) && ++spins < 500000) {
++      MvlSchedYieldOnce();
++      rc = EmReapChildStatus(pid, &status);
++    }
 +  }
 +  if (rc == -1) {
 +    // Either genuinely no such child was ever forked/spawned, or (pre-
@@ -1716,7 +2194,7 @@ index 34cc01c..67d9fdd 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
-@@ -3922,6 +5051,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+@@ -3922,6 +5090,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
    for (;;) {
      if (CompareTime(now, deadline) >= 0) return 0;
      ts = SubtractTime(deadline, now);
@@ -1735,7 +2213,7 @@ index 34cc01c..67d9fdd 100644
      if (nanosleep(&ts, 0)) {
        unassert(errno == EINTR);
        // this may run a guest signal handler before returning
-@@ -5620,6 +6761,20 @@ void OpSyscall(P) {
+@@ -5620,6 +6800,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -1756,7 +2234,7 @@ index 34cc01c..67d9fdd 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +6875,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6914,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);
