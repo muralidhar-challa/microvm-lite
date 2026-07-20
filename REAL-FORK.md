@@ -54,26 +54,38 @@ then waits for a writer that already exited, and that fiber never finishes.
 Measured: a healthy 150-pipeline session frees 300 child stacks; a poisoned
 one frees 4.
 
-## What this deletes
+## What this deletes (final tally — the plan below over-estimated)
 
-Real fork is mostly **removal**. These exist only to survive shared memory:
+The plan assumed EVERY fork-style child would go private, but musl's
+posix_spawn trampoline (Rust's `std::process::Command`, i.e. the sams CLI)
+calls `clone(CLONE_VM|CLONE_VFORK, stack)` — genuinely shared memory with a
+guest-supplied stack — and that path stays. So the shared-System machinery
+splits into deleted vs. still-load-bearing:
 
-- `em_forkstack` reclaim — child's stack lives in its own address space
-- live-stack copy + red-zone slack — no stack aliasing exists to fix
-- `EmDupFdsForChild`, and `independent_fds`/`fds_list`/`g_mvl_canonical_fds`
-  swapping in `mvl_dispatch.c` — each System owns its fds, nothing to swap
-- `MvlPipeRef` refcount + `SysRead` retry loop — becomes *correct* rather
-  than a workaround, because `FreeSystem` closing child fds is what finally
-  makes the refcount reach 0. (Keep it: it is the mechanism that turns
-  "file at EOF" into "writer is genuinely gone".)
-- `em_vfork_child` + `SysExecve`'s vfork-child branch (the nested
-  `RunMachineUntilExit(m2)` on a throwaway System) — a child with private
-  memory can just `execve` in place
-- `EmSaveMem`/`EmRestoreMem` snapshot/restore — the trick that existed only
-  to undo a shared-memory child's damage
+**Deleted (done):**
 
-`Fork()`'s eagain-on-no-stack-room guard (76fa8d0) stays: failing loudly
-beats corrupting, regardless of model.
+- `EmSaveMem`/`EmRestoreMem`/`EmSaveFds`/`EmRestoreFds` + all their structs
+  (`EmMemSnap`, `EmMemPage`, `EmFdSave`) and helpers (`EmSnapAdd`,
+  `EmSnapFind`, `EmFreeMemSnap`) — the run-to-completion snapshot/restore
+  era; uncalled since Phase 4 replaced that model
+- the live-stack copy + red-zone arm of the shared path (`stack==0` with
+  `CLONE_VM`) — unreachable: every no-stack fork now goes private, and
+  posix_spawn always supplies a stack; a loud `eagain()` guards the arm in
+  case a new caller ever trips it
+- `em_forkstack` (field, reclaim in `EmForkChildEntry`, zeroing in
+  `EmForkPrivate`) — only the deleted arm ever set it
+
+**Kept, still load-bearing (for posix_spawn, not dash/toybox):**
+
+- `EmDupFdsForChild` + `independent_fds`/`fds_list` swapping in
+  `mvl_dispatch.c` — a CLONE_VM fork-style child shares memory but needs
+  its own fd table; only the swap machinery can give it one
+- `em_vfork_child` + `SysExecve`'s vfork-child branch + `SysExitGroup`'s
+  gate — the execve-on-a-throwaway-Machine trick is exactly right for a
+  child that shares the parent's memory
+- `MvlPipeRef` refcount + `SysRead` retry loop — became *correct* rather
+  than a workaround: `EmCloseAllFds` at child exit is what finally drives
+  the refcount to 0 and turns "file at EOF" into "writer is genuinely gone"
 
 ## Implementation
 

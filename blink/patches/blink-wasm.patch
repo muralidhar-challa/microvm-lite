@@ -409,7 +409,7 @@ index ad309eb..fc53cca 100644
    int sig;
    RestoreIp(m);
 diff --git a/blink/machine.h b/blink/machine.h
-index be17a8a..debd6a6 100644
+index be17a8a..7cd6d61 100644
 --- a/blink/machine.h
 +++ b/blink/machine.h
 @@ -97,6 +97,12 @@
@@ -425,7 +425,7 @@ index be17a8a..debd6a6 100644
  #define PAGE_TA    0x0000fffffffff000  // bits used for host, or real address
  #define PAGE_GROW  0x0010000000000000  // for future support of MAP_GROWSDOWN
  #define PAGE_MUG   0x0020000000000000  // host page magic mapped individually
-@@ -449,6 +455,25 @@ struct Machine {               //
+@@ -449,6 +455,18 @@ struct Machine {               //
    sigset_t spawn_sigmask;                //
    struct Dll elem;                       //
    struct SmcQueue smcqueue;              //
@@ -436,13 +436,6 @@ index be17a8a..debd6a6 100644
 +  // vfork() gives us — but instead run the new program in a FRESH machine,
 +  // matching real vfork()'s separate-address-space-at-exec semantics.
 +  bool em_vfork_child;
-+  // The private guest stack Fork() reserved for this scheduled fork child
-+  // (0 when it didn't reserve one — an explicit-stack clone, or the parent).
-+  // Recorded so EmForkChildEntry can hand the address space back when the
-+  // child finishes. Without this, every fork permanently consumed 8 MB of a
-+  // 32-bit guest address space whose automap window is zero bytes wide (see
-+  // Fork()), so a VM died after ~54 pipelines and never recovered.
-+  i64 em_forkstack;
 +  // Real fork(): this machine owns its System (private address space + fd
 +  // table) rather than sharing the parent's, so its exit must tear both
 +  // down. False for clone(CLONE_VM) threads. See REAL-FORK.md.
@@ -451,7 +444,7 @@ index be17a8a..debd6a6 100644
    struct OpCache opcache[1];             //
  };  //
  
-@@ -466,6 +491,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
+@@ -466,6 +484,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
  i64 AreAllPagesUnlocked(struct System *) nosideeffect;
  bool IsOrphan(struct Machine *) nosideeffect;
  _Noreturn void Blink(struct Machine *);
@@ -603,7 +596,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..e45c146 100644
+index 34cc01c..3f8fa79 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -699,7 +692,7 @@ index 34cc01c..e45c146 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +534,1170 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +534,798 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -793,53 +786,9 @@ index 34cc01c..e45c146 100644
 +  return -1;
 +}
 +
-+// ── Guest-memory snapshot around run-to-completion fork children ─────────────
-+//
-+// blink's wasm Fork() runs the child on the SAME machine/guest memory as the
-+// parent (run-to-completion vfork model). That is correct for the classic
-+// vfork→execve pattern, but a shell's pipeline/subshell child that NEVER
-+// execve()s runs the shell's own code in-process: it mutates parent heap state
-+// that real fork() isolation would have copied (e.g. dash's forkchild() resets
-+// the job table the parent dereferences the moment it resumes → SEGV). The
-+// registers and fd table are already snapshot/restored around the child; this
-+// section extends the exact same discipline to guest MEMORY, which gives the
-+// parent true fork semantics for any guest (any shell) without COW machinery:
-+// snapshot every mapped page before the child runs, restore after it exits.
-+//
-+// Wasm builds are always the non-linear page-table mode (CAN_64BIT is false),
-+// so every mapped page is reachable by walking the 4-level table at s->cr3 and
-+// FindHostPage() yields its backing host page.
 +void EmDbgf(const char *fmt, ...);
 +
-+struct EmMemPage {
-+  i64 virt;   // guest page address
-+  u64 entry;  // leaf PTE at snapshot time
-+  u8 *copy;   // 4096-byte content copy (NULL for PAGE_RSRV reservations)
-+};
-+struct EmMemSnap {
-+  struct EmMemPage *p;
-+  long n, c;
-+  i64 brk;                              // parent's program break
-+  struct sigaction_linux hands[64];     // parent's signal dispositions
-+};
-+
-+static void EmSnapAdd(struct EmMemSnap *ms, i64 virt, u64 entry, u8 *host) {
-+  if (ms->n == ms->c) {
-+    ms->c = ms->c ? ms->c * 2 : 512;
-+    ms->p = (struct EmMemPage *)realloc(ms->p, ms->c * sizeof(*ms->p));
-+  }
-+  ms->p[ms->n].virt = virt;
-+  ms->p[ms->n].entry = entry;
-+  if (host) {
-+    ms->p[ms->n].copy = (u8 *)malloc(4096);
-+    memcpy(ms->p[ms->n].copy, host, 4096);
-+  } else {
-+    ms->p[ms->n].copy = 0;
-+  }
-+  ms->n++;
-+}
-+
-+// Walk every present leaf PTE, in ascending virt order (so ms->p is sorted).
++// Walk every present leaf PTE, in ascending virt order.
 +static void EmWalkLeaves(struct System *s,
 +                         void (*cb)(void *arg, i64 virt, u64 entry, u8 *mi),
 +                         void *arg) {
@@ -904,13 +853,13 @@ index 34cc01c..e45c146 100644
 +
 +// Real fork(): duplicate the parent's address space into the child's own
 +// System, so the child's writes are genuinely private (REAL-FORK.md).
-+// Reuses EmWalkLeaves, and EmSaveMemCb's proven insight below about which
-+// pages can be shared vs. must be copied: read-only pages (.text and
-+// friends) can never diverge without an mprotect() neither dash nor toybox
-+// issues, so they're SHARED (PTE aliased, PAGE_NOOWN-tagged) rather than
-+// copied — which is also what makes this safe: writing into a genuinely
-+// read-only host page is a real SIGSEGV (EmSaveMemCb), so copying them by
-+// reserving-writable-then-restoring-read-only was never going to work.
++// Reuses EmWalkLeaves. Read-only pages (.text and friends) can never
++// diverge without an mprotect() neither dash nor toybox issues, so they're
++// SHARED (PTE aliased, PAGE_NOOWN-tagged) rather than copied — which is
++// also what makes this safe: writing into a genuinely read-only host page
++// (file-backed PROT_READ|PROT_EXEC host mmap) is a real SIGSEGV, confirmed
++// via lldb, so copying them by reserving-writable-then-restoring-read-only
++// was never going to work.
 +struct EmCopyAsCtx {
 +  struct Machine *dst;  // child machine; CopyToUser walks ITS page tables
 +  long npages;          // instrumentation: pages recreated
@@ -971,203 +920,11 @@ index 34cc01c..e45c146 100644
 +  // too and its first touch still sees zeros — matching fork().
 +}
 +
-+static void EmSaveMemCb(void *arg, i64 virt, u64 entry, u8 *mi) {
-+  struct EmMemSnap *ms = (struct EmMemSnap *)arg;
-+  (void)mi;
-+  // Read-only pages (a program's .text segment, file-backed and mapped
-+  // PROT_READ|PROT_EXEC at the host level, no PAGE_RW bit) can never diverge
-+  // between parent and child without an mprotect() neither dash nor toybox
-+  // ever does — skip snapshotting their content entirely, matching real
-+  // fork() COW semantics (only writable/dirty pages ever need copying).
-+  // Necessary, not just an optimization: restoring INTO a genuinely
-+  // read-only host page (e.g. after a real host mmap(PROT_READ|PROT_EXEC)
-+  // for the executable's file-backed .text) is an actual SIGSEGV/SIGBUS —
-+  // confirmed via lldb, not a real host page.
-+  if ((entry & PAGE_RSRV) || !(entry & PAGE_RW)) {
-+    EmSnapAdd(ms, virt, entry, 0);
-+  } else {
-+    EmSnapAdd(ms, virt, entry, FindHostPage(entry));
-+  }
-+}
-+
-+static void EmSaveMem(struct Machine *m, struct EmMemSnap *ms) {
-+  memset(ms, 0, sizeof(*ms));
-+  ms->brk = m->system->brk;
-+  memcpy(ms->hands, m->system->hands, sizeof(ms->hands));
-+  EmWalkLeaves(m->system, EmSaveMemCb, ms);
-+#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[EmSaveMem] pages=%ld\n", ms->n);
-+#endif
-+}
-+
-+static struct EmMemPage *EmSnapFind(struct EmMemSnap *ms, i64 virt) {
-+  long lo = 0, hi = ms->n - 1, mid;
-+  while (lo <= hi) {
-+    mid = (lo + hi) / 2;
-+    if (ms->p[mid].virt < virt) lo = mid + 1;
-+    else if (ms->p[mid].virt > virt) hi = mid - 1;
-+    else return &ms->p[mid];
-+  }
-+  return 0;
-+}
-+
-+// State carried through the restore walk: which saved pages were seen, and
-+// which currently-mapped pages are child creations that must be unmapped.
-+struct EmMemRestoreCtx {
-+  struct EmMemSnap *ms;
-+  unsigned char *seen;      // ms->n flags
-+  i64 *doom;                // child-created page virts to FreeVirtual after
-+  long ndoom, cdoom;
-+};
-+
-+static void EmRestoreMemCb(void *arg, i64 virt, u64 entry, u8 *mi) {
-+  struct EmMemRestoreCtx *cx = (struct EmMemRestoreCtx *)arg;
-+  struct EmMemPage *sp = EmSnapFind(cx->ms, virt);
-+  if (!sp) {
-+    // Child-created mapping the parent never had: unmap it after the walk
-+    // (FreeVirtual mutates the tables we are iterating).
-+    if (cx->ndoom == cx->cdoom) {
-+      cx->cdoom = cx->cdoom ? cx->cdoom * 2 : 64;
-+      cx->doom = (i64 *)realloc(cx->doom, cx->cdoom * sizeof(*cx->doom));
-+    }
-+    cx->doom[cx->ndoom++] = virt;
-+    return;
-+  }
-+  cx->seen[sp - cx->ms->p] = 1;
-+  if (sp->copy) {
-+    if (!(entry & PAGE_RSRV)) {
-+      // Both materialized: restore the parent's bytes into whatever host page
-+      // currently backs this virt (the child may have swapped it).
-+      memcpy(FindHostPage(entry), sp->copy, 4096);
-+    }
-+    // saved-materialized but currently a reservation (child munmap+remap):
-+    // leave the reservation; the content restore below (absent case) does not
-+    // apply — accept the rare loss and log it.
-+    else {
-+      EmDbgf("EmRestoreMem: %" PRIx64 " became a reservation; content lost", virt);
-+    }
-+  } else if (sp->entry & PAGE_RSRV) {
-+    // Parent had only a reservation here.
-+    if (!(entry & PAGE_RSRV)) {
-+      if (sp->entry & PAGE_FILE) {
-+        // Lazy file page the child materialized: materialization is identical
-+        // for the parent (same file, same offset), so keep it as-is.
-+      } else {
-+        // Anonymous reservation the child touched: parent's first touch must
-+        // still see zeros.
-+        memset(FindHostPage(entry), 0, 4096);
-+      }
-+    }
-+  }
-+  // else: parent had a READ-ONLY materialized page (e.g. a .text segment,
-+  // file-backed PROT_READ|PROT_EXEC at the host level — writing into it is a
-+  // real SIGSEGV/SIGBUS, confirmed via lldb). No copy was taken because none
-+  // is needed: content can't diverge without an mprotect() neither dash nor
-+  // toybox ever does, so there's nothing to restore here regardless of what
-+  // the child did to its OWN view of this page.
-+  (void)mi;
-+}
-+
-+static void EmRestoreMem(struct Machine *m, struct EmMemSnap *ms) {
-+  long i;
-+  struct EmMemRestoreCtx cx;
-+  memset(&cx, 0, sizeof(cx));
-+  cx.ms = ms;
-+  cx.seen = (unsigned char *)calloc(1, ms->n ? ms->n : 1);
-+#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[EmRestoreMem] enter, ms->n=%ld\n", ms->n);
-+#endif
-+  EmWalkLeaves(m->system, EmRestoreMemCb, &cx);
-+#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[EmRestoreMem] walk done, ndoom=%ld\n", cx.ndoom);
-+#endif
-+  // Unmap pages the child created.
-+  for (i = 0; i < cx.ndoom; ++i) {
-+    FreeVirtual(m->system, cx.doom[i], 4096);
-+  }
-+#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[EmRestoreMem] doom freed, recreating unseen pages\n");
-+#endif
-+  // Re-create pages the child unmapped.
-+  for (i = 0; i < ms->n; ++i) {
-+    if (cx.seen[i]) continue;
-+#ifdef MVL_NATIVE_DEBUG
-+    fprintf(g_mvldbg, "[EmRestoreMem] recreate[%ld] virt=%llx has_copy=%d\n", i,
-+            (unsigned long long)ms->p[i].virt, ms->p[i].copy != 0);
-+#endif
-+    u64 prot = ms->p[i].entry &
-+               (PAGE_RW | PAGE_U | PAGE_XD | PAGE_G | PAGE_GROW | PAGE_FILE);
-+    if (ReserveVirtual(m->system, ms->p[i].virt, 4096, prot | PAGE_RSRV, -1, 0,
-+                       0, 0) == -1) {
-+      EmDbgf("EmRestoreMem: cannot remap %" PRIx64, ms->p[i].virt);
-+      continue;
-+    }
-+    if (ms->p[i].copy) {
-+      CopyToUserWrite(m, ms->p[i].virt, ms->p[i].copy, 4096);
-+    }
-+  }
-+#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[EmRestoreMem] exit\n");
-+#endif
-+  m->system->brk = ms->brk;
-+  memcpy(m->system->hands, ms->hands, sizeof(ms->hands));
-+  free(cx.seen);
-+  free(cx.doom);
-+}
-+
-+static void EmFreeMemSnap(struct EmMemSnap *ms) {
-+  long i;
-+  for (i = 0; i < ms->n; ++i) free(ms->p[i].copy);
-+  free(ms->p);
-+  ms->p = 0;
-+  ms->n = ms->c = 0;
-+}
-+
-+// Guest fds live in [0, kMinBlinkFd); blink's own fds are >= kMinBlinkFd.
-+struct EmFdSave {
-+  int fildes;  // guest fd number (== host fd number in blink's model)
-+  int oflags;  // blink Fd oflags, to rebuild the Fd struct
-+  int slot;    // high host fd holding a dup of the original open file
-+};
-+
-+// Snapshot the parent's fd table before running a vfork child by dup()ing each
-+// open guest fd to a high slot (F_DUPFD_CLOEXEC min=kMinBlinkFd lands above the
-+// guest range and skips blink's own fds), so the child's open/dup2/close for
-+// redirections and pipes can be undone on resume. Returns the number of saved
-+// entries.
-+//
-+// KNOWN LIMITATION (see the microvm-lite plan): dup2()ing fd 0/1/2 back on
-+// restore rebinds those Emscripten fd slots to fresh stream objects that no
-+// longer route through the worker's stdout/stderr TTY put_char capture, so in a
-+// long-lived worker every command AFTER the first forking one loses its output.
-+// Individual commands (fresh worker) are correct. Fixing this needs a cleaner
-+// process/fd model — see the meta-discussion in the plan.
-+static int EmSaveFds(struct Machine *m, struct EmFdSave *sv, int max) {
-+  int n = 0;
-+  struct Dll *e;
-+  LOCK(&m->system->fds.lock);
-+  for (e = dll_first(m->system->fds.list); e && n < max;
-+       e = dll_next(m->system->fds.list, e)) {
-+    struct Fd *fd = FD_CONTAINER(e);
-+    if (fd->fildes < 0 || fd->fildes >= kMinBlinkFd) continue;  // skip vm fds
-+    sv[n].fildes = fd->fildes;
-+    sv[n].oflags = fd->oflags;
-+    sv[n].slot = VfsFcntl(fd->fildes, F_DUPFD_CLOEXEC, kMinBlinkFd);
-+    if (sv[n].slot == -1) {
-+      LOGF("EmSaveFds: could not preserve fd %d (errno %d)", fd->fildes, errno);
-+      continue;  // best effort: this fd won't be restorable, but don't abort
-+    }
-+    ++n;
-+  }
-+  UNLOCK(&m->system->fds.lock);
-+  return n;
-+}
-+
 +#ifdef __EMSCRIPTEN__
 +// Real fork/vfork-backed background jobs (SCHEDULER-DESIGN.md, Phase 4):
-+// builds a NEW, independent fd list for a scheduled fork child — reusing
-+// EmSaveFds's dup-to-a-new-host-fd technique, but instead of stashing the
-+// dups for a later restore (the old synchronous path's trick), installs
++// builds a NEW, independent fd list for a scheduled fork child — dup()ing
++// each open guest fd to a high slot (F_DUPFD_CLOEXEC min=kMinBlinkFd lands
++// above the guest range, skipping blink's own fds), then installs
 +// them as a genuinely separate `struct Dll` list mvl_dispatch.c swaps into
 +// `m->system->fds.list` whenever this child is the one running (see
 +// MvlSchedSpawnWithEntry's doc in mvl_dispatch.h for why fds need their own
@@ -1188,7 +945,7 @@ index 34cc01c..e45c146 100644
 +    if (fd->fildes < 0 || fd->fildes >= kMinBlinkFd) continue;  // skip vm fds
 +    if ((dupfildes = VfsFcntl(fd->realfd, F_DUPFD_CLOEXEC, kMinBlinkFd)) == -1) {
 +      LOGF("EmDupFdsForChild: could not dup fd %d (errno %d)", fd->fildes, errno);
-+      continue;  // best effort, matching EmSaveFds
++      continue;  // best effort: this fd just won't exist in the child
 +    }
 +    // Guest-visible number MUST stay fd->fildes (real fork() preserves fd
 +    // numbers in the child; the guest's own C state was memcpy'd mid-flight
@@ -1208,41 +965,8 @@ index 34cc01c..e45c146 100644
 +}
 +#endif
 +
-+// Undo whatever the vfork child did to the shared fd table: tear down the
-+// child's Fd list (freeing structs, closing the host fds it left in the guest
-+// range), then restore each parent fd from its saved slot and rebuild the Fd
-+// struct — leaving the table as it was at vfork() time.
 +void EmSockOnClose(int fildes);  // defined in the M3 socket section below
 +void EmDbgf(const char *fmt, ...);
-+
-+static void EmRestoreFds(struct Machine *m, struct EmFdSave *sv, int n) {
-+  struct Dll *e, *e2;
-+  int i, j;
-+  LOCK(&m->system->fds.lock);
-+  for (e = dll_first(m->system->fds.list); e; e = e2) {
-+    struct Fd *fd = FD_CONTAINER(e);
-+    e2 = dll_next(m->system->fds.list, e);
-+    if (fd->fildes < 0 || fd->fildes >= kMinBlinkFd) continue;  // leave vm fds
-+    dll_remove(&m->system->fds.list, e);
-+    VfsClose(fd->fildes);
-+    // A virtual socket the CHILD opened dies with the child's fd — clear its
-+    // side-table entry so the fd number can't hijack an unrelated later fd.
-+    // But if the parent owned this fd number too (it's in the saved set), the
-+    // dup2 below restores the same open file, so any socket entry stays valid.
-+    for (j = 0; j < n; ++j) {
-+      if (sv[j].slot != -1 && sv[j].fildes == fd->fildes) break;
-+    }
-+    if (j == n) EmSockOnClose(fd->fildes);
-+    FreeFd(fd);
-+  }
-+  for (i = 0; i < n; ++i) {
-+    if (sv[i].slot == -1) continue;
-+    VfsDup2(sv[i].slot, sv[i].fildes);  // restore the parent's open file
-+    VfsClose(sv[i].slot);               // release the save slot
-+    AddFd(&m->system->fds, sv[i].fildes, sv[i].oflags);
-+  }
-+  UNLOCK(&m->system->fds.lock);
-+}
 +
 +// Real fork/vfork-backed background jobs (SCHEDULER-DESIGN.md, Phase 4).
 +// The fiber driver for a scheduled fork child: mirrors MvlThreadEntry
@@ -1279,20 +1003,11 @@ index 34cc01c..e45c146 100644
 +  // Else: SysExitGroup's own em_vfork_child branch already stashed status
 +  // directly before calling HaltMachine — nothing more to do here.
 +  //
-+  // Give the child's private guest stack back to the shared address space.
-+  // Safe here: the guest is done executing (Actor() only returns via the
-+  // siglongjmp above, and this function runs on the HOST fiber stack, not
-+  // the guest stack being freed), and nothing can resume this Machine —
-+  // MvlSchedThreadExitAndYield below unlinks the fiber for good.
++  // (The em_forkstack reclaim that used to live here is deleted with real
++  // fork(): a no-stack shared-memory child no longer exists, so there is no
++  // scheduler-allocated guest stack to hand back. posix_spawn children use
++  // the guest-supplied trampoline stack, which the guest itself owns.)
 +  //
-+  // Without this, the ceiling was TOTAL forks ever run; with it, the
-+  // ceiling is CONCURRENT forks, which for a shell pipeline is 2-3. The
-+  // window is only zero bytes wide (see Fork()), so reuse is what makes
-+  // long sessions possible at all.
-+  if (m->em_forkstack) {
-+    unassert(!FreeVirtual(m->system, m->em_forkstack, kStackSize));
-+    m->em_forkstack = 0;
-+  }
 +  // Real fork() child: the kernel closes a dying process's fds, and that is
 +  // what releases a pipe's last write end so the reader finally sees EOF
 +  // (REAL-FORK.md). Do it BEFORE handing control away — after
@@ -1383,12 +1098,10 @@ index 34cc01c..e45c146 100644
 +    m2->sysdepth = 0;
 +    m2->sigdepth = 0;
 +    m2->signals = 0;
-+    // Shared-System-era fields inherited by that memcpy that must NOT carry
-+    // into a real-fork child. em_forkstack is the killer: it names a stack
-+    // in the PARENT's address space, and EmForkChildEntry would hand the
-+    // parent's memory back while the parent is still using it.
-+    m2->em_forkstack = 0;
-+    m2->em_vfork_child = false;  // real fork execve()s in place, correctly
++    // Shared-System-era field inherited by that memcpy that must NOT carry
++    // into a real-fork child: a vfork child execve()s on a throwaway
++    // Machine; a real-fork child execve()s in place, correctly.
++    m2->em_vfork_child = false;
 +  }
 +  // Copy the fd table. fork() gives the child its own table whose entries
 +  // reference the SAME open file descriptions (shared file offsets) — which
@@ -1440,11 +1153,11 @@ index 34cc01c..e45c146 100644
 +  // struct System, not struct Machine, so there is no way to share memory
 +  // but NOT fds without splitting that struct; accepted as the same v1
 +  // "share, don't isolate" simplification Phase 0-3 already made for
-+  // memory — see SCHEDULER-DESIGN.md's Phase 4 notes). This REPLACES the
-+  // old run-to-completion model (EmSaveMem/EmRestoreMem/EmSaveFds/
-+  // EmRestoreFds/RunMachineUntilExit(m) reusing the SAME Machine for both
-+  // parent and child) — a backgrounded child now genuinely runs
-+  // concurrently with its parent instead of blocking it until done.
++  // memory — see SCHEDULER-DESIGN.md's Phase 4 notes). This replaced the
++  // old run-to-completion snapshot/restore model — a backgrounded child
++  // genuinely runs concurrently with its parent instead of blocking it
++  // until done. (The snapshot/restore machinery itself is deleted: real
++  // fork() made it dead code.)
 +  if (!(m2 = NewMachine(m->system, m))) {
 +#ifdef MVL_NATIVE_DEBUG
 +    fprintf(g_mvldbg, "[Fork] NewMachine FAILED\n");
@@ -1452,117 +1165,25 @@ index 34cc01c..e45c146 100644
 +    return eagain();
 +  }
 +  Put64(m2->ax, 0);  // child's view of fork()/vfork()/clone()'s return value
-+  if (stack) {
-+    // musl's posix_spawn (Rust's std::process::Command) calls
-+    // clone(CLONE_VM|CLONE_VFORK, explicit_stack, ...) with its own
-+    // trampoline stack — the guest already gave the child a stack that
-+    // doesn't overlap the parent's, nothing more to do.
-+    Put64(m2->sp, stack);
-+  } else {
-+    // Plain fork()/vfork() (stack==0, e.g. busybox hush NOMMU) — unlike
-+    // the explicit-stack case above, NewMachine's memcpy left m2->sp equal
-+    // to the PARENT's sp: both machines pointing at the SAME shared stack
-+    // memory. That's correct for real vfork() (the parent is SUSPENDED
-+    // until the child execve()s/exits, so only one of them ever actually
-+    // runs) but wrong here — the child now runs CONCURRENTLY with the
-+    // parent, so both would push/pop the identical stack addresses
-+    // simultaneously, corrupting each other within microseconds
-+    // (confirmed via lldb: FindPageTableEntry crash-looping on garbage
-+    // addresses almost immediately, traced to exactly this). Give the
-+    // child its own stack region and copy the parent's currently-live
-+    // stack bytes into it, relocating sp by the same offset — sp/bp-
-+    // relative frame access keeps working; an absolute pointer computed
-+    // pre-fork to a stack local and dereferenced post-fork without an
-+    // intervening execve() is a known, accepted gap (rare for the
-+    // fork-then-quickly-execve pattern this targets, and real fork()'s
-+    // full COW isolation is deliberately out of scope for v1 — see
-+    // SCHEDULER-DESIGN.md).
-+    i64 old_sp = Get64(m->sp);
-+    i64 stack_bottom = kStackTop - kStackSize;
-+    i64 new_stack;
-+    // Copy only the LIVE stack (sp upward), not the whole 8 MB reservation.
-+    // Everything below sp is dead by definition, and copying it cost an
-+    // 8 MB malloc + 16 MB of copying per fork. That malloc is what actually
-+    // capped a session once the guest stacks themselves were being reclaimed:
-+    // measured 9 forks failing on it (host heap exhausted/fragmented by the
-+    // per-fiber allocations mvl_dispatch.c defers freeing) while the guest
-+    // address space still had room. A shell forking to run a pipeline stage
-+    // has only a few KB live here.
-+    //
-+    // kRedZone: x86-64's ABI lets a leaf function use 128 bytes BELOW rsp
-+    // without adjusting it, so that much genuinely-live data can sit under
-+    // sp. Round up generously — this is cheap now that we're not copying
-+    // the whole region.
-+    enum { kRedZone = 4096 };
-+    i64 live_from = old_sp - kRedZone;
-+    i64 copy_bytes;
-+    if (live_from < stack_bottom) live_from = stack_bottom;
-+    if (old_sp < stack_bottom || old_sp > kStackTop) {
-+      // sp isn't in the region we're about to duplicate (guest switched
-+      // stacks itself). Copying a relocated window would be meaningless
-+      // and silently wrong, so fall back to duplicating the whole region.
-+      live_from = stack_bottom;
-+    }
-+    copy_bytes = kStackTop - live_from;
-+    // ReserveVirtual(virt=0) does NOT mean "auto-place" outside the
-+    // HasLinearMapping() case (confirmed via lldb: it returned literal
-+    // address 0, silently colliding with low/reserved memory — the actual
-+    // cause of the crash this comment replaces). SysMmap's own addr=0
-+    // handling (syscall.c ~2108) shows the real pattern: resolve a free
-+    // address via FindVirtual() first, THEN pass that to ReserveVirtual().
-+    new_stack = FindVirtual(m->system, m->system->automap, kStackSize);
-+    if (new_stack != -1) {
-+      i64 newautomap = ROUNDUP(new_stack + kStackSize, FLAG_pagesize);
-+      new_stack = ReserveVirtual(m->system, new_stack, kStackSize,
-+                                 PAGE_FILE | PAGE_U | PAGE_RW, -1, 0, 0, 0);
-+      if (new_stack != -1) {
-+        m->system->automap =
-+            newautomap < FLAG_automapend ? newautomap : FLAG_automapstart;
-+      }
-+    }
-+    // Both failure paths below MUST fail the fork rather than continue.
-+    // Continuing leaves m2->sp pointing at the PARENT's stack while the
-+    // child runs concurrently, and the two then push/pop identical
-+    // addresses — silent guest-memory corruption, not a crash. Observed as
-+    // pipelines returning byte-count-correct GARBAGE, dash dying with
-+    // "Out of space", and every later pipeline in that VM returning empty
-+    // while the shell still responds. A failed fork() is recoverable and
-+    // visible (dash prints "Cannot fork"); silent corruption is neither.
-+    //
-+    // This is reachable in normal use, not just under memory pressure: the
-+    // wasm build has a 32-bit address space (blink's own GetBitsInAddress-
-+    // Space returns 32 under __EMSCRIPTEN__), so ScaleAddress collapses
-+    // FLAG_automapstart and FLAG_automapend onto the SAME address — the
-+    // automap window is zero bytes wide, the assignment above always
-+    // resets automap to the start, and these never-freed 8 MB stacks pile
-+    // up from a fixed base until FindVirtual can't fit another one
-+    // (~256 forks / ~128 pipelines). Reclaiming them is the real fix; this
-+    // just makes hitting the ceiling honest.
-+    if (new_stack == -1) {
-+      LOGF("Fork: no room in the guest address space for the child's stack; "
-+           "failing the fork instead of sharing the parent's stack");
-+      FreeMachine(m2);
-+      return eagain();
-+    }
-+    {
-+      u8 *copybuf = (u8 *)malloc(copy_bytes);
-+      if (!copybuf) {
-+        LOGF("Fork: couldn't allocate the child's stack copy buffer");
-+        unassert(!FreeVirtual(m->system, new_stack, kStackSize));
-+        FreeMachine(m2);
-+        return eagain();
-+      }
-+      // Same offset within the region for both, so sp/bp-relative frame
-+      // access keeps working after the relocation.
-+      CopyFromUser(m, copybuf, live_from, copy_bytes);
-+      CopyToUser(m2, new_stack + (live_from - stack_bottom), copybuf,
-+                 copy_bytes);
-+      free(copybuf);
-+      Put64(m2->sp, new_stack + (old_sp - stack_bottom));
-+      // Hand this back when the child finishes — see EmForkChildEntry.
-+      m2->em_forkstack = new_stack;
-+    }
++  if (!stack) {
++    // Unreachable in practice: every no-stack fork/vfork (SysFork, SysVfork,
++    // clone(SIGCHLD)) takes the private-address-space branch above, and the
++    // only caller that reaches here — musl's posix_spawn trampoline,
++    // clone(CLONE_VM|CLONE_VFORK, stack, ...) — always supplies a stack.
++    // A shared-memory child with NO private stack would push/pop the
++    // parent's exact stack addresses concurrently (silent corruption, not
++    // a crash — confirmed via lldb in the run-to-completion era). The
++    // live-stack-copy machinery that used to handle this case is deleted
++    // with real fork(); if some new caller ever trips this, fail loudly.
++    LOGF("Fork: clone(CLONE_VM) without a stack is not supported");
++    FreeMachine(m2);
++    return eagain();
 +  }
++  // musl's posix_spawn (Rust's std::process::Command) calls
++  // clone(CLONE_VM|CLONE_VFORK, explicit_stack, ...) with its own
++  // trampoline stack — the guest already gave the child a stack that
++  // doesn't overlap the parent's, nothing more to do.
++  Put64(m2->sp, stack);
 +  m2->em_vfork_child = true;  // ends the sharing on execve — see SysExecve.
 +  if (MvlSchedSpawnWithEntry(m2, EmForkChildEntry, EmDupFdsForChild(m)) != 0) {
 +#ifdef MVL_NATIVE_DEBUG
@@ -1870,7 +1491,7 @@ index 34cc01c..e45c146 100644
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -498,20 +1713,22 @@ static void *OnSpawn(void *arg) {
+@@ -498,20 +1341,22 @@ static void *OnSpawn(void *arg) {
    Blink(m);
  }
  
@@ -1897,7 +1518,7 @@ index 34cc01c..e45c146 100644
    THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
    if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
      LOGF("unsupported clone() signal: %" PRId64, flags & 255);
-@@ -567,6 +1784,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -567,6 +1412,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
    Put64(m2->ax, 0);
    Put64(m2->sp, stack);
    m2->spawn_sigmask = oldss;
@@ -1905,7 +1526,7 @@ index 34cc01c..e45c146 100644
    unassert(!pthread_attr_init(&attr));
    unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
    err = pthread_create(&thread, &attr, OnSpawn, m2);
-@@ -576,6 +1794,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -576,6 +1422,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
      return eagain();
    }
@@ -1924,7 +1545,7 @@ index 34cc01c..e45c146 100644
    if (flags & CLONE_PARENT_SETTID_LINUX) {
      atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
    }
-@@ -601,7 +1831,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -601,7 +1459,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      return enosys();
  #endif
    }
@@ -1933,7 +1554,7 @@ index 34cc01c..e45c146 100644
    return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
  #else
    LOGF("threading support disabled");
-@@ -717,13 +1947,35 @@ static int SysFutexWait(struct Machine *m,  //
+@@ -717,13 +1575,35 @@ static int SysFutexWait(struct Machine *m,  //
      if (Load32(mem) != expect) {
        rc = 0;
      } else {
@@ -1976,7 +1597,7 @@ index 34cc01c..e45c146 100644
        }
      }
      UNLOCK(&f->lock);
-@@ -1306,45 +2558,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
+@@ -1306,45 +2186,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
  static int SysDup1(struct Machine *m, i32 fildes) {
    int lim;
    int oflags;
@@ -2037,7 +1658,7 @@ index 34cc01c..e45c146 100644
 +// fd table may have its OWN, unrelated resource sitting at that exact real
 +// descriptor right now. Always allocate a fresh, private, never-colliding
 +// real descriptor instead (same F_DUPFD_CLOEXEC trick as EmDupFdsForChild/
-+// EmSaveFds) and let the caller record it as the new entry's realfd, while
++// EmDupFdsForChild) and let the caller record it as the new entry's realfd, while
 +// the guest-visible fd keeps exactly the number the guest asked for.
 +static int DupToRealfd(struct Fds *fds, int fildes) {
 +  return VfsFcntl(GetRealFd(fds, fildes), F_DUPFD_CLOEXEC, kMinBlinkFd);
@@ -2060,7 +1681,7 @@ index 34cc01c..e45c146 100644
    if (newfildes < 0) {
      LOGF("dup2() ebadf");
      return ebadf();
-@@ -1352,75 +2620,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
+@@ -1352,75 +2248,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
    if (fildes == newfildes) {
      // no-op system call, but still must validate
      LOCK(&m->system->fds.lock);
@@ -2199,7 +1820,7 @@ index 34cc01c..e45c146 100644
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -2339,19 +3626,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
+@@ -2339,19 +3254,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
  
  static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    i64 rc;
@@ -2225,7 +1846,7 @@ index 34cc01c..e45c146 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2359,7 +3651,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2359,7 +3279,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
@@ -2254,7 +1875,7 @@ index 34cc01c..e45c146 100644
        if (rc != -1) SetWriteAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2371,7 +3683,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2371,7 +3311,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
  
  static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    i64 rc;
@@ -2263,7 +1884,7 @@ index 34cc01c..e45c146 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2381,9 +3693,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2381,9 +3321,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -2275,7 +1896,7 @@ index 34cc01c..e45c146 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2391,7 +3705,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2391,7 +3333,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
@@ -2284,7 +1905,7 @@ index 34cc01c..e45c146 100644
        if (rc != -1) SetReadAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2464,7 +3778,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
+@@ -2464,7 +3406,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
  static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                        i64 offset, i32 flags) {
    i64 rc;
@@ -2293,7 +1914,7 @@ index 34cc01c..e45c146 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*readv_impl)(int, const struct iovec *, int);
-@@ -2478,9 +3792,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2478,9 +3420,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(readv_impl = fd->cb->readv);
      oflags = fd->oflags;
@@ -2305,7 +1926,7 @@ index 34cc01c..e45c146 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2490,13 +3806,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2490,13 +3434,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -2321,7 +1942,7 @@ index 34cc01c..e45c146 100644
          }
        } else {
          rc = 0;
-@@ -2512,7 +3828,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2512,7 +3456,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                         i64 offset, i32 flags) {
    i64 rc;
@@ -2330,7 +1951,7 @@ index 34cc01c..e45c146 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2526,9 +3842,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2526,9 +3470,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -2342,7 +1963,7 @@ index 34cc01c..e45c146 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2538,14 +3856,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2538,14 +3484,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -2359,7 +1980,7 @@ index 34cc01c..e45c146 100644
          }
        } else {
          rc = 0;
-@@ -2559,6 +3877,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2559,6 +3505,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  }
  
  static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
@@ -2369,7 +1990,7 @@ index 34cc01c..e45c146 100644
    return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
  }
  
-@@ -2652,9 +3973,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+@@ -2652,9 +3601,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
    struct dirent *ent;
    struct dirent_linux rec;
    if (size < sizeof(rec) - sizeof(rec.name)) return einval();
@@ -2387,7 +2008,7 @@ index 34cc01c..e45c146 100644
    if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
      return -1;
    }
-@@ -2743,7 +4071,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
+@@ -2743,7 +3699,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
    if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
    if (!(fd = GetAndLockFd(m, fildes))) return -1;
    if (!fd->dirstream) {
@@ -2396,7 +2017,7 @@ index 34cc01c..e45c146 100644
    } else if (whence == SEEK_SET_LINUX) {
      if (!offset) {
        VfsRewinddir(fd->dirstream);
-@@ -2806,10 +4134,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
+@@ -2806,10 +3762,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
  }
  
  static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
@@ -2412,7 +2033,7 @@ index 34cc01c..e45c146 100644
      XlatStatToLinux(&gst, &st);
      if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
    }
-@@ -3253,7 +4584,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3253,7 +4212,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
      rc = UnXlatOpenFlags(fd->oflags);
    } else if (cmd == F_SETFD_LINUX) {
      if (!(arg & ~FD_CLOEXEC_LINUX)) {
@@ -2421,7 +2042,7 @@ index 34cc01c..e45c146 100644
          fd->oflags &= ~O_CLOEXEC;
          if (arg) fd->oflags |= O_CLOEXEC;
          rc = 0;
-@@ -3266,7 +4597,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3266,7 +4225,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
    } else if (cmd == F_SETFL_LINUX) {
      fl = XlatOpenFlags(arg & (O_APPEND_LINUX | O_ASYNC_LINUX | O_DIRECT_LINUX |
                                O_NOATIME_LINUX | O_NDELAY_LINUX));
@@ -2430,7 +2051,7 @@ index 34cc01c..e45c146 100644
        fd->oflags &= ~SETFL_FLAGS;
        fd->oflags |= fl;
        rc = 0;
-@@ -3526,6 +4857,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -3526,6 +4485,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -2438,7 +2059,7 @@ index 34cc01c..e45c146 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +4959,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4587,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -2587,7 +2208,7 @@ index 34cc01c..e45c146 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
-@@ -3922,6 +5396,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+@@ -3922,6 +5024,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
    for (;;) {
      if (CompareTime(now, deadline) >= 0) return 0;
      ts = SubtractTime(deadline, now);
@@ -2606,7 +2227,7 @@ index 34cc01c..e45c146 100644
      if (nanosleep(&ts, 0)) {
        unassert(errno == EINTR);
        // this may run a guest signal handler before returning
-@@ -5620,6 +7106,20 @@ void OpSyscall(P) {
+@@ -5620,6 +6734,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -2627,7 +2248,7 @@ index 34cc01c..e45c146 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +7220,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6848,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);
