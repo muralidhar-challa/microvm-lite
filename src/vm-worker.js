@@ -166,7 +166,10 @@ self.Module = {
     function mkdirp(p) { try { FS.mkdir(p); } catch (e) { /* EEXIST */ } }
     mkdirp("/root"); mkdirp("/bin"); mkdirp("/lib"); mkdirp("/etc"); mkdirp("/tmp");
     mkdirpDeep(HOME);
-    ENV["HOME"] = HOME; ENV["PATH"] = "/bin:/root"; ENV["TERM"] = "xterm";
+    // /usr/bin: where the guest-userland closure (sqlite3, jq, lua5.4,
+    // poppler-utils — build-guest-userland.sh) installs, matching real
+    // FHS layout. Without it those tools only run via absolute path.
+    ENV["HOME"] = HOME; ENV["PATH"] = "/bin:/usr/bin:/root"; ENV["TERM"] = "xterm";
     ENV["WORKDIR"] = HOME;
 
     // DNS seed from the configured routes (product-agnostic — VM_ROUTES is built

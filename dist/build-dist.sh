@@ -44,7 +44,7 @@ cp -L "$WASM/toybox"  "$OUT/bin/toybox"       # 0BSD coreutils
 
 echo "[3/3] Hash + emit manifest.json"
 DASH_APPLETS='["sh","bash"]'
-TOYBOX_APPLETS='["ls","cat","sed","awk","grep","find","head","tail","cp","mv","rm","mkdir","rmdir","touch","echo","printf","wc","sort","uniq","cut","tr","xargs","env","pwd","id","wget","chmod","stat","du","df","diff","md5sum","tar","gzip","gunzip","base64","sleep","seq","yes","date","sync","kill","true","false"]'
+TOYBOX_APPLETS='["ls","cat","sed","awk","grep","egrep","fgrep","find","head","tail","cp","mv","rm","mkdir","rmdir","touch","echo","printf","wc","sort","uniq","cut","tr","xargs","env","pwd","id","wget","chmod","stat","du","df","diff","md5sum","sha256sum","tar","gzip","gunzip","base64","sleep","seq","yes","date","sync","kill","true","false","which","uuidgen","ps","whoami","hostname","uname","mktemp","basename","dirname","readlink","realpath","nl","rev","tac","timeout","nproc","free","pgrep","pkill","tee","od","xxd","comm","split","fold","expand","link","unlink","mkfifo","nohup","logname","groups","cksum","factor"]'
 HOME_DIR="/workspace"
 
 python3 - "$OUT" "$DASH_APPLETS" "$TOYBOX_APPLETS" "$HOME_DIR" <<'PY'
