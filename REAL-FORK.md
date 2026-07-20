@@ -138,38 +138,63 @@ non-RW page sets `SEGV_ACCERR` and faults), so COW is reachable:
 Requires host-page refcounting, which the current allocator does not have —
 which is exactly why Step 1 comes first.
 
-## Where the first attempt stopped (bookmark)
+## How it landed (post-mortem of the bookmark)
 
-Branch `wip/real-fork`. Compiles; `Fork()` branches correctly
-(`FORK flags=0 stack=0 -> PRIVATE`); `EmForkPrivate` is entered
-(`FORKENTER tid=42`). It then dies on the **first page it tries to copy**:
+The bookmark's diagnosis ("dies writing into read-only .text") turned out to
+be WRONG — a reasonable inference from where the log stopped, but not the
+mechanism. Three real bugs, found in order once the read-only pages were
+shared instead of copied:
 
-    copying page #1 virt=400000 entry=60000000004c05
+1. **`NewSystem()` does not create the page-table root.** Only `LoadProgram`
+   (loader.c) ever allocates `cr3`. `EmForkPrivate`'s fresh System had
+   `cr3 = 0`, and under wasm walking page tables from root 0 is not a trap —
+   `GetPageAddress` returns a near-NULL host pointer and every
+   `StorePte`/`ReserveVirtual` silently corrupts the bottom of wasm linear
+   memory until something unrelated falls over. This, not the read-only-page
+   write, is what killed the first attempt on "page #1". Fix: mirror
+   LoadProgram — `s2->cr3 = AllocatePageTable(s2)` (plus cr0) right after
+   `NewSystem`.
 
-`virt=0x400000` is dash's ELF load address and the entry decodes to
-PAGE_V | PAGE_U | PAGE_HOST | PAGE_MAP | PAGE_MUG | PAGE_FILE with
-**PAGE_RW clear** — i.e. the read-only, file-backed, host-mmapped `.text`
-segment. `EmCopyAsCb` reserves it writable and `CopyToUser`s into it, which
-is precisely what EmSaveMemCb documents as fatal:
+2. **`FreeMachine()` already frees an orphan's System.** It dll_removes the
+   machine and, when the list empties — always, for a real-fork child —
+   calls `FreeSystem` itself. The child-exit teardown (and both fork failure
+   paths) called `FreeSystem` again: double `DestroyFds`, double `free(s)`.
+   Eight child exits of that corrupted the C heap enough to kill dash
+   itself; the test signature was "first two pipelines pass, then the VM
+   dies for good". Fix: `EmCloseAllFds(s)` (real fds must close — that is
+   the pipe-EOF mechanism) then `FreeMachine(m)` ALONE.
 
-> restoring INTO a genuinely read-only host page (e.g. after a real host
-> mmap(PROT_READ|PROT_EXEC) for the executable's file-backed .text) is an
-> actual SIGSEGV/SIGBUS — confirmed via lldb
+3. **Read-only pages are shared, not copied** — `EmCopyAsCb` branches on
+   `entry & PAGE_RW`: writable pages are copied via
+   ReserveVirtual+CopyToUser as before; read-only ones get the parent's
+   leaf PTE installed verbatim (`EmInstallSharedLeaf`) with a new
+   **`PAGE_NOOWN`** flag (spare PTE bit 0x10, `__EMSCRIPTEN__` only).
+   `FreePage()` sees NOOWN and drops only its accounting — never
+   Munmaps/recycles backing it doesn't own — while still reporting
+   exec-page invalidation so an in-place execve at the same load address
+   can't execute stale decoded instructions. NOOWN is only applied when
+   the entry has real backing to alias (`PAGE_HOST`); bare anonymous
+   reservations stay untagged, since `HandlePageFault` preserves flags on
+   materialize and a tagged child-owned page would leak at teardown.
 
-So the approach is wrong for that page class, and it is the first page every
-fork touches.
+Per-fork cost measured: **2098 pages walked, 44 shared, 8 pages
+byte-copied (32 KB)** — the rest are dash's stack-region reservations,
+recreated as reservations. ~4 ms/fork in practice: the 60-iteration
+gate loop (120 pipelines, 266 forks) completes in ~1 s total, versus
+~0.5 s per command before — the old latency was the pipe retry loops
+that real EOF removed.
 
-**Next step:** don't copy read-only pages at all — SHARE them, which is what
-real COW fork does and what EmSaveMemCb already concluded (they cannot
-diverge without an mprotect neither dash nor toybox issues). Branch
-`EmCopyAsCb` on `entry & PAGE_RW`: copy writable pages as it does now,
-install the parent's PTE directly for read-only ones. The one hazard to
-resolve is teardown — `FreeSystem` on the child must not free a host page
-the parent still owns, so shared pages need a refcount or an exclusion from
-the child's FreeHostPages.
+Gate results (2026-07-20): realfork-test.mjs ALL GREEN — the cold-VM
+`seq 1 5 | head -2` case, all previously-poisoning cases, 0/60 loop
+failures, 266/266 clean forks. contract 17/17, dist-smoke 5/5,
+guest-userland 10/10 (incl. sqlite3-via-piped-stdin and jq-via-pipe as
+hard assertions). stress: zero errors, drift ≤1.09×, heap 73→87.6 MB
+plateau (the vfork-era model peaked at 540 MB on this profile); its 68
+"integrity failures" are the reference dist lacking sqlite3/full wget —
+pre-existing, unrelated, and themselves evidence of forks working (dash
+fork+execs and reports `sqlite3: not found` cleanly).
 
-Two workaround conflicts were found and are already fixed in this WIP; both
-were silent and both are worth keeping regardless of how the copy is done:
+Two workaround conflicts found earlier in the WIP remain fixed and load-bearing:
 
 - `SysExitGroup` gated only on `em_vfork_child`, so a real-fork child fell
   through to KillOtherThreads/exit() and never stashed a status for

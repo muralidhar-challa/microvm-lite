@@ -409,10 +409,23 @@ index ad309eb..fc53cca 100644
    int sig;
    RestoreIp(m);
 diff --git a/blink/machine.h b/blink/machine.h
-index be17a8a..bb18a27 100644
+index be17a8a..debd6a6 100644
 --- a/blink/machine.h
 +++ b/blink/machine.h
-@@ -449,6 +449,25 @@ struct Machine {               //
+@@ -97,6 +97,12 @@
+ #define PAGE_RSRV  0x0000000000000200  // PAGE_TA bits havent been chosen yet
+ #define PAGE_HOST  0x0000000000000400  // PAGE_TA bits point to system memory
+ #define PAGE_MAP   0x0000000000000800  // PAGE_TA bits are a linear host mmap
++// Real fork() (REAL-FORK.md, __EMSCRIPTEN__ only): set on a leaf PTE that
++// ALIASES another System's host page rather than owning it — installed by
++// EmCopyAsCb for read-only pages it shares instead of copies. FreePage()
++// must not Munmap/recycle the backing memory for such a PTE; only the
++// System that originally reserved it may free it.
++#define PAGE_NOOWN 0x0000000000000010
+ #define PAGE_TA    0x0000fffffffff000  // bits used for host, or real address
+ #define PAGE_GROW  0x0010000000000000  // for future support of MAP_GROWSDOWN
+ #define PAGE_MUG   0x0020000000000000  // host page magic mapped individually
+@@ -449,6 +455,25 @@ struct Machine {               //
    sigset_t spawn_sigmask;                //
    struct Dll elem;                       //
    struct SmcQueue smcqueue;              //
@@ -438,7 +451,7 @@ index be17a8a..bb18a27 100644
    struct OpCache opcache[1];             //
  };  //
  
-@@ -466,6 +485,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
+@@ -466,6 +491,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
  i64 AreAllPagesUnlocked(struct System *) nosideeffect;
  bool IsOrphan(struct Machine *) nosideeffect;
  _Noreturn void Blink(struct Machine *);
@@ -448,6 +461,43 @@ index be17a8a..bb18a27 100644
  _Noreturn void Actor(struct Machine *);
  void Jitter(P, const char *, ...);
  void FreeMachine(struct Machine *);
+diff --git a/blink/memorymalloc.c b/blink/memorymalloc.c
+index 7d5cc93..2fe6061 100644
+--- a/blink/memorymalloc.c
++++ b/blink/memorymalloc.c
+@@ -627,6 +627,32 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
+   u8 *page;
+   long pagesize;
+   unassert(entry & PAGE_V);
++#ifdef __EMSCRIPTEN__
++  if (entry & PAGE_NOOWN) {
++    // Real fork() shared read-only page (REAL-FORK.md): this System never
++    // owned the backing memory, it only aliased another System's PTE, so
++    // there is nothing here to Munmap/recycle — just drop our accounting.
++    // PAGE_FILE is deliberately left alone: this System's s->filemaps was
++    // never populated for this virt (EmCopyAsCb installs the leaf directly,
++    // bypassing AddFileMapViaMap), so UnmarkFilePage would be a no-op scan
++    // anyway; skipping the whole block just avoids that pointless walk.
++    // Exec-page invalidation must STILL be reported: an in-place execve
++    // (SysExecve's normal path, which a real-fork child now takes) unmaps
++    // shared .text and loads a new binary at possibly the same addresses —
++    // without this flag InvalidateSystem never tells machines to drop their
++    // stale decoded instructions.
++    if (!(entry & PAGE_XD) && !(entry & PAGE_RSRV)) {
++      *executable_code_was_made_non_executable = true;
++    }
++    if (entry & PAGE_RSRV) {
++      s->memstat.reserved -= 1;
++    } else {
++      s->memstat.committed -= 1;
++      --*rss_delta;
++    }
++    return false;
++  }
++#endif
+   if (entry & PAGE_FILE) UnmarkFilePage(s, virt);
+   if (!(entry & PAGE_XD) && !(entry & PAGE_RSRV)) {
+     *executable_code_was_made_non_executable = true;
 diff --git a/blink/open.c b/blink/open.c
 index f717c07..e92247a 100644
 --- a/blink/open.c
@@ -553,7 +603,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..fbcf8de 100644
+index 34cc01c..89a48bf 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -649,7 +699,7 @@ index 34cc01c..fbcf8de 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +534,1134 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +534,1205 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -835,13 +885,46 @@ index 34cc01c..fbcf8de 100644
 +  fclose(f);
 +}
 +
++// Install ENTRY — a fully-formed leaf PTE value read from another System —
++// into DST at VIRT, creating intermediate page-table levels as needed.
++// Mirrors ReserveVirtual's intermediate-table walk (memorymalloc.c) but
++// stores a caller-supplied entry at the leaf instead of allocating fresh
++// backing memory. Caller must OR PAGE_NOOWN into entry first, so FreePage()
++// never frees memory this System doesn't own (REAL-FORK.md).
++static bool EmInstallSharedLeaf(struct System *s, i64 virt, u64 entry) {
++  u8 *mi;
++  u64 pt;
++  i64 level, ti;
++  for (pt = s->cr3, level = 39; level >= 12; level -= 9) {
++    ti = (virt >> level) & 511;
++    mi = GetPageAddress(s, pt, level == 39) + ti * 8;
++    if (level > 12) {
++      pt = LoadPte(mi);
++      if (!(pt & PAGE_V)) {
++        if ((pt = AllocatePageTable(s)) == -1) return false;
++        StorePte(mi, pt);
++      }
++      continue;
++    }
++    StorePte(mi, entry);
++    return true;
++  }
++  return false;  // unreachable: the loop above always hits level==12
++}
++
 +// Real fork(): duplicate the parent's address space into the child's own
 +// System, so the child's writes are genuinely private (REAL-FORK.md).
 +// Reuses EmWalkLeaves, and EmSaveMemCb's proven insight below about which
-+// pages can be shared vs. must be copied.
++// pages can be shared vs. must be copied: read-only pages (.text and
++// friends) can never diverge without an mprotect() neither dash nor toybox
++// issues, so they're SHARED (PTE aliased, PAGE_NOOWN-tagged) rather than
++// copied — which is also what makes this safe: writing into a genuinely
++// read-only host page is a real SIGSEGV (EmSaveMemCb), so copying them by
++// reserving-writable-then-restoring-read-only was never going to work.
 +struct EmCopyAsCtx {
 +  struct Machine *dst;  // child machine; CopyToUser walks ITS page tables
 +  long npages;          // instrumentation: pages recreated
++  long nshared;         // instrumentation: pages shared instead of copied
 +  long nbytes;          // instrumentation: bytes actually copied
 +  bool failed;
 +};
@@ -851,10 +934,38 @@ index 34cc01c..fbcf8de 100644
 +  u8 *host;
 +  (void)mi;
 +  if (cx->failed) return;
-+  // Reserve WRITABLE regardless of the parent's protection, so the content
-+  // copy below can materialize the page; the parent's real protection is
-+  // reapplied at the bottom. (Writing into a genuinely read-only host page
-+  // is a real SIGSEGV — see EmSaveMemCb.)
++  if (!(entry & PAGE_RW)) {
++    // Read-only in the parent: share the exact same backing. PAGE_NOOWN only
++    // when there IS backing to alias (PAGE_HOST): a bare anonymous
++    // reservation has none, and must not be tagged — HandlePageFault
++    // preserves every flag but PAGE_TA/PAGE_RSRV when it materializes, so a
++    // tagged reservation would become a materialized page FreePage refuses
++    // to recycle even though the child allocated (owns) it.
++    u64 tag = (entry & PAGE_HOST) ? PAGE_NOOWN : 0;
++    if (!EmInstallSharedLeaf(cx->dst->system, virt, entry | tag)) {
++      MvlForkLog("COPYFAIL share virt=%llx entry=%llx npages=%ld\n",
++                 (unsigned long long)virt, (unsigned long long)entry,
++                 cx->npages);
++      cx->failed = true;
++      return;
++    }
++    if (entry & PAGE_RSRV) {
++      cx->dst->system->memstat.reserved += 1;
++    } else {
++      cx->dst->system->memstat.committed += 1;
++    }
++    cx->dst->system->vss += 1;
++    if (!(entry & PAGE_RSRV)) cx->dst->system->rss += 1;
++    cx->npages++;
++    cx->nshared++;
++    if ((cx->npages % 64) == 1) {
++      MvlForkLog("  sharing page #%ld virt=%llx entry=%llx\n", cx->npages,
++                 (unsigned long long)virt, (unsigned long long)entry);
++    }
++    return;
++  }
++  // Writable in the parent: it CAN diverge, so it must be a private copy.
++  // Reserve WRITABLE and copy the bytes in.
 +  if (ReserveVirtual(cx->dst->system, virt, 4096,
 +                     PAGE_U | PAGE_RW | (entry & PAGE_XD), -1, 0, false,
 +                     true) == -1) {
@@ -883,13 +994,6 @@ index 34cc01c..fbcf8de 100644
 +  }
 +  // else: the parent holds only a reservation here, so the child keeps one
 +  // too and its first touch still sees zeros — matching fork().
-+  if (!(entry & PAGE_RW)) {
-+    // Parent's page was read-only (.text and friends). Restore that in the
-+    // child now that its content is in place. Safe to mutate the CHILD's
-+    // tables here: EmWalkLeaves is iterating the PARENT's.
-+    ProtectVirtual(cx->dst->system, virt, 4096,
-+                   PROT_READ | ((entry & PAGE_XD) ? 0 : PROT_EXEC), false);
-+  }
 +}
 +
 +static void EmSaveMemCb(void *arg, i64 virt, u64 entry, u8 *mi) {
@@ -1219,12 +1323,18 @@ index 34cc01c..fbcf8de 100644
 +  // (REAL-FORK.md). Do it BEFORE handing control away — after
 +  // MvlSchedThreadExitAndYield this fiber never runs again.
 +  if (m->em_own_system) {
-+    struct System *s = m->system;
-+    EmCloseAllFds(s);
-+    dll_remove(&s->machines, &m->elem);  // FreeSystem asserts this is empty
-+    FreeMachine(m);
-+    FreeSystem(s);
-+    g_machine = 0;  // this Machine is gone; don't leave a dangling pointer
++    // FreeMachine alone is the whole teardown: it dll_removes m from
++    // s->machines itself, and — because a real-fork child is always its
++    // System's only machine — takes the orphan branch and calls
++    // FreeSystem(s) too. Removing from the list or calling FreeSystem here
++    // as well is a DOUBLE free of the System (double DestroyFds, double
++    // free(s)); eight child exits of that corrupted the C heap enough to
++    // kill dash itself. EmCloseAllFds must still run first: FreeSystem's
++    // DestroyFds only frees the structs, never the dup'd host fds, and a
++    // closed write end is what gives the pipe reader its EOF.
++    EmCloseAllFds(m->system);
++    FreeMachine(m);  // orphan branch frees the System as well
++    g_machine = 0;   // this Machine is gone; don't leave a dangling pointer
 +  }
 +  MvlSchedThreadExitAndYield();
 +}
@@ -1253,6 +1363,18 @@ index 34cc01c..fbcf8de 100644
 +  memcpy(s2->rlim, m->system->rlim, sizeof(s2->rlim));
 +  s2->automap = m->system->automap;
 +  s2->brk = m->system->brk;
++  // NewSystem does NOT create the page-table root — only LoadProgram
++  // (loader.c) ever does. Without this, every walk below starts at cr3=0,
++  // and under wasm that's not a trap but a silent walk through the bottom
++  // of the linear memory: EmInstallSharedLeaf/ReserveVirtual "succeed"
++  // while corrupting the heap. Mirror LoadProgram's setup.
++  s2->cr0 = m->system->cr0;
++  s2->cr3 = AllocatePageTable(s2);
++  if (s2->cr3 == (u64)-1) {
++    MvlForkLog("FORKFAIL AllocatePageTable\n");
++    FreeSystem(s2);
++    return 0;
++  }
 +  if (!(m2 = NewMachine(s2, 0))) {
 +    MvlForkLog("FORKFAIL NewMachine\n");
 +    FreeSystem(s2);
@@ -1261,11 +1383,11 @@ index 34cc01c..fbcf8de 100644
 +  memset(&cx, 0, sizeof(cx));
 +  cx.dst = m2;
 +  EmWalkLeaves(m->system, EmCopyAsCb, &cx);
-+  MvlForkLog("COPYDONE npages=%ld nbytes=%ld failed=%d\n", cx.npages, cx.nbytes,
-+             (int)cx.failed);
++  MvlForkLog("COPYDONE npages=%ld nshared=%ld nbytes=%ld failed=%d\n",
++             cx.npages, cx.nshared, cx.nbytes, (int)cx.failed);
 +  if (cx.failed) {
-+    FreeMachine(m2);
-+    FreeSystem(s2);
++    FreeMachine(m2);  // orphan branch frees s2 too — a second FreeSystem here
++                      // would be the same double free fixed in EmForkChildEntry
 +    enomem();
 +    return 0;
 +  }
@@ -1341,9 +1463,8 @@ index 34cc01c..fbcf8de 100644
 +  if (!stack && !(flags & CLONE_VM_LINUX)) {
 +    if (!(m2 = EmForkPrivate(m))) return eagain();
 +    if (MvlSchedSpawnOwnSystem(m2, EmForkChildEntry) != 0) {
-+      struct System *s2 = m2->system;
-+      FreeMachine(m2);
-+      FreeSystem(s2);
++      EmCloseAllFds(m2->system);  // DestroyFds would leak the dup'd host fds
++      FreeMachine(m2);  // orphan branch frees the System too — no FreeSystem here
 +      return eagain();
 +    }
 +    THR_LOGF("pid=%d Fork (wasm, private) -> child_pid=%d", m->system->pid,
@@ -1784,7 +1905,7 @@ index 34cc01c..fbcf8de 100644
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -498,20 +1677,22 @@ static void *OnSpawn(void *arg) {
+@@ -498,20 +1748,22 @@ static void *OnSpawn(void *arg) {
    Blink(m);
  }
  
@@ -1811,7 +1932,7 @@ index 34cc01c..fbcf8de 100644
    THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
    if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
      LOGF("unsupported clone() signal: %" PRId64, flags & 255);
-@@ -567,6 +1748,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -567,6 +1819,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
    Put64(m2->ax, 0);
    Put64(m2->sp, stack);
    m2->spawn_sigmask = oldss;
@@ -1819,7 +1940,7 @@ index 34cc01c..fbcf8de 100644
    unassert(!pthread_attr_init(&attr));
    unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
    err = pthread_create(&thread, &attr, OnSpawn, m2);
-@@ -576,6 +1758,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -576,6 +1829,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
      return eagain();
    }
@@ -1838,7 +1959,7 @@ index 34cc01c..fbcf8de 100644
    if (flags & CLONE_PARENT_SETTID_LINUX) {
      atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
    }
-@@ -601,7 +1795,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -601,7 +1866,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      return enosys();
  #endif
    }
@@ -1847,7 +1968,7 @@ index 34cc01c..fbcf8de 100644
    return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
  #else
    LOGF("threading support disabled");
-@@ -717,13 +1911,35 @@ static int SysFutexWait(struct Machine *m,  //
+@@ -717,13 +1982,35 @@ static int SysFutexWait(struct Machine *m,  //
      if (Load32(mem) != expect) {
        rc = 0;
      } else {
@@ -1890,7 +2011,7 @@ index 34cc01c..fbcf8de 100644
        }
      }
      UNLOCK(&f->lock);
-@@ -1306,45 +2522,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
+@@ -1306,45 +2593,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
  static int SysDup1(struct Machine *m, i32 fildes) {
    int lim;
    int oflags;
@@ -1974,7 +2095,7 @@ index 34cc01c..fbcf8de 100644
    if (newfildes < 0) {
      LOGF("dup2() ebadf");
      return ebadf();
-@@ -1352,75 +2584,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
+@@ -1352,75 +2655,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
    if (fildes == newfildes) {
      // no-op system call, but still must validate
      LOCK(&m->system->fds.lock);
@@ -2113,7 +2234,7 @@ index 34cc01c..fbcf8de 100644
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -2339,19 +3590,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
+@@ -2339,19 +3661,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
  
  static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    i64 rc;
@@ -2139,7 +2260,7 @@ index 34cc01c..fbcf8de 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2359,7 +3615,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2359,7 +3686,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
@@ -2168,7 +2289,7 @@ index 34cc01c..fbcf8de 100644
        if (rc != -1) SetWriteAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2371,7 +3647,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2371,7 +3718,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
  
  static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    i64 rc;
@@ -2177,7 +2298,7 @@ index 34cc01c..fbcf8de 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2381,9 +3657,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2381,9 +3728,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -2189,7 +2310,7 @@ index 34cc01c..fbcf8de 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2391,7 +3669,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2391,7 +3740,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
@@ -2198,7 +2319,7 @@ index 34cc01c..fbcf8de 100644
        if (rc != -1) SetReadAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2464,7 +3742,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
+@@ -2464,7 +3813,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
  static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                        i64 offset, i32 flags) {
    i64 rc;
@@ -2207,7 +2328,7 @@ index 34cc01c..fbcf8de 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*readv_impl)(int, const struct iovec *, int);
-@@ -2478,9 +3756,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2478,9 +3827,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(readv_impl = fd->cb->readv);
      oflags = fd->oflags;
@@ -2219,7 +2340,7 @@ index 34cc01c..fbcf8de 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2490,13 +3770,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2490,13 +3841,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -2235,7 +2356,7 @@ index 34cc01c..fbcf8de 100644
          }
        } else {
          rc = 0;
-@@ -2512,7 +3792,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2512,7 +3863,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                         i64 offset, i32 flags) {
    i64 rc;
@@ -2244,7 +2365,7 @@ index 34cc01c..fbcf8de 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2526,9 +3806,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2526,9 +3877,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -2256,7 +2377,7 @@ index 34cc01c..fbcf8de 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2538,14 +3820,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2538,14 +3891,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -2273,7 +2394,7 @@ index 34cc01c..fbcf8de 100644
          }
        } else {
          rc = 0;
-@@ -2559,6 +3841,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2559,6 +3912,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  }
  
  static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
@@ -2283,7 +2404,7 @@ index 34cc01c..fbcf8de 100644
    return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
  }
  
-@@ -2652,9 +3937,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+@@ -2652,9 +4008,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
    struct dirent *ent;
    struct dirent_linux rec;
    if (size < sizeof(rec) - sizeof(rec.name)) return einval();
@@ -2301,7 +2422,7 @@ index 34cc01c..fbcf8de 100644
    if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
      return -1;
    }
-@@ -2743,7 +4035,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
+@@ -2743,7 +4106,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
    if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
    if (!(fd = GetAndLockFd(m, fildes))) return -1;
    if (!fd->dirstream) {
@@ -2310,7 +2431,7 @@ index 34cc01c..fbcf8de 100644
    } else if (whence == SEEK_SET_LINUX) {
      if (!offset) {
        VfsRewinddir(fd->dirstream);
-@@ -2806,10 +4098,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
+@@ -2806,10 +4169,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
  }
  
  static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
@@ -2326,7 +2447,7 @@ index 34cc01c..fbcf8de 100644
      XlatStatToLinux(&gst, &st);
      if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
    }
-@@ -3253,7 +4548,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3253,7 +4619,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
      rc = UnXlatOpenFlags(fd->oflags);
    } else if (cmd == F_SETFD_LINUX) {
      if (!(arg & ~FD_CLOEXEC_LINUX)) {
@@ -2335,7 +2456,7 @@ index 34cc01c..fbcf8de 100644
          fd->oflags &= ~O_CLOEXEC;
          if (arg) fd->oflags |= O_CLOEXEC;
          rc = 0;
-@@ -3266,7 +4561,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3266,7 +4632,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
    } else if (cmd == F_SETFL_LINUX) {
      fl = XlatOpenFlags(arg & (O_APPEND_LINUX | O_ASYNC_LINUX | O_DIRECT_LINUX |
                                O_NOATIME_LINUX | O_NDELAY_LINUX));
@@ -2344,7 +2465,7 @@ index 34cc01c..fbcf8de 100644
        fd->oflags &= ~SETFL_FLAGS;
        fd->oflags |= fl;
        rc = 0;
-@@ -3526,6 +4821,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -3526,6 +4892,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -2352,7 +2473,7 @@ index 34cc01c..fbcf8de 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +4923,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4994,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -2501,7 +2622,7 @@ index 34cc01c..fbcf8de 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
-@@ -3922,6 +5360,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+@@ -3922,6 +5431,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
    for (;;) {
      if (CompareTime(now, deadline) >= 0) return 0;
      ts = SubtractTime(deadline, now);
@@ -2520,7 +2641,7 @@ index 34cc01c..fbcf8de 100644
      if (nanosleep(&ts, 0)) {
        unassert(errno == EINTR);
        // this may run a guest signal handler before returning
-@@ -5620,6 +7070,20 @@ void OpSyscall(P) {
+@@ -5620,6 +7141,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -2541,7 +2662,7 @@ index 34cc01c..fbcf8de 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +7184,9 @@ void OpSyscall(P) {
+@@ -5720,6 +7255,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);
