@@ -138,6 +138,45 @@ non-RW page sets `SEGV_ACCERR` and faults), so COW is reachable:
 Requires host-page refcounting, which the current allocator does not have —
 which is exactly why Step 1 comes first.
 
+## Where the first attempt stopped (bookmark)
+
+Branch `wip/real-fork`. Compiles; `Fork()` branches correctly
+(`FORK flags=0 stack=0 -> PRIVATE`); `EmForkPrivate` is entered
+(`FORKENTER tid=42`). It then dies on the **first page it tries to copy**:
+
+    copying page #1 virt=400000 entry=60000000004c05
+
+`virt=0x400000` is dash's ELF load address and the entry decodes to
+PAGE_V | PAGE_U | PAGE_HOST | PAGE_MAP | PAGE_MUG | PAGE_FILE with
+**PAGE_RW clear** — i.e. the read-only, file-backed, host-mmapped `.text`
+segment. `EmCopyAsCb` reserves it writable and `CopyToUser`s into it, which
+is precisely what EmSaveMemCb documents as fatal:
+
+> restoring INTO a genuinely read-only host page (e.g. after a real host
+> mmap(PROT_READ|PROT_EXEC) for the executable's file-backed .text) is an
+> actual SIGSEGV/SIGBUS — confirmed via lldb
+
+So the approach is wrong for that page class, and it is the first page every
+fork touches.
+
+**Next step:** don't copy read-only pages at all — SHARE them, which is what
+real COW fork does and what EmSaveMemCb already concluded (they cannot
+diverge without an mprotect neither dash nor toybox issues). Branch
+`EmCopyAsCb` on `entry & PAGE_RW`: copy writable pages as it does now,
+install the parent's PTE directly for read-only ones. The one hazard to
+resolve is teardown — `FreeSystem` on the child must not free a host page
+the parent still owns, so shared pages need a refcount or an exclusion from
+the child's FreeHostPages.
+
+Two workaround conflicts were found and are already fixed in this WIP; both
+were silent and both are worth keeping regardless of how the copy is done:
+
+- `SysExitGroup` gated only on `em_vfork_child`, so a real-fork child fell
+  through to KillOtherThreads/exit() and never stashed a status for
+  SysWait4 — every pipeline returned "".
+- `memcpy(m2, m, sizeof(*m2))` inherited the parent's `em_forkstack`, so the
+  child would have freed the PARENT's stack while the parent was still on it.
+
 ## Verification
 
 - `seq 1 5 | head -2` on a **cold** VM, followed by `echo hi | cat`: the
