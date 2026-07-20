@@ -383,10 +383,10 @@ index ad309eb..fc53cca 100644
    int sig;
    RestoreIp(m);
 diff --git a/blink/machine.h b/blink/machine.h
-index be17a8a..a8e3e80 100644
+index be17a8a..32377b1 100644
 --- a/blink/machine.h
 +++ b/blink/machine.h
-@@ -449,6 +449,14 @@ struct Machine {               //
+@@ -449,6 +449,21 @@ struct Machine {               //
    sigset_t spawn_sigmask;                //
    struct Dll elem;                       //
    struct SmcQueue smcqueue;              //
@@ -397,11 +397,18 @@ index be17a8a..a8e3e80 100644
 +  // vfork() gives us — but instead run the new program in a FRESH machine,
 +  // matching real vfork()'s separate-address-space-at-exec semantics.
 +  bool em_vfork_child;
++  // The private guest stack Fork() reserved for this scheduled fork child
++  // (0 when it didn't reserve one — an explicit-stack clone, or the parent).
++  // Recorded so EmForkChildEntry can hand the address space back when the
++  // child finishes. Without this, every fork permanently consumed 8 MB of a
++  // 32-bit guest address space whose automap window is zero bytes wide (see
++  // Fork()), so a VM died after ~54 pipelines and never recovered.
++  i64 em_forkstack;
 +#endif
    struct OpCache opcache[1];             //
  };  //
  
-@@ -466,6 +474,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
+@@ -466,6 +481,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
  i64 AreAllPagesUnlocked(struct System *) nosideeffect;
  bool IsOrphan(struct Machine *) nosideeffect;
  _Noreturn void Blink(struct Machine *);
@@ -516,7 +523,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..05bab72 100644
+index 34cc01c..44b6ab4 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -606,7 +613,7 @@ index 34cc01c..05bab72 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +528,894 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +528,938 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -1089,6 +1096,21 @@ index 34cc01c..05bab72 100644
 +  }
 +  // Else: SysExitGroup's own em_vfork_child branch already stashed status
 +  // directly before calling HaltMachine — nothing more to do here.
++  //
++  // Give the child's private guest stack back to the shared address space.
++  // Safe here: the guest is done executing (Actor() only returns via the
++  // siglongjmp above, and this function runs on the HOST fiber stack, not
++  // the guest stack being freed), and nothing can resume this Machine —
++  // MvlSchedThreadExitAndYield below unlinks the fiber for good.
++  //
++  // Without this, the ceiling was TOTAL forks ever run; with it, the
++  // ceiling is CONCURRENT forks, which for a shell pipeline is 2-3. The
++  // window is only zero bytes wide (see Fork()), so reuse is what makes
++  // long sessions possible at all.
++  if (m->em_forkstack) {
++    unassert(!FreeVirtual(m->system, m->em_forkstack, kStackSize));
++    m->em_forkstack = 0;
++  }
 +  MvlSchedThreadExitAndYield();
 +}
 +
@@ -1138,8 +1160,32 @@ index 34cc01c..05bab72 100644
 +    // full COW isolation is deliberately out of scope for v1 — see
 +    // SCHEDULER-DESIGN.md).
 +    i64 old_sp = Get64(m->sp);
-+    i64 copy_bytes = kStackSize;  // whole reserved region, not just above sp
++    i64 stack_bottom = kStackTop - kStackSize;
 +    i64 new_stack;
++    // Copy only the LIVE stack (sp upward), not the whole 8 MB reservation.
++    // Everything below sp is dead by definition, and copying it cost an
++    // 8 MB malloc + 16 MB of copying per fork. That malloc is what actually
++    // capped a session once the guest stacks themselves were being reclaimed:
++    // measured 9 forks failing on it (host heap exhausted/fragmented by the
++    // per-fiber allocations mvl_dispatch.c defers freeing) while the guest
++    // address space still had room. A shell forking to run a pipeline stage
++    // has only a few KB live here.
++    //
++    // kRedZone: x86-64's ABI lets a leaf function use 128 bytes BELOW rsp
++    // without adjusting it, so that much genuinely-live data can sit under
++    // sp. Round up generously — this is cheap now that we're not copying
++    // the whole region.
++    enum { kRedZone = 4096 };
++    i64 live_from = old_sp - kRedZone;
++    i64 copy_bytes;
++    if (live_from < stack_bottom) live_from = stack_bottom;
++    if (old_sp < stack_bottom || old_sp > kStackTop) {
++      // sp isn't in the region we're about to duplicate (guest switched
++      // stacks itself). Copying a relocated window would be meaningless
++      // and silently wrong, so fall back to duplicating the whole region.
++      live_from = stack_bottom;
++    }
++    copy_bytes = kStackTop - live_from;
 +    // ReserveVirtual(virt=0) does NOT mean "auto-place" outside the
 +    // HasLinearMapping() case (confirmed via lldb: it returned literal
 +    // address 0, silently colliding with low/reserved memory — the actual
@@ -1188,10 +1234,15 @@ index 34cc01c..05bab72 100644
 +        FreeMachine(m2);
 +        return eagain();
 +      }
-+      CopyFromUser(m, copybuf, kStackTop - kStackSize, copy_bytes);
-+      CopyToUser(m2, new_stack, copybuf, copy_bytes);
++      // Same offset within the region for both, so sp/bp-relative frame
++      // access keeps working after the relocation.
++      CopyFromUser(m, copybuf, live_from, copy_bytes);
++      CopyToUser(m2, new_stack + (live_from - stack_bottom), copybuf,
++                 copy_bytes);
 +      free(copybuf);
-+      Put64(m2->sp, new_stack + (old_sp - (kStackTop - kStackSize)));
++      Put64(m2->sp, new_stack + (old_sp - stack_bottom));
++      // Hand this back when the child finishes — see EmForkChildEntry.
++      m2->em_forkstack = new_stack;
 +    }
 +  }
 +  m2->em_vfork_child = true;  // ends the sharing on execve — see SysExecve.
@@ -1501,7 +1552,7 @@ index 34cc01c..05bab72 100644
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -498,20 +1431,22 @@ static void *OnSpawn(void *arg) {
+@@ -498,20 +1475,22 @@ static void *OnSpawn(void *arg) {
    Blink(m);
  }
  
@@ -1528,7 +1579,7 @@ index 34cc01c..05bab72 100644
    THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
    if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
      LOGF("unsupported clone() signal: %" PRId64, flags & 255);
-@@ -567,6 +1502,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -567,6 +1546,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
    Put64(m2->ax, 0);
    Put64(m2->sp, stack);
    m2->spawn_sigmask = oldss;
@@ -1536,7 +1587,7 @@ index 34cc01c..05bab72 100644
    unassert(!pthread_attr_init(&attr));
    unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
    err = pthread_create(&thread, &attr, OnSpawn, m2);
-@@ -576,6 +1512,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -576,6 +1556,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
      return eagain();
    }
@@ -1555,7 +1606,7 @@ index 34cc01c..05bab72 100644
    if (flags & CLONE_PARENT_SETTID_LINUX) {
      atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
    }
-@@ -601,7 +1549,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -601,7 +1593,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      return enosys();
  #endif
    }
@@ -1564,7 +1615,7 @@ index 34cc01c..05bab72 100644
    return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
  #else
    LOGF("threading support disabled");
-@@ -717,13 +1665,35 @@ static int SysFutexWait(struct Machine *m,  //
+@@ -717,13 +1709,35 @@ static int SysFutexWait(struct Machine *m,  //
      if (Load32(mem) != expect) {
        rc = 0;
      } else {
@@ -1607,7 +1658,7 @@ index 34cc01c..05bab72 100644
        }
      }
      UNLOCK(&f->lock);
-@@ -1306,45 +2276,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
+@@ -1306,45 +2320,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
  static int SysDup1(struct Machine *m, i32 fildes) {
    int lim;
    int oflags;
@@ -1691,7 +1742,7 @@ index 34cc01c..05bab72 100644
    if (newfildes < 0) {
      LOGF("dup2() ebadf");
      return ebadf();
-@@ -1352,75 +2338,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
+@@ -1352,75 +2382,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
    if (fildes == newfildes) {
      // no-op system call, but still must validate
      LOCK(&m->system->fds.lock);
@@ -1830,7 +1881,7 @@ index 34cc01c..05bab72 100644
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -2339,19 +3344,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
+@@ -2339,19 +3388,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
  
  static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    i64 rc;
@@ -1856,7 +1907,7 @@ index 34cc01c..05bab72 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2359,7 +3369,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2359,7 +3413,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
@@ -1885,7 +1936,7 @@ index 34cc01c..05bab72 100644
        if (rc != -1) SetWriteAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2371,7 +3401,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2371,7 +3445,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
  
  static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    i64 rc;
@@ -1894,7 +1945,7 @@ index 34cc01c..05bab72 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2381,9 +3411,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2381,9 +3455,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -1906,7 +1957,7 @@ index 34cc01c..05bab72 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2391,7 +3423,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2391,7 +3467,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
@@ -1915,7 +1966,7 @@ index 34cc01c..05bab72 100644
        if (rc != -1) SetReadAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2464,7 +3496,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
+@@ -2464,7 +3540,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
  static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                        i64 offset, i32 flags) {
    i64 rc;
@@ -1924,7 +1975,7 @@ index 34cc01c..05bab72 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*readv_impl)(int, const struct iovec *, int);
-@@ -2478,9 +3510,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2478,9 +3554,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(readv_impl = fd->cb->readv);
      oflags = fd->oflags;
@@ -1936,7 +1987,7 @@ index 34cc01c..05bab72 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2490,13 +3524,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2490,13 +3568,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -1952,7 +2003,7 @@ index 34cc01c..05bab72 100644
          }
        } else {
          rc = 0;
-@@ -2512,7 +3546,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2512,7 +3590,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                         i64 offset, i32 flags) {
    i64 rc;
@@ -1961,7 +2012,7 @@ index 34cc01c..05bab72 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2526,9 +3560,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2526,9 +3604,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -1973,7 +2024,7 @@ index 34cc01c..05bab72 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2538,14 +3574,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2538,14 +3618,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -1990,7 +2041,7 @@ index 34cc01c..05bab72 100644
          }
        } else {
          rc = 0;
-@@ -2559,6 +3595,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2559,6 +3639,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  }
  
  static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
@@ -2000,7 +2051,7 @@ index 34cc01c..05bab72 100644
    return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
  }
  
-@@ -2652,9 +3691,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+@@ -2652,9 +3735,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
    struct dirent *ent;
    struct dirent_linux rec;
    if (size < sizeof(rec) - sizeof(rec.name)) return einval();
@@ -2018,7 +2069,7 @@ index 34cc01c..05bab72 100644
    if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
      return -1;
    }
-@@ -2743,7 +3789,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
+@@ -2743,7 +3833,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
    if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
    if (!(fd = GetAndLockFd(m, fildes))) return -1;
    if (!fd->dirstream) {
@@ -2027,7 +2078,7 @@ index 34cc01c..05bab72 100644
    } else if (whence == SEEK_SET_LINUX) {
      if (!offset) {
        VfsRewinddir(fd->dirstream);
-@@ -2806,10 +3852,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
+@@ -2806,10 +3896,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
  }
  
  static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
@@ -2043,7 +2094,7 @@ index 34cc01c..05bab72 100644
      XlatStatToLinux(&gst, &st);
      if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
    }
-@@ -3253,7 +4302,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3253,7 +4346,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
      rc = UnXlatOpenFlags(fd->oflags);
    } else if (cmd == F_SETFD_LINUX) {
      if (!(arg & ~FD_CLOEXEC_LINUX)) {
@@ -2052,7 +2103,7 @@ index 34cc01c..05bab72 100644
          fd->oflags &= ~O_CLOEXEC;
          if (arg) fd->oflags |= O_CLOEXEC;
          rc = 0;
-@@ -3266,7 +4315,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3266,7 +4359,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
    } else if (cmd == F_SETFL_LINUX) {
      fl = XlatOpenFlags(arg & (O_APPEND_LINUX | O_ASYNC_LINUX | O_DIRECT_LINUX |
                                O_NOATIME_LINUX | O_NDELAY_LINUX));
@@ -2061,7 +2112,7 @@ index 34cc01c..05bab72 100644
        fd->oflags &= ~SETFL_FLAGS;
        fd->oflags |= fl;
        rc = 0;
-@@ -3526,6 +4575,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -3526,6 +4619,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -2069,7 +2120,7 @@ index 34cc01c..05bab72 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +4677,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4721,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -2218,7 +2269,7 @@ index 34cc01c..05bab72 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
-@@ -3922,6 +5114,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+@@ -3922,6 +5158,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
    for (;;) {
      if (CompareTime(now, deadline) >= 0) return 0;
      ts = SubtractTime(deadline, now);
@@ -2237,7 +2288,7 @@ index 34cc01c..05bab72 100644
      if (nanosleep(&ts, 0)) {
        unassert(errno == EINTR);
        // this may run a guest signal handler before returning
-@@ -5620,6 +6824,20 @@ void OpSyscall(P) {
+@@ -5620,6 +6868,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -2258,7 +2309,7 @@ index 34cc01c..05bab72 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +6938,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6982,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);
