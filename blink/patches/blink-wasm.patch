@@ -409,7 +409,7 @@ index ad309eb..fc53cca 100644
    int sig;
    RestoreIp(m);
 diff --git a/blink/machine.h b/blink/machine.h
-index be17a8a..7cd6d61 100644
+index be17a8a..53c02a1 100644
 --- a/blink/machine.h
 +++ b/blink/machine.h
 @@ -97,6 +97,12 @@
@@ -425,7 +425,7 @@ index be17a8a..7cd6d61 100644
  #define PAGE_TA    0x0000fffffffff000  // bits used for host, or real address
  #define PAGE_GROW  0x0010000000000000  // for future support of MAP_GROWSDOWN
  #define PAGE_MUG   0x0020000000000000  // host page magic mapped individually
-@@ -449,6 +455,18 @@ struct Machine {               //
+@@ -449,11 +455,35 @@ struct Machine {               //
    sigset_t spawn_sigmask;                //
    struct Dll elem;                       //
    struct SmcQueue smcqueue;              //
@@ -444,7 +444,24 @@ index be17a8a..7cd6d61 100644
    struct OpCache opcache[1];             //
  };  //
  
-@@ -466,6 +484,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
+ extern struct HostPages g_hostpages;
+ extern _Thread_local siginfo_t g_siginfo;
++#ifdef __EMSCRIPTEN__
++// Process-wide child-pid allocator (CHILD-PID-COLLISION-BUG.md). Real fork()
++// gives every forked command its own private System, whose System::next_tid
++// starts at 0 — fine for tid-within-one-process (native blink's use of it),
++// but g_em_children[] (syscall.c) is a single GLOBAL table shared by every
++// System, so two independent fork lineages each spawning a clone(CLONE_VM)
++// child (NewMachine's shared-System branch, memorymalloc.c) would otherwise
++// both allocate pid kMinThreadId for their first child and collide. One
++// counter shared by every System closes that: no two live, unreaped
++// children can ever share a pid, regardless of how many Systems exist.
++extern unsigned g_em_next_child_pid;
++#endif
+ extern _Thread_local struct Machine *g_machine;
+ extern const nexgen32e_f kConvert[3];
+ extern const nexgen32e_f kSax[3];
+@@ -466,6 +496,9 @@ struct Machine *NewMachine(struct System *, struct Machine *);
  i64 AreAllPagesUnlocked(struct System *) nosideeffect;
  bool IsOrphan(struct Machine *) nosideeffect;
  _Noreturn void Blink(struct Machine *);
@@ -455,10 +472,32 @@ index be17a8a..7cd6d61 100644
  void Jitter(P, const char *, ...);
  void FreeMachine(struct Machine *);
 diff --git a/blink/memorymalloc.c b/blink/memorymalloc.c
-index 7d5cc93..2fe6061 100644
+index 7d5cc93..3260232 100644
 --- a/blink/memorymalloc.c
 +++ b/blink/memorymalloc.c
-@@ -627,6 +627,32 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
+@@ -405,7 +405,21 @@ struct Machine *NewMachine(struct System *system, struct Machine *parent) {
+   m->thread = pthread_self();
+   Write32(m->sigaltstack.flags, SS_DISABLE_LINUX);
+   if (parent) {
++#ifdef __EMSCRIPTEN__
++    // Not system->next_tid: real fork() (syscall.c) gives every forked
++    // command its own private System, whose next_tid starts at 0 — a
++    // clone(CLONE_VM) child spawned here (musl posix_spawn/Rust
++    // std::process::Command) would collide with one from any OTHER
++    // independently-forked System's first spawn, since both would land
++    // pid kMinThreadId in the single global g_em_children[] wait4() table.
++    // g_em_next_child_pid is shared by every System, so no two ever
++    // collide. See CHILD-PID-COLLISION-BUG.md. Native blink is unaffected:
++    // each System there is a real OS process, and next_tid only needs to
++    // be unique within one process, which system->next_tid already is.
++    m->tid = (g_em_next_child_pid++ & (kMaxThreadIds - 1)) + kMinThreadId;
++#else
+     m->tid = (system->next_tid++ & (kMaxThreadIds - 1)) + kMinThreadId;
++#endif
+   } else {
+     // TODO(jart): We shouldn't be doing system calls in an allocator.
+     m->tid = m->system->pid;
+@@ -627,6 +641,32 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
    u8 *page;
    long pagesize;
    unassert(entry & PAGE_V);
@@ -596,7 +635,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..3f8fa79 100644
+index 34cc01c..3d80977 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -692,7 +731,7 @@ index 34cc01c..3f8fa79 100644
  static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
    int pid, newpid = 0;
    _Atomic(int) *ctid_ptr;
-@@ -483,6 +534,798 @@ static int SysVfork(struct Machine *m) {
+@@ -483,6 +534,810 @@ static int SysVfork(struct Machine *m) {
    // TODO: Parent should be stopped while child is running.
    return SysFork(m);
  }
@@ -739,6 +778,15 @@ index 34cc01c..3f8fa79 100644
 +  int status;
 +  bool used;
 +} g_em_children[EM_MAX_CHILDREN];
++
++// CHILD-PID-COLLISION-BUG.md. Deliberately NOT reset by em_reset_children()
++// below: the bug it fixes is two independent fork lineages colliding on a
++// pid WITHIN one top-level command (e.g. subagent spawning concurrent
++// clone(CLONE_VM) children under different forked-and-exec'd processes) —
++// resetting this between top-level commands the way g_em_children[] resets
++// wouldn't help with that, and would reopen the same collision window every
++// command starts fresh at kMinThreadId again.
++unsigned g_em_next_child_pid = 0;
 +
 +// main() is re-invoked many times per module instance in the wasm build (one
 +// top-level command == one em_main() call, see stubs.c's em_reset_getopt
@@ -1045,8 +1093,11 @@ index 34cc01c..3f8fa79 100644
 +  }
 +  // NewMachine(s, 0) takes the machine's tid from system->pid, and NewSystem
 +  // zeroes it — so allocate a genuinely unique pid here. Fork() returns this
-+  // to the parent and EmStashChildStatus/SysWait4 key on it.
-+  s2->pid = (m->system->next_tid++ & (kMaxThreadIds - 1)) + kMinThreadId;
++  // to the parent and EmStashChildStatus/SysWait4 key on it. g_em_next_child_
++  // pid, not m->system->next_tid: this pid must never collide with a
++  // clone(CLONE_VM) child's tid either (NewMachine, memorymalloc.c) — both
++  // land in the same global g_em_children[] table (CHILD-PID-COLLISION-BUG.md).
++  s2->pid = (g_em_next_child_pid++ & (kMaxThreadIds - 1)) + kMinThreadId;
 +  s2->exec = m->system->exec;
 +  memcpy(s2->rlim, m->system->rlim, sizeof(s2->rlim));
 +  s2->automap = m->system->automap;
@@ -1491,7 +1542,7 @@ index 34cc01c..3f8fa79 100644
  
  static void *OnSpawn(void *arg) {
    int rc;
-@@ -498,20 +1341,22 @@ static void *OnSpawn(void *arg) {
+@@ -498,20 +1353,22 @@ static void *OnSpawn(void *arg) {
    Blink(m);
  }
  
@@ -1518,7 +1569,7 @@ index 34cc01c..3f8fa79 100644
    THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
    if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
      LOGF("unsupported clone() signal: %" PRId64, flags & 255);
-@@ -567,6 +1412,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -567,6 +1424,7 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
    Put64(m2->ax, 0);
    Put64(m2->sp, stack);
    m2->spawn_sigmask = oldss;
@@ -1526,7 +1577,7 @@ index 34cc01c..3f8fa79 100644
    unassert(!pthread_attr_init(&attr));
    unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
    err = pthread_create(&thread, &attr, OnSpawn, m2);
-@@ -576,6 +1422,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -576,6 +1434,18 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
      return eagain();
    }
@@ -1545,7 +1596,7 @@ index 34cc01c..3f8fa79 100644
    if (flags & CLONE_PARENT_SETTID_LINUX) {
      atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
    }
-@@ -601,7 +1459,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
+@@ -601,7 +1471,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
      return enosys();
  #endif
    }
@@ -1554,7 +1605,7 @@ index 34cc01c..3f8fa79 100644
    return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
  #else
    LOGF("threading support disabled");
-@@ -717,13 +1575,35 @@ static int SysFutexWait(struct Machine *m,  //
+@@ -717,13 +1587,35 @@ static int SysFutexWait(struct Machine *m,  //
      if (Load32(mem) != expect) {
        rc = 0;
      } else {
@@ -1597,7 +1648,7 @@ index 34cc01c..3f8fa79 100644
        }
      }
      UNLOCK(&f->lock);
-@@ -1306,45 +2186,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
+@@ -1306,45 +2198,61 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
  static int SysDup1(struct Machine *m, i32 fildes) {
    int lim;
    int oflags;
@@ -1681,7 +1732,7 @@ index 34cc01c..3f8fa79 100644
    if (newfildes < 0) {
      LOGF("dup2() ebadf");
      return ebadf();
-@@ -1352,75 +2248,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
+@@ -1352,75 +2260,94 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
    if (fildes == newfildes) {
      // no-op system call, but still must validate
      LOCK(&m->system->fds.lock);
@@ -1820,7 +1871,7 @@ index 34cc01c..3f8fa79 100644
      unassert(ForkFd(&m->system->fds, fd, newfildes, oflags));
      UNLOCK(&m->system->fds.lock);
    }
-@@ -2339,19 +3254,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
+@@ -2339,19 +3266,24 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
  
  static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    i64 rc;
@@ -1846,7 +1897,7 @@ index 34cc01c..3f8fa79 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2359,7 +3279,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2359,7 +3291,27 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
@@ -1875,7 +1926,7 @@ index 34cc01c..3f8fa79 100644
        if (rc != -1) SetWriteAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2371,7 +3311,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2371,7 +3323,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
  
  static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    i64 rc;
@@ -1884,7 +1935,7 @@ index 34cc01c..3f8fa79 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2381,9 +3321,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2381,9 +3333,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -1896,7 +1947,7 @@ index 34cc01c..3f8fa79 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2391,7 +3333,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2391,7 +3345,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
@@ -1905,7 +1956,7 @@ index 34cc01c..3f8fa79 100644
        if (rc != -1) SetReadAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2464,7 +3406,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
+@@ -2464,7 +3418,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
  static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                        i64 offset, i32 flags) {
    i64 rc;
@@ -1914,7 +1965,7 @@ index 34cc01c..3f8fa79 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*readv_impl)(int, const struct iovec *, int);
-@@ -2478,9 +3420,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2478,9 +3432,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(readv_impl = fd->cb->readv);
      oflags = fd->oflags;
@@ -1926,7 +1977,7 @@ index 34cc01c..3f8fa79 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2490,13 +3434,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2490,13 +3446,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -1942,7 +1993,7 @@ index 34cc01c..3f8fa79 100644
          }
        } else {
          rc = 0;
-@@ -2512,7 +3456,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2512,7 +3468,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                         i64 offset, i32 flags) {
    i64 rc;
@@ -1951,7 +2002,7 @@ index 34cc01c..3f8fa79 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2526,9 +3470,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2526,9 +3482,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -1963,7 +2014,7 @@ index 34cc01c..3f8fa79 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2538,14 +3484,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2538,14 +3496,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -1980,7 +2031,7 @@ index 34cc01c..3f8fa79 100644
          }
        } else {
          rc = 0;
-@@ -2559,6 +3505,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2559,6 +3517,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  }
  
  static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
@@ -1990,7 +2041,7 @@ index 34cc01c..3f8fa79 100644
    return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
  }
  
-@@ -2652,9 +3601,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+@@ -2652,9 +3613,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
    struct dirent *ent;
    struct dirent_linux rec;
    if (size < sizeof(rec) - sizeof(rec.name)) return einval();
@@ -2008,7 +2059,7 @@ index 34cc01c..3f8fa79 100644
    if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
      return -1;
    }
-@@ -2743,7 +3699,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
+@@ -2743,7 +3711,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
    if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
    if (!(fd = GetAndLockFd(m, fildes))) return -1;
    if (!fd->dirstream) {
@@ -2017,7 +2068,7 @@ index 34cc01c..3f8fa79 100644
    } else if (whence == SEEK_SET_LINUX) {
      if (!offset) {
        VfsRewinddir(fd->dirstream);
-@@ -2806,10 +3762,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
+@@ -2806,10 +3774,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
  }
  
  static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
@@ -2033,7 +2084,7 @@ index 34cc01c..3f8fa79 100644
      XlatStatToLinux(&gst, &st);
      if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
    }
-@@ -3253,7 +4212,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3253,7 +4224,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
      rc = UnXlatOpenFlags(fd->oflags);
    } else if (cmd == F_SETFD_LINUX) {
      if (!(arg & ~FD_CLOEXEC_LINUX)) {
@@ -2042,7 +2093,7 @@ index 34cc01c..3f8fa79 100644
          fd->oflags &= ~O_CLOEXEC;
          if (arg) fd->oflags |= O_CLOEXEC;
          rc = 0;
-@@ -3266,7 +4225,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3266,7 +4237,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
    } else if (cmd == F_SETFL_LINUX) {
      fl = XlatOpenFlags(arg & (O_APPEND_LINUX | O_ASYNC_LINUX | O_DIRECT_LINUX |
                                O_NOATIME_LINUX | O_NDELAY_LINUX));
@@ -2051,7 +2102,7 @@ index 34cc01c..3f8fa79 100644
        fd->oflags &= ~SETFL_FLAGS;
        fd->oflags |= fl;
        rc = 0;
-@@ -3526,6 +4485,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -3526,6 +4497,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -2059,7 +2110,7 @@ index 34cc01c..3f8fa79 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +4587,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4599,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -2208,7 +2259,7 @@ index 34cc01c..3f8fa79 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
-@@ -3922,6 +5024,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+@@ -3922,6 +5036,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
    for (;;) {
      if (CompareTime(now, deadline) >= 0) return 0;
      ts = SubtractTime(deadline, now);
@@ -2227,7 +2278,7 @@ index 34cc01c..3f8fa79 100644
      if (nanosleep(&ts, 0)) {
        unassert(errno == EINTR);
        // this may run a guest signal handler before returning
-@@ -5620,6 +6734,20 @@ void OpSyscall(P) {
+@@ -5620,6 +6746,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -2248,7 +2299,7 @@ index 34cc01c..3f8fa79 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +6848,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6860,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);

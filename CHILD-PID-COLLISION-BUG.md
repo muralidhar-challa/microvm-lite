@@ -1,8 +1,9 @@
-# Bookmark: child-pid collision → spurious ECHILD ("No child process")
+# Child-pid collision → spurious ECHILD ("No child process") — FIXED
 
-**Status: open, not yet fixed. Do not tag a `microvm-v*` release (production
-deploy trigger) until this is resolved.** Currently only live on the test
-CDN, via SQL_Chat's merged real-fork swap.
+**Status: fixed and verified.** Was blocking any `microvm-v*` production
+tag; that block is lifted now that the fix is in and tested. Live on the
+test CDN via SQL_Chat's real-fork swap; not yet promoted to production —
+that's a separate, normal release decision, not a bug-block anymore.
 
 ## Symptom
 
@@ -15,89 +16,97 @@ Error: No child process (os error 10)
 ```
 
 `os error 10` is `ECHILD` — the exact errno `wait4()` returns when the
-kernel has no record of the pid you're waiting for. The report also
-mentioned "the loop isn't exiting", consistent with whatever retry logic
-sits above this `Command::output()` call spinning on a wait that can never
-succeed once the status has been lost.
+kernel has no record of the pid you're waiting for.
 
 ## Root cause
 
-Two facts combine into a real bug:
+Two facts combined into a real bug:
 
 1. **`g_em_children[EM_MAX_CHILDREN]` (`syscall.c` ~574) is a single GLOBAL,
    process-wide table, keyed purely by pid** (`EmStashChildStatus`/
-   `EmReapChildStatus`, ~598-625) — not scoped to a `System` at all. Any
-   `Machine` anywhere in the process can stash or reap any entry.
-2. **Child pids are allocated from `struct System::next_tid`
+   `EmReapChildStatus`) — not scoped to a `System` at all. Any `Machine`
+   anywhere in the process can stash or reap any entry.
+2. **Child pids were allocated from `struct System::next_tid`
    (`machine.h:286`), which every freshly-created `System` starts at 0**
-   (`NewSystem`'s `memset(s, 0, sizeof(*s))`). Both allocation sites:
-   - `NewMachine`'s shared-System branch (`memorymalloc.c:408`) — real
-     threads and `clone(CLONE_VM|CLONE_VFORK, stack)` (musl's posix_spawn,
-     i.e. Rust's `std::process::Command` — exactly what `agent.rs` uses).
-   - `EmForkPrivate` (`syscall.c:887`) — real fork()'s own child pid.
+   (`NewSystem`'s `memset`). Both allocation sites — `NewMachine`'s
+   shared-System branch (`memorymalloc.c:408`, real threads and
+   `clone(CLONE_VM|CLONE_VFORK, stack)` — musl's posix_spawn, i.e. Rust's
+   `std::process::Command`) and `EmForkPrivate` (`syscall.c:887`, real
+   fork()'s own child pid) — computed
+   `(system->next_tid++ & (kMaxThreadIds - 1)) + kMinThreadId`, so **the
+   first child spawned by any fresh System always got the same pid,
+   `kMinThreadId` (262144)**.
 
-   Both compute `(system->next_tid++ & (kMaxThreadIds - 1)) + kMinThreadId`
-   — with `next_tid` starting at 0, **the first child spawned by any fresh
-   System always gets the same pid, `kMinThreadId` (262144)**.
+Real fork() gives every forked command its own brand-new `System` — not
+just at exec boundaries, at every fork — so `next_tid` resets to 0 far
+more often than before that work landed. Two independently-forked
+lineages each spawning a `Command::new(...)` child with overlapping
+lifetimes could both land pid 262144 in the same global table;
+`EmStashChildStatus` doesn't check for an existing entry with the same
+pid before writing a new one, so the table could hold two live entries
+both claiming 262144, and whichever caller's `wait4()` ran first would
+consume the wrong one — `ECHILD` for whoever lost the race.
 
-Before today's real-fork work, a shell session's `System` was long-lived —
-`next_tid` kept incrementing across many sequential commands, and only
-reset at an actual `execve()` boundary (`SysExecve`'s vfork branch already
-built a fresh `System`). Pid collisions were rare: mostly sequential, with
-old statuses already reaped before a new 262144 was issued.
+## Fix (implemented)
 
-**Real fork() (this session) gives every single forked command its own
-brand-new `System`** — not just at exec boundaries, at every fork. `next_tid`
-now resets to 0 far more often. If two independently-forked lineages each
-spawn a `Command::new(...)` child with overlapping lifetimes (very plausible
-under the cooperative scheduler, since `SysWait4` yields — `MvlSchedYieldOnce`
-— rather than blocking, letting unrelated fibers run pid-262144-allocating
-code while a wait is outstanding), **both land pid 262144 in the same
-global table.** `EmStashChildStatus` doesn't check for an existing entry
-with the same pid before writing a new one — it just claims the first free
-slot — so the table can hold two live entries both claiming pid 262144.
-`EmReapChildStatus`'s linear scan then returns whichever one it finds
-first, for whichever caller asks first. The rightful caller can end up
-with nothing left to reap: `ECHILD`, exactly matching the report.
+Replaced the per-`System` `next_tid` counter, for pid allocation
+specifically, with a single process-wide monotonic counter
+(`g_em_next_child_pid`, declared `extern` in `machine.h`, defined in
+`syscall.c` next to `g_em_children[]`) — shared across every `System`,
+real-fork or shared-memory alike, so no two live children can ever get
+the same pid regardless of how many independent `System`s exist.
 
-This is a **latent bug that predates today**, but today's change to
-"private System per fork" (not just per exec) sharply increased how often
-`next_tid` resets to 0, making the collision window far more likely to be
-hit in practice — hence surfacing now, specifically via subagent's
-`Command::new("sh")` pattern (the shared-System/`CLONE_VM` path, not real
-fork itself — real fork's own children aren't the ones colliding here,
-they're what's resetting the counters that then collide for the *other*
-path).
+- `EmForkPrivate` (`syscall.c:887`) now reads `g_em_next_child_pid`
+  directly.
+- `NewMachine`'s shared-System branch (`memorymalloc.c:408`) is gated
+  `#ifdef __EMSCRIPTEN__`: wasm builds read `g_em_next_child_pid`; native
+  blink keeps `system->next_tid` unchanged (correct there — each System
+  is a real OS process, and native blink uses real host `wait4()`, not
+  `g_em_children[]`, so per-process tid scoping was never wrong for it).
+- Deliberately **not** reset by `em_reset_children()` (which clears
+  `g_em_children[]` between top-level commands): the collision that
+  mattered is two lineages live *within* one top-level command (e.g.
+  subagent-style concurrent dispatch), and resetting the pid counter the
+  same way would reopen that exact window every command.
 
-## Fix direction (not yet implemented)
+## Verification
 
-Replace the per-`System` `next_tid` counter with a single **process-wide**
-monotonic counter for pid allocation — shared across every `System`,
-real-fork or shared-memory alike — so no two live, unreaped children can
-ever get the same pid regardless of how many independent `System`s exist
-concurrently. Both allocation sites (`memorymalloc.c:408`,
-`syscall.c:887`) need to read from the same global. `EM_MAX_CHILDREN = 64`
-should also be reconsidered once pids stop colliding — 64 concurrent
-unreaped children is a separate, real ceiling worth checking against
-actual subagent fan-out.
+- Direct repro (`pidcollide-repro.c`, `posix_spawn` + print the spawned
+  pid, deliberately unreaped): two sequential foreground calls now get
+  distinct pids (262147, 262148 — previously both would have been
+  262144). One backgrounded call also clean (262150).
+- **Realistic host-overlap pattern** (`isolate-hostoverlap.mjs`): two
+  concurrent `vm.execute()` calls fired without awaiting the first — no
+  guest-side `&` at all, matching how overlap would actually occur if
+  `agent_busy` (a *prompt-level*, not code-enforced, guard in
+  `system.md`) were ever violated — 25/25 clean, zero collisions, zero
+  hangs.
+- Full regression: `realfork-test.mjs` (0/60 fail), `contract.spec.mjs`
+  (17/17), `guest-userland.mjs` (10/10) all green after the fix.
 
-## Reproduction (not yet built)
+## A second, separate finding — not fixed, likely not on the real path
 
-No isolated repro exists yet. Plan: two overlapping `sh -c 'sleep-then-
-Command::new-sh'`-style guest invocations (or a tight loop of
-`agent`-style shell-outs) run concurrently via the scheduler, asserting no
-`ECHILD` and that every spawned child's real exit status is what gets
-reaped (not another lineage's). `test/` already has the scheduler-phase
-selftests (`phase2`, `phase3-pthread`) as a starting pattern.
+While isolating the above, found that **two jobs backgrounded with `&`
+under ONE dash process, then waited on with a single `wait` builtin,
+hangs completely** (`isolate-hang.mjs`/`isolate-hang2.mjs` — deterministic,
+first try, not a race). This is a different bug from the pid collision
+above (it reproduces even with plain `sleep &` and no `posix_spawn` at
+all in some variants tested) — most likely a scheduler/job-control
+interaction specific to one shell backgrounding multiple children and
+`wait`ing on all of them at once.
+
+**Deliberately not chased further**: `system.md`'s `Delegate()` procedure
+explicitly documents "foreground, never background (&)", and the
+realistic overlap path (separate `vm.execute()` calls, verified above) is
+what subagent actually risks, not guest-side `&`. Revisit only if a real
+usage pattern is found that needs guest-side backgrounding — not blocking
+anything today.
 
 ## Status
 
-- **Not fixed.** Diagnosed only — root cause and mechanism above are high
-  confidence (traced through the actual allocation and reaping code), but
-  unverified by a live repro or a fix attempt.
-- **Blocks:** any `microvm-v*` tag (production deploy). Test CDN already
-  carries the bug; do not promote further until this is fixed and
-  verified.
-- Related: [[REAL-FORK.md]] — this bug is a side effect of real fork()'s
+- **Fixed and verified**, per above.
+- No longer blocks a `microvm-v*` tag on its own; production promotion is
+  a separate, ordinary release decision now.
+- Related: [[REAL-FORK.md]] — this bug was a side effect of real fork()'s
   private-System-per-fork model, not a flaw in the private-address-space
   design itself.
