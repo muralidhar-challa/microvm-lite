@@ -110,16 +110,19 @@ if [ ! -d "$TOYBOX_DIR" ]; then
 fi
 cd "$TOYBOX_DIR"
 cp "$BLINK_DIR/toybox.config" .config
-# -idirafter /usr/include: some enabled applets (rfkill) pull real Linux
-# uapi headers (linux/rfkill.h) that musl-gcc's own specs deliberately
-# don't expose (avoiding glibc header contamination). Those headers are
-# libc-agnostic — same content regardless of what libc built against them
-# — so falling back to the host's copy (present via linux-libc-dev on
-# Debian/Ubuntu CI, and via Xcode's SDK-less /usr/include on macOS, where
-# this is a harmless no-op since there's no linux/ subdir to match) is
-# correct, not a hack.
+# -idirafter: some enabled applets (rfkill, tunctl) pull real Linux uapi
+# headers (linux/rfkill.h, linux/if_tun.h) that musl-gcc's own specs
+# deliberately don't expose (avoiding glibc header contamination). Those
+# headers are libc-agnostic — same content regardless of what libc built
+# against them — so falling back to the host's copy after musl's own
+# search path is correct, not a hack. Two dirs needed on Debian/Ubuntu:
+# /usr/include (linux-libc-dev's linux/*.h) and the multiarch triplet dir
+# (its asm/*.h — linux/types.h chains into asm/types.h, which Debian
+# ships only under the triplet path, not plain /usr/include/asm). Both
+# are harmless no-ops on macOS (no linux/ subdir under Xcode's SDK-less
+# /usr/include).
 CROSS_COMPILE=x86_64-linux-musl- SED=gsed LDFLAGS="-static" \
-  CFLAGS="-idirafter /usr/include" \
+  CFLAGS="-idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu" \
   LDOPTIMIZE="-Wl,--gc-sections -Wl,--as-needed" \
   make -j"$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)"
 chmod 755 toybox
