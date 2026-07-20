@@ -27,3 +27,7 @@ dist/vm-host.js
 dist/manifest.json
 dist/bin/
 dist/rootfs/
+dist/pidcollide
+
+# local convenience symlink → ../public/microvm
+product-dist

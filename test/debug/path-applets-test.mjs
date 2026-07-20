@@ -1,0 +1,27 @@
+import { chromium } from "playwright";
+import { spawn } from "child_process";
+const PORT = 8817;
+const log = (s) => process.stdout.write(s + "\n");
+const server = spawn("python3", ["-m", "http.server", String(PORT)], { cwd: process.cwd(), stdio: "ignore" });
+process.on("exit", () => { try { server.kill(); } catch {} });
+async function w(u, t = 60) { for (let i = 0; i < t; i++) { try { if ((await fetch(u)).ok) return; } catch {} await new Promise(r => setTimeout(r, 250)); } throw new Error("no server"); }
+await w(`http://localhost:${PORT}/test/contract.html`);
+const b = await chromium.launch();
+const p = await b.newPage();
+await p.goto(`http://localhost:${PORT}/test/contract.html`);
+await p.waitForFunction(() => window.__startVM !== undefined, { timeout: 15000 });
+await p.evaluate(() => window.__startVM({ baseEtag: "patht-" + Date.now(), cdnBase: "/dist", workerUrl: "/src/vm-worker.js" }));
+await p.waitForFunction(() => window.vm && window.vm.isReady === true, { timeout: 60000 });
+const run = async (x) => { try { return String(await p.evaluate(([q, t]) => window.vm.execute(q, t), [x, 8000])).trim(); } catch (e) { return "<<TIMEOUT: " + e.message.slice(0, 80) + ">>"; } };
+log("echo \\$PATH: " + await run("echo $PATH"));
+log("which: " + await run("which uuidgen"));
+log("uuidgen (1): " + await run("uuidgen"));
+log("uuidgen (2): " + await run("uuidgen"));
+log("uuidgen (3): " + await run("uuidgen"));
+log("uname -a: " + await run("uname -a"));
+log("whoami: " + await run("whoami"));
+log("ps: " + await run("ps 2>&1 | head -3"));
+log("mktemp: " + await run("mktemp"));
+log("realpath .: " + await run("realpath ."));
+log("timeout applet: " + await run("timeout 1 sleep 0.1; echo rc=$?"));
+await b.close(); server.kill(); process.exit(0);
