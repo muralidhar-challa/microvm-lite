@@ -9,7 +9,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$DIR/blink-src"
 # Must list every file the patch touches (keep in sync with build.sh's checkout).
-FILES="blink/close.c blink/debug.c blink/errno.c blink/errno.h blink/fds.c blink/fds.h blink/machine.c blink/machine.h blink/open.c blink/pipe.c blink/realpath.c blink/syscall.c blink/syscall.h blink/blink.c blink/throw.c"
+FILES="blink/close.c blink/debug.c blink/errno.c blink/errno.h blink/fds.c blink/fds.h blink/machine.c blink/machine.h blink/memorymalloc.c blink/open.c blink/pipe.c blink/realpath.c blink/syscall.c blink/syscall.h blink/blink.c blink/throw.c"
 cd "$SRC"
 git diff $FILES > "$DIR/blink/patches/blink-wasm.patch"
 echo "regenerated blink-wasm.patch ($(wc -l < "$DIR/blink/patches/blink-wasm.patch") lines) from blink-src edits"

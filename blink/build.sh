@@ -38,8 +38,8 @@ echo "[2/6] Applying patches..."
 cd "$SRC_DIR"
 git checkout blink/close.c blink/debug.c blink/errno.c blink/errno.h \
             blink/fds.c blink/fds.h blink/machine.c blink/machine.h \
-            blink/open.c blink/pipe.c blink/realpath.c blink/syscall.c \
-            blink/syscall.h blink/blink.c blink/throw.c 2>/dev/null || true
+            blink/memorymalloc.c blink/open.c blink/pipe.c blink/realpath.c \
+            blink/syscall.c blink/syscall.h blink/blink.c blink/throw.c 2>/dev/null || true
 git apply "$BLINK_DIR/patches/blink-wasm.patch"
 
 # ── 3. Copy our shell template and build config ──────────────────────────────
