@@ -56,14 +56,5 @@ for (let i = 0; i < 60; i++) {
   if ((i + 1) % 20 === 0) log(`  [${i + 1}/60] ${((Date.now() - t0) / 1000).toFixed(0)}s, bad=${bad}`);
 }
 log(`\nmixed-loop failures: ${bad}/60   |   check failures: ${fail}`);
-try {
-  const flog = String(await p.evaluate(() => window.vm.readFile("/tmp/.mvlfork.log")));
-  const lines = flog.split("\n");
-  const done = lines.filter(l => l.startsWith("COPYDONE"));
-  const fails = lines.filter(l => l.includes("FAIL"));
-  log(`fork log: ${done.length} COPYDONE, ${fails.length} FAIL lines`);
-  log("  last: " + (done[done.length - 1] || "<none>"));
-  if (fails.length) log("  first fail: " + fails[0]);
-} catch (e) { log("fork log unreadable: " + e.message.slice(0, 60)); }
 log(bad === 0 && fail === 0 ? "\nALL GREEN" : "\nNOT GREEN");
 await b.close(); server.kill(); process.exit(0);
