@@ -73,6 +73,8 @@ _Noreturn void MvlSchedThreadExitAndYield(void);
 // (e.g. a shell reading its next script line) while a child runs
 // concurrently corrupts the PARENT's fd view, not just the child's —
 // this isn't an edge case, it's the common case for any real script.
+int MvlSchedSpawnOwnSystem(struct Machine *m2, void (*entry)(struct Machine *m));
+
 int MvlSchedSpawnWithEntry(struct Machine *m2, void (*entry)(struct Machine *m),
                            struct Dll *fds_list);
 

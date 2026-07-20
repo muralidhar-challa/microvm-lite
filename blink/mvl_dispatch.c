@@ -17,6 +17,9 @@ struct MvlThread {
   struct MvlThread *next;  // circular ring; g_mvl_current is our position in it.
   void (*custom_entry)(struct Machine *);  // 0 => use MvlThreadEntry.
   bool independent_fds;  // Phase 4: has its own fds_list, not the shared one.
+  bool own_system;       // real fork(): owns its System, so its fds live on
+                         // that System already — nothing to swap. See
+                         // REAL-FORK.md.
   struct Dll *fds_list;  // valid only when independent_fds — see mvl_dispatch.h.
 };
 
@@ -54,6 +57,10 @@ static void MvlSchedEnsureMain(void) {
 // resuming one (whoever ran meanwhile left fds.list pointing at THEIR
 // view, same hazard as g_machine).
 static void MvlSchedInstallFds(struct MvlThread *t) {
+  // A real-fork child points at its OWN System, whose fds.list is already
+  // the right one. Writing g_mvl_canonical_fds into it would hand it the
+  // PARENT's table and undo the isolation entirely.
+  if (t->own_system) return;
   t->m->system->fds.list = t->independent_fds ? t->fds_list : g_mvl_canonical_fds;
 }
 
@@ -99,7 +106,8 @@ static void MvlCustomEntryTrampoline(void *arg) {
 
 static int MvlSchedSpawnInternal(struct Machine *m2,
                                  void (*custom_entry)(struct Machine *),
-                                 bool independent_fds, struct Dll *fds_list) {
+                                 bool independent_fds, struct Dll *fds_list,
+                                 bool own_system) {
   struct MvlThread *t;
   MvlSchedEnsureMain();
   if (!(t = (struct MvlThread *)malloc(sizeof(*t)))) return -1;
@@ -112,6 +120,7 @@ static int MvlSchedSpawnInternal(struct Machine *m2,
   t->custom_entry = custom_entry;
   t->independent_fds = independent_fds;
   t->fds_list = fds_list;
+  t->own_system = own_system;
   SchedMakeContext(&t->ctx,
                    custom_entry ? MvlCustomEntryTrampoline : MvlThreadEntry,
                    t->stack, MVL_THREAD_STACK_SIZE, &g_mvl_main.ctx, t);
@@ -124,12 +133,19 @@ static int MvlSchedSpawnInternal(struct Machine *m2,
 }
 
 int MvlSchedSpawnThread(struct Machine *m2) {
-  return MvlSchedSpawnInternal(m2, 0, false, 0);
+  return MvlSchedSpawnInternal(m2, 0, false, 0, false);
 }
 
 int MvlSchedSpawnWithEntry(struct Machine *m2, void (*entry)(struct Machine *m),
                            struct Dll *fds_list) {
-  return MvlSchedSpawnInternal(m2, entry, true, fds_list);
+  return MvlSchedSpawnInternal(m2, entry, true, fds_list, false);
+}
+
+// Real fork(): the child owns its System, so the scheduler must not touch
+// its fd table at all (REAL-FORK.md).
+int MvlSchedSpawnOwnSystem(struct Machine *m2,
+                           void (*entry)(struct Machine *m)) {
+  return MvlSchedSpawnInternal(m2, entry, false, 0, true);
 }
 
 bool MvlSchedHasLiveChild(int wpid) {
@@ -167,7 +183,9 @@ bool MvlSchedHasLiveChild(int wpid) {
 static void MvlSchedSwapToNext(void) {
   struct MvlThread *me = g_mvl_current, *next = me->next;
   struct Machine *saved = g_machine;
-  if (me->independent_fds) me->fds_list = me->m->system->fds.list;  // capture mutations
+  if (me->independent_fds && !me->own_system) {
+    me->fds_list = me->m->system->fds.list;  // capture mutations
+  }
   g_mvl_current = next;
   MvlSchedInstallFds(next);
   SchedSwap(&me->ctx, &next->ctx);
