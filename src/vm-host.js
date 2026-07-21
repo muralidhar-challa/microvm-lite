@@ -165,6 +165,8 @@ let _baseEtagExplicit = false;  // true when the caller pinned baseEtag via opts
 let _cdnBase = ".";
 let _vmRoutes = {};
 let _workerUrl = "./vm-worker.js";
+let _fatalTimes = [];  // recent guest-module crash timestamps (auto-restart guard)
+let _proxyTimeoutMs = 0;  // 0 → worker default (300s); override via startVM opts
 
 const DEFAULT_CALL_TIMEOUT_MS = 120000;
 
@@ -239,6 +241,26 @@ async function _doStartVM() {
         .catch((err) => w && w.postMessage({ type: "proxy_response", id: msg.id, status: 500, body: JSON.stringify({ __error__: String(err) }) }));
       return;
     }
+    if (msg.type === "fatal") {
+      // The guest wasm module hit an unrecoverable trap (memory OOB /
+      // unreachable / abort) — the Asyncify state is corrupt and every
+      // further call would hang. Reject in-flight callers with a retryable
+      // error and restart the worker; the IDB snapshot (HOME + /tmp) is
+      // KEPT, so session workdirs and result files survive the restart.
+      console.error("[vm] guest module fatal, restarting worker:", msg.error);
+      _pending.forEach(({ reject }) => reject(new Error("VM crashed and is restarting (state preserved) — retry the command. Cause: " + String(msg.error).split("\n")[0])));
+      _pending.clear();
+      try { _worker.terminate(); } catch { /* already dead */ }
+      _worker = null; _ready = false; _startPromise = null;
+      const now = Date.now();
+      _fatalTimes = _fatalTimes.filter((t) => now - t < 60000); _fatalTimes.push(now);
+      if (_fatalTimes.length <= 3) {
+        _startPromise = _doStartVM();
+      } else {
+        console.error("[vm] crashed >3 times in 60s — auto-restart stopped; call vm.resetToFresh()");
+      }
+      return;
+    }
     if (msg.type === "fs_dirty") { _saveSnapshot(); return; }
     if (msg.type === "dbg") { if (window.__vmDebug) console.log("[vm-dbg]", msg.text); return; }
     if (msg.type === "result") { const p = _pending.get(msg.id); if (p) { _pending.delete(msg.id); p.resolve(msg.value); } return; }
@@ -246,7 +268,7 @@ async function _doStartVM() {
   };
 
   const transfer = stateBuffer ? [stateBuffer] : [];
-  _worker.postMessage({ type: "init", cdnBase: _cdnBase, stateBuffer, vmRoutes: _vmRoutes }, transfer);
+  _worker.postMessage({ type: "init", cdnBase: _cdnBase, stateBuffer, vmRoutes: _vmRoutes, proxyTimeoutMs: _proxyTimeoutMs }, transfer);
 
   window.vm = {
     get isReady() { return _ready; },
@@ -307,6 +329,7 @@ export function startVM(opts = {}) {
   if (opts.cdnBase) _cdnBase = opts.cdnBase;
   if (opts.vmRoutes) _vmRoutes = opts.vmRoutes;
   if (opts.workerUrl) _workerUrl = opts.workerUrl;
+  if (opts.proxyTimeoutMs) _proxyTimeoutMs = opts.proxyTimeoutMs;
   _startPromise = _doStartVM();
   return _startPromise;
 }
