@@ -76,6 +76,29 @@ try {
   const persisted = await page.evaluate((f) => window.vm.readFile(f), runRes.output_file);
   check("run() output_file readable + matches", persisted.trim() === "bg-output", JSON.stringify(persisted));
 
+  // ── run(cmd, timeout, session): emulated shell session ─────────────────────
+  // WORKDIR/SESSION_ID exported + workdir auto-created; exported env vars and
+  // cwd persist across calls sharing a session id; sessions are isolated from
+  // each other and from the legacy sessionless path.
+  const wdOut = await page.evaluate(() => window.vm.run("echo W=$WORKDIR S=$SESSION_ID", undefined, "sessA"));
+  check("session: WORKDIR + SESSION_ID exported", wdOut.output === "W=/tmp/sams_sessA S=sessA", JSON.stringify(wdOut.output));
+  const wdDir = await page.evaluate(() => window.vm.run("[ -d /tmp/sams_sessA ] && echo exists", undefined, "sessA"));
+  check("session: workdir auto-created", wdDir.output === "exists", JSON.stringify(wdDir.output));
+  const cwd0 = await page.evaluate(() => window.vm.run("pwd", undefined, "sessA"));
+  check("session: default cwd is the workdir", cwd0.output === "/tmp/sams_sessA", JSON.stringify(cwd0.output));
+  await page.evaluate(() => window.vm.run("export FOO=alpha; false", undefined, "sessA"));
+  const envP = await page.evaluate(() => window.vm.run("echo FOO=$FOO", undefined, "sessA"));
+  check("session: exported env persists across calls (even after rc!=0)", envP.output === "FOO=alpha", JSON.stringify(envP.output));
+  await page.evaluate(() => window.vm.run("cd /etc", undefined, "sessA"));
+  const cwdP = await page.evaluate(() => window.vm.run("pwd", undefined, "sessA"));
+  check("session: cwd persists across calls", cwdP.output === "/etc", JSON.stringify(cwdP.output));
+  const isoB = await page.evaluate(() => window.vm.run("echo FOO=$FOO; pwd", undefined, "sessB"));
+  check("session: other session isolated (no env/cwd leak)", isoB.output === "FOO=\n/tmp/sams_sessB", JSON.stringify(isoB.output));
+  const weird = await page.evaluate(() => window.vm.run("echo $WORKDIR", undefined, "we!r d/../id"));
+  check("session: id sanitized for paths", weird.output === "/tmp/sams_werdid", JSON.stringify(weird.output));
+  const legacy = await page.evaluate(() => window.vm.run("echo W=$WORKDIR; pwd"));
+  check("sessionless run(): no WORKDIR, cwd = HOME", legacy.output === "W=\n/workspace", JSON.stringify(legacy.output));
+
   // ── writeFile / readFile / readFileRaw ────────────────────────────────────
   await page.evaluate(() => window.vm.writeFile("/workspace/wf.txt", "written-content"));
   const rf = await page.evaluate(() => window.vm.readFile("/workspace/wf.txt"));

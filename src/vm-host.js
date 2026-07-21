@@ -252,8 +252,12 @@ async function _doStartVM() {
     get isReady() { return _ready; },
     ready: () => _ready ? Promise.resolve() : new Promise((r) => _readyResolvers.push(r)),
     execute: (cmd, timeout = 30000) => _call({ type: "run", cmd, timeout }, undefined, timeout + 15000),
-    run: async (cmd, timeout = 120000) => {
-      const r = await _call({ type: "execute", cmd, timeout }, undefined, timeout + 15000);
+    // `session` (optional): scopes the call to an emulated shell session —
+    // exported env/cwd persist across calls sharing the same session id, with
+    // WORKDIR=/tmp/sams_<session> exported and auto-created (see vm-worker's
+    // runShellCapture). Omitted → legacy stateless call cd'd to HOME.
+    run: async (cmd, timeout = 120000, session) => {
+      const r = await _call({ type: "execute", cmd, timeout, session }, undefined, timeout + 15000);
       if (!r.done && r.output_file && r.pid == null) {
         try {
           const hex = r.output_file.replace("/tmp/out-", "").replace(".txt", "");

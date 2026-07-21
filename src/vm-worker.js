@@ -170,7 +170,9 @@ self.Module = {
     // poppler-utils — build-guest-userland.sh) installs, matching real
     // FHS layout. Without it those tools only run via absolute path.
     ENV["HOME"] = HOME; ENV["PATH"] = "/bin:/usr/bin:/root"; ENV["TERM"] = "xterm";
-    ENV["WORKDIR"] = HOME;
+    // No boot-level WORKDIR: the per-session wrapper in runShellCapture exports
+    // the real one (/tmp/sams_<session>). A HOME-valued fallback here would
+    // silently swallow a missing session and land files in the persistent HOME.
 
     // DNS seed from the configured routes (product-agnostic — VM_ROUTES is built
     // from init.vmRoutes). getaddrinfo reads /etc/hosts first.
@@ -366,9 +368,35 @@ async function ensureBundlesFor(cmd) {
 // blink Fd that survives the save/restore, so the full `A; B; C` sequence — post
 // -fork commands included — is captured intact. cmd goes on its own line inside
 // the group so a trailing `;`/operator in cmd can't break the `)` terminator.
-async function runShellCapture(cmd, capFile, pidFile) {
+// With a `session`, the command additionally runs inside an emulated shell
+// session: WORKDIR=/tmp/sams_<sid> and SESSION_ID are exported for real (and
+// the workdir created), the previous call's exported env vars and cwd are
+// restored from /tmp/.sess_<sid>.{env,cwd}, and the trailer re-saves both
+// after the command — so `export FOO=1` or `cd somewhere` in one call is
+// still in effect in the next, per session, like a persistent shell. The
+// trailer runs regardless of cmd's exit status and the real status is
+// preserved via __rc. cwd restore uses the `read` builtin (not `$(cat …)`)
+// to avoid a subshell+fork per call under the vfork model. /tmp is MEMFS, so
+// session state resets on VM restart — the [ -f ] guards make that graceful.
+async function runShellCapture(cmd, capFile, pidFile, session) {
   var script = (pidFile ? "echo $$ > " + pidFile + "; " : "")
-    + "exec > " + capFile + " 2>&1; cd " + HOME + " 2>/dev/null; " + cmd;
+    + "exec > " + capFile + " 2>&1; ";
+  if (session) {
+    var sid = String(session).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) || "default";
+    var wd = "/tmp/sams_" + sid, sess = "/tmp/.sess_" + sid;
+    script += "export WORKDIR=" + wd + " SESSION_ID=" + sid + "; "
+      + "mkdir -p " + wd + "; "
+      + "[ -f " + sess + ".env ] && . " + sess + ".env; "
+      + "__c=; [ -f " + sess + ".cwd ] && read -r __c < " + sess + ".cwd; "
+      // `cd ""` is a silent no-op in dash (stays in the inherited, possibly
+      // cross-session cwd) — default an empty __c to the workdir explicitly.
+      + "[ -n \"$__c\" ] || __c=" + wd + "; "
+      + "cd \"$__c\" 2>/dev/null || cd " + wd + "; "
+      + cmd + "\n"
+      + "__rc=$?; export -p > " + sess + ".env; pwd > " + sess + ".cwd; exit $__rc";
+  } else {
+    script += "cd " + HOME + " 2>/dev/null; " + cmd;
+  }
   return runExec(["/bin/sh", "-c", script]);
 }
 
@@ -387,11 +415,11 @@ async function doRun(cmd) {
 // Mirrors useV86.executeCmd's on-disk contract (/tmp/out-<hex>.txt,
 // /tmp/pid-<hex>.txt) so the app's window.vm.run pid-readback path is byte-for-
 // byte compatible. Run-to-completion → always done:true (see file header).
-async function doExecute(cmd) {
+async function doExecute(cmd, session) {
   await ensureBundlesFor(cmd);
   var hex = randHex();
   var outFile = "/tmp/out-" + hex + ".txt", pidFile = "/tmp/pid-" + hex + ".txt";
-  await runShellCapture(cmd, outFile, pidFile);
+  var r = await runShellCapture(cmd, outFile, pidFile, session);
   _fsDirty = true;
   var output = "(no output)", pid = null;
   try {
@@ -401,7 +429,13 @@ async function doExecute(cmd) {
       if (bytes.length > MAX) output = new TextDecoder().decode(bytes.subarray(0, MAX)) + "\n...(output large — use grep/awk on " + outFile + " to filter)";
       else output = new TextDecoder().decode(bytes).replace(/\s+$/, "") || "(no output)";
     }
-  } catch (e) {}
+  } catch (e) {
+    // Capture file unreadable — surface it instead of masquerading as empty
+    // output (a "(no output)" streak on commands like `echo hello` is exactly
+    // this case, and used to be silently swallowed here).
+    output = "[vm error: could not read command output: " + String(e && e.message || e) + "]";
+  }
+  if (r && r.error) output = "[vm error: " + r.error + "]" + (output === "(no output)" ? "" : "\n" + output);
   try { pid = parseInt(new TextDecoder().decode(FS.readFile(pidFile)).trim()) || null; } catch (e) {}
   return { done: true, output_file: outFile, pid: pid, output: output };
 }
@@ -512,7 +546,7 @@ self.onmessage = async function (ev) {
 
   if (msg.type === "execute") {
     await moduleReadyPromise;
-    try { self.postMessage({ type: "result", id: msg.id, value: await doExecute(msg.cmd) }); }
+    try { self.postMessage({ type: "result", id: msg.id, value: await doExecute(msg.cmd, msg.session) }); }
     catch (err) { self.postMessage({ type: "result", id: msg.id, value: { done: false, output_file: null, pid: null, output: "error: " + String(err && err.message || err) } }); }
     return;
   }
