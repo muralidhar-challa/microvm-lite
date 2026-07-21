@@ -99,6 +99,21 @@ try {
   const legacy = await page.evaluate(() => window.vm.run("echo W=$WORKDIR; pwd"));
   check("sessionless run(): no WORKDIR, cwd = HOME", legacy.output === "W=\n/workspace", JSON.stringify(legacy.output));
 
+  // ── concurrent calls serialize (never wedge the Asyncify module) ───────────
+  // Fired together: the second must queue behind the first and BOTH must
+  // return their own correct output (this used to corrupt Asyncify state and
+  // permanently hang every later call).
+  const conc = await page.evaluate(() => Promise.all([
+    window.vm.run("sleep 1; echo first-done"),
+    window.vm.run("echo second-done"),
+    window.vm.execute("echo third-done"),
+  ]));
+  check("concurrent calls serialize, all outputs intact",
+    conc[0].output === "first-done" && conc[1].output === "second-done" && conc[2] === "third-done",
+    JSON.stringify([conc[0].output, conc[1].output, conc[2]]));
+  const after = await page.evaluate(() => window.vm.run("echo alive"));
+  check("worker healthy after concurrent burst", after.output === "alive", JSON.stringify(after.output));
+
   // ── writeFile / readFile / readFileRaw ────────────────────────────────────
   await page.evaluate(() => window.vm.writeFile("/workspace/wf.txt", "written-content"));
   const rf = await page.evaluate(() => window.vm.readFile("/workspace/wf.txt"));

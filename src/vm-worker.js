@@ -282,6 +282,20 @@ async function runExec(argv) {
   return { output: output, error: error, exitCode: exitCode };
 }
 
+// Serialize ALL guest executions: two concurrent em_main calls on one
+// Asyncify module corrupt its unwind state and wedge the worker permanently
+// (real incident: a sams call stuck retrying against a slow backend + the
+// user typing `pwd` in the terminal → every later call timed out forever).
+// A queued call just waits its turn; the host-side per-call timeout may still
+// fire for the waiting caller, but the worker stays healthy and drains.
+var _execChain = Promise.resolve();
+function runExecQueued(argv) {
+  var run = function () { return runExec(argv); };
+  var p = _execChain.then(run, run);
+  _execChain = p.then(function () {}, function () {});
+  return p;
+}
+
 function randHex() { return Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0"); }
 
 // ── Bundle staging (generic, product-agnostic asset loading) ─────────────────
@@ -397,7 +411,7 @@ async function runShellCapture(cmd, capFile, pidFile, session) {
   } else {
     script += "cd " + HOME + " 2>/dev/null; " + cmd;
   }
-  return runExec(["/bin/sh", "-c", script]);
+  return runExecQueued(["/bin/sh", "-c", script]);
 }
 
 // ── vm.execute (worker msg "run"): simple string capture ─────────────────────
@@ -532,7 +546,7 @@ self.onmessage = async function (ev) {
     await moduleReadyPromise;
     var argv = msg.type === "exec" ? ["/bin/" + msg.argv[0]].concat(msg.argv.slice(1)) : msg.argv;
     await ensureBundlesFor(argv.join(" "));
-    var r = await runExec(argv);
+    var r = await runExecQueued(argv);
     self.postMessage({ type: "result", id: msg.id, output: r.output, error: r.error, exitCode: r.exitCode });
     return;
   }
