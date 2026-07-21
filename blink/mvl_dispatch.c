@@ -21,6 +21,15 @@ struct MvlThread {
                          // that System already — nothing to swap. See
                          // REAL-FORK.md.
   struct Dll *fds_list;  // valid only when independent_fds — see mvl_dispatch.h.
+  struct System *nested_sys;  // non-null while this fiber runs a NESTED
+                              // machine (SysExecve's vfork-child branch):
+                              // the live fds ring is on nested_sys, not
+                              // m->system — save/install must track THAT,
+                              // or the fiber's saved head goes stale while
+                              // the exec'd program mutates the ring (frees
+                              // nodes, moves the head), and reinstalling
+                              // the stale head cross-splices the parent's
+                              // and child's fd tables. See MvlSchedSetNestedFds.
 };
 
 bool g_mvl_sched_active;
@@ -60,8 +69,56 @@ static void MvlSchedInstallFds(struct MvlThread *t) {
   // A real-fork child points at its OWN System, whose fds.list is already
   // the right one. Writing g_mvl_canonical_fds into it would hand it the
   // PARENT's table and undo the isolation entirely.
+  struct System *sys;
   if (t->own_system) return;
-  t->m->system->fds.list = t->independent_fds ? t->fds_list : g_mvl_canonical_fds;
+  sys = t->nested_sys ? t->nested_sys : t->m->system;
+  sys->fds.list = t->independent_fds ? t->fds_list : g_mvl_canonical_fds;
+}
+
+// Save the LIVE fds.list head back into whichever view the leaving fiber
+// was using. The head is not a stable pointer: dll_make_first/dll_remove
+// move it on every guest open/close/dup, so it must be re-captured on
+// every swap-away. A one-time snapshot (the original design) goes stale
+// the moment the guest touches an fd after the ring exists; re-installing
+// it on resume then either hides fds opened since the snapshot (observed:
+// SysDup2's lookup missing a live fd → ForkFd(fd=NULL)) or resurrects a
+// freed node as the head (observed: dash's heredoc fd save/restore churn
+// with a spawned cat fiber → dll_splice_after on freed memory,
+// EXC_BAD_ACCESS at 0x8 — the production blink.wasm "memory access out of
+// bounds" / VM-hang crash).
+static void MvlSchedSaveFds(struct MvlThread *t) {
+  struct System *sys;
+  if (t->own_system) return;
+  sys = t->nested_sys ? t->nested_sys : t->m->system;
+  if (t->independent_fds) {
+    t->fds_list = sys->fds.list;
+  } else {
+    g_mvl_canonical_fds = sys->fds.list;
+  }
+}
+
+// SysExecve's vfork-child branch runs the exec'd program in a NESTED
+// Machine+System on the SAME fiber, seeding nested->fds.list with the
+// fiber's fd ring. From that moment the live ring head lives on the nested
+// System (the exec'd program's opens/closes move it there), so this tells
+// the dispatcher where to save from / install to across yields. Call with
+// the nested System right before RunMachineUntilExit(m2); call with NULL
+// right after it returns — the NULL call re-syncs the fiber's own view
+// (fds_list and m->system->fds.list) from the nested System's FINAL head,
+// so nothing downstream reinstalls a pre-exec stale head. Confirmed
+// failure without this: the exec'd sqlite3's fd ring cross-spliced with
+// the concurrently-running parent shell's table (stale-head dll_make_first
+// merges the rings), its stdout resolving to the PARENT's later redirect
+// target — the Phase-4 "empty output" symptom.
+void MvlSchedSetNestedFds(struct System *nested) {
+  struct MvlThread *t = g_mvl_current;
+  if (!t) return;
+  if (!nested && t->nested_sys) {
+    struct Dll *live = t->nested_sys->fds.list;
+    if (t->independent_fds) t->fds_list = live;
+    if (!t->own_system) t->m->system->fds.list = live;
+  }
+  t->nested_sys = nested;
 }
 
 static void MvlThreadEntry(void *arg) {
@@ -183,9 +240,7 @@ bool MvlSchedHasLiveChild(int wpid) {
 static void MvlSchedSwapToNext(void) {
   struct MvlThread *me = g_mvl_current, *next = me->next;
   struct Machine *saved = g_machine;
-  if (me->independent_fds && !me->own_system) {
-    me->fds_list = me->m->system->fds.list;  // capture mutations
-  }
+  MvlSchedSaveFds(me);  // live head, EVERY swap-away — see MvlSchedSaveFds
   g_mvl_current = next;
   MvlSchedInstallFds(next);
   SchedSwap(&me->ctx, &next->ctx);
@@ -221,6 +276,9 @@ _Noreturn void MvlSchedThreadExitAndYield(void) {
   p->next = me->next;
   g_mvl_current = p;
   g_mvl_sched_active = (p->next != p);
+  MvlSchedSaveFds(me);  // dying fiber's final fd state — non-independent
+                        // (thread-style) exits must update the canonical
+                        // head too, or their close()s resurrect on resume
   MvlSchedInstallFds(p);
   SchedSwap(&me->ctx, &p->ctx);
   // Never resumed: `me` is unlinked, nothing will swap to it again. Actual
