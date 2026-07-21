@@ -21,6 +21,36 @@ the whole process on a second independent fork — found via a native,
 `lldb`-debuggable build of blink with `__EMSCRIPTEN__` forced). This doc
 specifies the next step: a genuine cooperative scheduler.
 
+### Product priority (2026-07 update)
+
+Ranked by what the product actually suffers from, to keep the remaining
+phases pointed at value:
+
+1. **Background jobs (`done:false` + pid + later readFile + kill)** — the
+   SAMS backend intermittently takes 24s-10min on query execution
+   (HAR-confirmed). Today a slow query blocks the whole VM (all other calls
+   serialize behind it — see the `runExecQueued` note under "Near-term
+   wins") and a host-side timeout loses the handle to work that is still
+   running. This is the phase output that changes user experience, and it
+   is the yardstick for Phase 5's design.
+2. **True persistent interactive shell** — partly superseded since this doc
+   was first written: the shipped emulated session (vm-worker
+   `runShellCapture` session wrapper — exported WORKDIR/SESSION_ID plus
+   env/cwd replay via `/tmp/.sess_<sid>.{env,cwd}`) already covers env+cwd
+   persistence for the chat orchestrator. A live shell still adds shell
+   functions/aliases/unexported vars, `$?` continuity, and honest terminal
+   interactivity — a post-Phase-6 consumer (a persistent `sh` as a
+   long-lived scheduled job fed via its stdin fd), no longer a driver.
+3. **Guest `pthread_create`** — already delivered (Phase 3 DONE below).
+
+Also load-bearing: **this design requires the interpreter.** Preemption
+comes from `Actor()`'s per-instruction checkpoint (instruction count as
+BEAM-style reduction count — a guest busy-loop with zero syscalls still
+yields on budget, no guest cooperation needed, because cooperation lives a
+layer below the guest). A wasm JIT backend, if ever built, would run
+translated blocks between checkpoints and break preemption — any future
+JIT work must be scheduler-aware, and the scheduler comes first.
+
 ## Architecture decision: literal shared memory
 
 The scheduler gives a scheduled job **literal shared memory** with whatever
@@ -111,6 +141,65 @@ before the next step depends on it.
   existing `-sASYNCIFY`. Known hazard: `g_machine` is `_Thread_local`
   (`machine.c:60`) and does **not** follow a fiber swap on the one real
   thread — the scheduler must manually reassign `g_machine` on every resume.
+
+## Blocking calls: the yield-and-recheck pattern, and `em_http_fetch`
+
+Every green-thread runtime converts blocking operations into yield-and-poll
+(Go's netpoller, BEAM's ports, asyncio's loop) — under this scheduler a
+blocking host call stalls the ONE real OS thread every fiber shares, so
+nothing else can run and nothing exists to wake the blocker. Two instances
+of exactly this bug were already found and fixed with the same pattern
+(cooperatively yield via the scheduler, recheck the condition, repeat):
+`SysFutexWait` (Phase 3) and `SysNanosleep` (Phase 4), both gated on
+`g_mvl_sched_active` so the never-scheduled path stays byte-identical.
+
+**`em_http_fetch` is the third — and it is the flagship use case, not an
+edge case.** An earlier draft of this doc listed "a Machine mid-
+`em_http_fetch` being fiber-swapped" as out of scope. That exclusion cannot
+survive contact with the goal: a slow `sams` query — the very thing
+`{done:false, pid}` exists to background — spends nearly ALL of its time
+inside the fetch. A fiber suspended in a plain Asyncify await cannot also
+be fiber-swapped (the await unwinds to the JS event loop, not to a swap
+point). Resolution, same shape as the futex/nanosleep fixes:
+
+- For scheduled jobs (`g_mvl_sched_active`), `em_http_fetch` becomes
+  **issue-then-poll**: post the proxy_request to JS, then loop
+  `{ check per-request completion flag; MvlSchedYieldOnce(); }` until the
+  JS side marks the response ready (the existing proxy timeout → 504
+  synthesis stays, made configurable — see Near-term wins). No Asyncify
+  await on this path at all, so the fiber is always swappable.
+- The non-scheduled fast path keeps the existing Asyncify-await
+  implementation unchanged.
+- JS side: `proxy_response` handling stores the response and sets the flag
+  instead of resolving an await — a small, mechanical change in
+  `vm-worker.js`.
+
+This is a **prerequisite for Phase 5**, alongside the Phase 4
+memory-isolation gap: without it, backgrounding detaches from exactly the
+jobs that never yield.
+
+## Near-term wins independent of the remaining phases (do these regardless)
+
+- **Proxy 30s cap vs. legitimately slow queries.** `emHttpFetch` in
+  `src/vm-worker.js` synthesizes a 504 after a hard-coded 30 000 ms, but
+  some predefined queries legitimately run 1-2 min (the sams CLI's own
+  per-attempt timeout defaults to 240s, and the backend hangs up to
+  10 min). On microvm-lite ANY query >30s currently dies at the proxy
+  regardless of sams settings. Make the cap configurable from the init
+  message with a default comfortably above 240s.
+- **"Started"-message stepping stone (optional).** The worker posts
+  `{type:"started", id, output_file, pid}` as soon as the capture file is
+  chosen; on host-side `_call` timeout, `vm.run` resolves
+  `{done:false, output_file, pid}` instead of rejecting. Result stays
+  retrievable after a timeout TODAY, with the honest limitation that later
+  commands still queue behind the running one until it finishes. ~80% of
+  the background-jobs UX for ~5% of the effort; Phase 5 replaces its
+  internals, not its contract.
+- **Context: `runExecQueued` (vm-worker, commit 2d2b825).** All guest
+  executions now serialize through one promise chain — the correctness
+  stopgap for the single-continuation world (two concurrent `em_main`
+  calls corrupted Asyncify and wedged the worker permanently, observed
+  live). Phase 5's tick loop subsumes and retires it.
 
 ## Phased implementation
 
@@ -494,12 +583,19 @@ sequential non-backgrounded commands) until the memory-isolation gap is
 addressed. Phase 5 (JS contract wiring for `{done:false, pid}`) should
 wait for that work, not build on top of a known-corruptible foundation.
 
-**Phase 5 — wire the JS contract.** `doExecute` (`vm-worker.js`) is wired to
+**Phase 5 — wire the JS contract. TWO HARD PREREQUISITES, in order:
+(a) the Phase 4 memory-isolation gap (a concurrently-scheduled fork child
+corrupts the parent's unisolated address space — see Phase 4's findings;
+real design work, not a patch), and (b) the `em_http_fetch` issue-then-poll
+conversion (see "Blocking calls" above — without it, backgrounding cannot
+detach from exactly the fetch-bound jobs that motivate the feature).**
+`doExecute` (`vm-worker.js`) is wired to
 a scheduler tick loop (`em_sched_run(budget_ms)` called repeatedly from a JS
 `setTimeout(0)` loop, not one giant Asyncify-suspended call — keeps the
 browser responsive and avoids nesting Asyncify unwinds inside a fiber swap);
 on timeout it detaches exactly like `useV86.ts`'s Ctrl+C-the-wait behavior
 and returns `{done:false, output_file, pid}` while the job keeps running.
+This retires the interim `runExecQueued` serialization queue.
 `doRun` stays on the legacy path for now. Gate: new `contract.spec.mjs` case
 — a long-running command returns `done:false` with a real pid before it
 finishes, a later `readFile(output_file)` eventually shows the completed
@@ -530,18 +626,27 @@ path onto the scheduler too, and re-run the full regression suite.
 - Fair scheduling — round-robin only, no priorities/nice. (Preemption of a
   busy loop with no syscalls mostly works for free from the instruction-count
   checkpoint, since there's no JIT — every instruction hits the counter.)
-- A Machine simultaneously mid-`em_http_fetch` (Asyncify) *and* being
-  fiber-swapped/backgrounded — don't background a job mid-fetch in v1.
+- ~~A Machine simultaneously mid-`em_http_fetch` (Asyncify) and being
+  fiber-swapped/backgrounded~~ — REMOVED from this list: it is the flagship
+  use case (backgrounding a fetch-bound `sams` query) and is now a designed
+  component — see "Blocking calls: the yield-and-recheck pattern, and
+  `em_http_fetch`", a stated prerequisite for Phase 5.
 - Full job control (SIGSTOP/SIGCONT, process groups, tty ownership,
   `fg`/`bg`) — only SIGTERM/SIGKILL-style `em_kill`.
 - Real per-page copy-on-write divergence for fork-style jobs (the kind real
-  Linux does via page-fault-triggered duplication) — v1 fork-style jobs share
-  memory with no divergence at all, same as threads, for the whole window
-  between `fork()` and either `execve()` (which replaces the address space
-  entirely, ending the sharing) or `exit()`. This is a deliberate
-  simplification matching the shared-memory decision above, not a punt to
-  revisit by default — only worth reconsidering if a real workload needs a
-  backgrounded child's writes to stay invisible to its parent.
+  Linux does via page-fault-triggered duplication) — **status changed by
+  Phase 4's findings.** The original bet ("share memory with no divergence;
+  only revisit if a workload needs a child's writes invisible to its
+  parent") is falsified: the observed failure is not leaked writes but the
+  parent's own unrelated buffers being corrupted by a concurrently-
+  scheduled child in ordinary multi-line scripts (repeatable SIGSEGV — see
+  Phase 4). SOME form of memory isolation for concurrently-scheduled fork
+  children is therefore a hard prerequisite for Phase 5, and scoping it
+  (full CoW vs. targeted isolation of the guest stack/heap regions vs.
+  restricting concurrency to post-execve children, which already get a
+  separate System) is the next real design task. Full Linux-grade
+  page-fault CoW machinery remains out of scope unless that scoping
+  concludes it's the only correct option.
 
 ## Critical files
 
