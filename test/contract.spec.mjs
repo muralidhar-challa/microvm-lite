@@ -135,6 +135,9 @@ try {
   check("writeFile({mode}) installs a runnable executable", helloOut.includes("hi-from-installed"), helloOut);
 
   // ── Snapshot persistence: save_state → gzip+IDB, restore across reboot ─────
+  // /tmp persists too (session workdirs + result files survive refresh);
+  // per-run capture artifacts (/tmp/out-*, .stdout.*) are excluded.
+  await page.evaluate(() => window.vm.run("echo tmp-data > $WORKDIR/keep.txt", undefined, "sessA"));
   await page.evaluate(() => window.vm.writeFile("/workspace/persist.txt", "survives-reboot"));
   // Force a save (fs_dirty debounce would also do it, but drive it directly).
   await page.evaluate(async () => {
@@ -160,10 +163,17 @@ try {
   // snapshot (kept, since resetToFresh isn't called yet) must restore the files.
   await page.reload();
   await page.waitForFunction(() => window.__startVM !== undefined, { timeout: 15000 });
-  await page.evaluate(() => window.__startVM({ baseEtag: "test-v1", cdnBase: "/test", workerUrl: "/src/vm-worker.js", vmRoutes: {} }));
+  // Boot against /dist (same as the initial boot): the post-reboot session
+  // test below RUNS a guest command, which needs the real staged toolchain —
+  // /test has no manifest, so nothing would be staged.
+  await page.evaluate(() => window.__startVM({ baseEtag: "test-v1", cdnBase: "/dist", workerUrl: "/src/vm-worker.js", vmRoutes: {} }));
   await page.waitForFunction(() => window.vm && window.vm.isReady === true, { timeout: 45000 });
   const afterReboot = await page.evaluate(() => window.vm.readFile("/workspace/persist.txt").catch(() => "<missing>"));
   check("snapshot restores files across reboot", afterReboot === "survives-reboot", JSON.stringify(afterReboot));
+  const tmpAfterReboot = await page.evaluate(() => window.vm.readFile("/tmp/sams_sessA/keep.txt").catch(() => "<missing>"));
+  check("snapshot restores /tmp session files across reboot", tmpAfterReboot.trim() === "tmp-data", JSON.stringify(tmpAfterReboot));
+  const sessCwdAfterReboot = await page.evaluate(() => window.vm.run("pwd", undefined, "sessA"));
+  check("session cwd survives reboot via /tmp snapshot", sessCwdAfterReboot.output === "/etc", JSON.stringify(sessCwdAfterReboot.output));
 
   // ── resetToFresh clears the snapshot ──────────────────────────────────────
   await page.evaluate(() => window.vm.resetToFresh());

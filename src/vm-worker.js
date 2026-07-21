@@ -36,6 +36,14 @@ var BASE = ".";
 // fetch bridge (see emHttpFetch). Fake IPs assigned 10.0.2.10, .11, … in order.
 var VM_ROUTES = {};
 
+// Proxy bridge timeout: how long a guest HTTP request may wait for the host
+// page's proxy_response before a synthesized 504. Overridable via
+// init.proxyTimeoutMs — the old hard-coded 30s silently killed legitimately
+// slow predefined queries (some run 1-2 min; sams' own per-attempt budget is
+// 240s, and its client-side timeouts can't work through this bridge, so this
+// cap is the only effective one).
+var PROXY_TIMEOUT_MS = 300000;
+
 // Applet fallback list for the no-manifest path. manifest.applets overrides.
 var APPLETS = [
   "sh", "hush", "ls", "cat", "sed", "awk", "grep", "find", "head", "tail",
@@ -139,7 +147,7 @@ self.Module = {
       _proxyWaiters[id] = resolve;
       setTimeout(function () {
         if (_proxyWaiters[id]) { delete _proxyWaiters[id]; resolve({ status: 504, statusText: "Gateway Timeout", body: "endpoint timeout\n" }); }
-      }, 30000);
+      }, PROXY_TIMEOUT_MS);
     });
     // Split the query off for the registry key (useV86 routes on pathname
     // only); keep the full target in `url` so handlers can read query params.
@@ -166,7 +174,7 @@ self.Module = {
     function mkdirp(p) { try { FS.mkdir(p); } catch (e) { /* EEXIST */ } }
     mkdirp("/root"); mkdirp("/bin"); mkdirp("/lib"); mkdirp("/etc"); mkdirp("/tmp");
     mkdirpDeep(HOME);
-    // /usr/bin: where the guest-userland closure (sqlite3, jq, lua5.4,
+    // /usr/bin: where the guest-userland closure (sqlite3, jq,
     // poppler-utils — build-guest-userland.sh) installs, matching real
     // FHS layout. Without it those tools only run via absolute path.
     ENV["HOME"] = HOME; ENV["PATH"] = "/bin:/usr/bin:/root"; ENV["TERM"] = "xterm";
@@ -262,7 +270,13 @@ async function runExec(argv) {
   var error = null, exitCode = null;
   _execBusy = true;
   try { exitCode = await callMainAsync(["blink"].concat(argv)); }
-  catch (e) { error = (e && e.name ? e.name + ": " : "") + (e && (e.stack || e.message) || String(e)); }
+  catch (e) {
+    error = (e && e.name ? e.name + ": " : "") + (e && (e.stack || e.message) || String(e));
+    if (!_moduleFatal && isFatalExecError(e)) {
+      _moduleFatal = error.split("\n")[0];
+      self.postMessage({ type: "fatal", error: error });
+    }
+  }
   finally { _execBusy = false; }
   var output = "";
   try { output += new TextDecoder().decode(FS.readFile(outPath)); } catch (e) {}
@@ -289,8 +303,23 @@ async function runExec(argv) {
 // A queued call just waits its turn; the host-side per-call timeout may still
 // fire for the waiting caller, but the worker stays healthy and drains.
 var _execChain = Promise.resolve();
+// A wasm-level trap (memory OOB, unreachable, abort) leaves the Asyncify
+// module permanently corrupted — feeding it more work just hangs to the
+// caller's timeout. Latch the first fatal, tell the host (which restarts the
+// worker), and fail every queued/subsequent exec fast with a clear message.
+var _moduleFatal = null;
+function isFatalExecError(e) {
+  if (typeof WebAssembly !== "undefined" && e instanceof WebAssembly.RuntimeError) return true;
+  if (e && e.name === "RuntimeError") return true;
+  return /memory access out of bounds|unreachable|table index is out of bounds|Aborted\(/.test(String(e && e.message || e));
+}
 function runExecQueued(argv) {
-  var run = function () { return runExec(argv); };
+  var run = function () {
+    if (_moduleFatal) {
+      return { output: "", error: "[vm fatal] " + _moduleFatal + " — guest module dead, VM restarting; retry the command", exitCode: null };
+    }
+    return runExec(argv);
+  };
   var p = _execChain.then(run, run);
   _execChain = p.then(function () {}, function () {});
   return p;
@@ -447,7 +476,8 @@ async function doExecute(cmd, session) {
     // Capture file unreadable — surface it instead of masquerading as empty
     // output (a "(no output)" streak on commands like `echo hello` is exactly
     // this case, and used to be silently swallowed here).
-    output = "[vm error: could not read command output: " + String(e && e.message || e) + "]";
+    var why = (e && (e.message || e.code || (e.errno != null ? "errno " + e.errno : ""))) || String(e);
+    output = "[vm error: could not read command output: " + why + "]";
   }
   if (r && r.error) output = "[vm error: " + r.error + "]" + (output === "(no output)" ? "" : "\n" + output);
   try { pid = parseInt(new TextDecoder().decode(FS.readFile(pidFile)).trim()) || null; } catch (e) {}
@@ -486,6 +516,16 @@ function unb64(str) {
 function makeSnapshot() {
   var files = {};
   walk(HOME, files);
+  // /tmp persists too: session workdirs (/tmp/sams_*), session state
+  // (.sess_*), and query result files survive a page refresh or a
+  // crash-restart instead of being recreated from scratch every boot.
+  // resetToFresh() remains the deliberate clean-slate path. Per-run
+  // transient capture artifacts are excluded — they're regenerated every
+  // command and would grow the snapshot without bound.
+  walk("/tmp", files);
+  Object.keys(files).forEach(function (p) {
+    if (/^\/tmp\/(\.stdout\.|\.stderr\.|out-|pid-|\.run-)/.test(p)) delete files[p];
+  });
   var manifest = { version: 1, home: HOME, files: {} };
   Object.keys(files).forEach(function (p) { manifest.files[p] = b64(files[p]); });
   return new TextEncoder().encode(JSON.stringify(manifest)).buffer;
@@ -511,6 +551,7 @@ self.onmessage = async function (ev) {
     // Assign a fake IP to each configured hostname (product-agnostic: the routes
     // come entirely from the integrator's init.vmRoutes). These seed /etc/hosts
     // and let the fetch bridge map guest connect() dests back to a hostname.
+    if (msg.proxyTimeoutMs > 0) PROXY_TIMEOUT_MS = msg.proxyTimeoutMs;
     if (msg.vmRoutes) {
       var ipN = 10;
       Object.keys(msg.vmRoutes).forEach(function (host) { VM_ROUTES["10.0.2." + (ipN++)] = host; });
