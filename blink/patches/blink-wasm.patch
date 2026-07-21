@@ -635,7 +635,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..c307248 100644
+index 34cc01c..e056e6f 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -2293,7 +2293,26 @@ index 34cc01c..c307248 100644
      if (nanosleep(&ts, 0)) {
        unassert(errno == EINTR);
        // this may run a guest signal handler before returning
-@@ -5620,6 +6761,20 @@ void OpSyscall(P) {
+@@ -4676,6 +5817,18 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
+     if ((gfds = (struct pollfd_linux *)AddToFreeList(m, malloc(gfdssize)))) {
+       rc = 0;
+       CopyFromUserRead(m, gfds, fdsaddr, gfdssize);
++#ifdef MVL_NATIVE_DEBUG
++      for (i = 0; i < nfds; ++i) {
++        int pfildes = Read32(gfds[i].fd);
++        struct Fd *pfd;
++        LOCK(&m->system->fds.lock);
++        pfd = GetFd(&m->system->fds, pfildes);
++        fprintf(g_mvldbg, "[Poll] m=%p i=%ld fd=%d events=%d path=%s\n",
++                (void *)m, i, pfildes, (int)Read16(gfds[i].events),
++                pfd && pfd->path ? pfd->path : "?");
++        UNLOCK(&m->system->fds.lock);
++      }
++#endif
+       for (;;) {
+         for (i = 0; i < nfds; ++i) {
+         TryAgain:
+@@ -5620,6 +6773,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -2314,7 +2333,7 @@ index 34cc01c..c307248 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +6875,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6887,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);
