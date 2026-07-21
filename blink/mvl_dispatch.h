@@ -92,4 +92,15 @@ bool MvlSchedHasLiveChild(int wpid);
 // from em_reset_children() alongside its existing resets.
 void MvlSchedReset(void);
 
+// SysExecve's vfork-child branch: tell the dispatcher the live fd ring now
+// lives on the NESTED System while the exec'd program runs on this fiber
+// (pass the nested System before RunMachineUntilExit; pass NULL right
+// after — that re-syncs the fiber's own fd view from the nested System's
+// final head). Without this, the fiber's saved head goes stale while the
+// exec'd program mutates the shared ring, and reinstalling it on a later
+// yield cross-splices the parent's and child's fd tables (observed as the
+// child's stdout resolving to the parent's redirect target — the Phase-4
+// "empty output" bug). See mvl_dispatch.c for the full account.
+void MvlSchedSetNestedFds(struct System *nested);
+
 #endif /* MVL_DISPATCH_H_ */

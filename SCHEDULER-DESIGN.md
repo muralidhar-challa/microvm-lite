@@ -547,16 +547,84 @@ the old model was synchronous (never two sides truly concurrent). Scoping
 that fix is real design work for a future session, not a bug to patch
 blind.
 
-**A related, likely-connected symptom**, found while validating the gate
-through the real VM contract: `window.vm.execute("sh -c 'sleep 1 & wait; echo EXIT:$?'")`
+**A related, likely-connected symptom** (STATUS: ROOT-CAUSED AND FIXED,
+2026-07-21 — see below), found while validating the gate through the real
+VM contract: `window.vm.execute("sh -c 'sleep 1 & wait; echo EXIT:$?'")`
 completes with the correct ~1s timing but returns **empty output** — the
 inner shell's own stdout write appears not to reach the worker's capture
-mechanism in this specific nested-shell-plus-backgrounding shape. Not
-separately root-caused; worth investigating together with the memory-
-isolation gap above, since both are manifestations of "concurrent
-scheduling exposes gaps in resources this scheduler currently shares
-uncritically" (memory for the crash; very possibly fd-table capture
-plumbing interacting with the new independent-fds mechanism for this one).
+mechanism in this specific nested-shell-plus-backgrounding shape. The
+speculation at the time ("very possibly fd-table capture plumbing
+interacting with the new independent-fds mechanism") was correct.
+
+### Root cause of the empty-output symptom AND a production crash (fixed)
+
+This same bug reached production: a live UI trace showed `sqlite3 :memory:
+< file.sql` (reading JSON via `readfile()`/`json_each`, inside the
+orchestrator's session-shell wrapper — export/mkdir/heredoc/redirect, the
+same general shape as the gate's `sleep & wait` line) throwing
+`RuntimeError: memory access out of bounds` in `blink.wasm` and
+permanently wedging the VM (every later call timed out — this is what
+motivated the worker-side crash-latch/auto-restart resilience work, still
+correct and kept as defense-in-depth, but the underlying wasm bug is now
+fixed at the source). Bisecting confirmed nondeterminism tied to fd-table
+layout, not to the specific SQL or file size.
+
+**Root cause, confirmed via native `lldb` (`EXC_BAD_ACCESS` at address
+`0x8` inside `dll_splice_after`, called from `SysDup2`→`AddFd`→`ForkFd`):**
+`mvl_dispatch.c`'s `g_mvl_canonical_fds` — the fd-list head shared by every
+non-independent-fds fiber (main + thread-style) — was captured **once**,
+the first time `MvlSchedEnsureMain()` ever ran, and never updated again.
+But the head is not a stable pointer: `dll_make_first`/`dll_remove` (guest
+open/close/dup) move it on essentially every syscall. The moment ANY
+fiber's fd table changed after that first capture, `g_mvl_canonical_fds`
+went stale; the next `MvlSchedInstallFds` reinstalled the stale head into
+whichever fiber resumed, and a subsequent open/dup on top of it either (a)
+silently missed fds opened since the snapshot — the "empty output" shape,
+a write/lookup landing on the wrong or a defunct fd — or (b) spliced a
+freed/foreign list node back into the live ring, corrupting it — the
+production `EXC_BAD_ACCESS`/wasm-OOB crash shape. Two symptoms, one bug;
+which one you hit depended on exactly which fds were touched in what order,
+which is why it looked nondeterministic and layout-sensitive.
+
+**Fix** (`mvl_dispatch.c`): a new `MvlSchedSaveFds(t)` re-captures the
+*live* head (from `t`'s actual `fds.list`, not a remembered pointer) and is
+called at **every** swap-away site — both `MvlSchedSwapToNext` (the
+periodic/futex/nanosleep yield path) and `MvlSchedThreadExitAndYield` (the
+exit path; a dying non-independent-fds fiber's final fd state must update
+the canonical head too, or its closes resurrect on the next fiber's
+resume). A second, related gap: `SysExecve`'s vfork-child branch
+(`syscall.c`) runs the exec'd program in a **nested** `Machine`+`System` on
+the same fiber — from that point the live ring genuinely lives on the
+nested `System`, not the fiber's own `m->system`, so save/install must
+follow it there. New `MvlSchedSetNestedFds(nested)` (called right before
+`RunMachineUntilExit(m2)` with the nested System, and with `NULL` right
+after — which also re-syncs the fiber's own fd view from the nested
+System's final head) makes both functions look in the right place for the
+whole nested run.
+
+**Verification:** native `lldb` repro (the exact session-wrapper shell
+shape from the production trace, run in a loop under `MVL_NATIVE_DEBUG`)
+crashed reliably before the fix and is clean after — 0/6+ failures across
+repeated runs, machine-pointer-tagged syscall tracing confirms the correct
+fiber's writes land on the correct fd throughout. In the browser: the
+production trace's exact failing command (`crash-bisect.mjs` variant F,
+the synthetic session wrapper with no state-save trailer) went from a
+reliable crash to a reliable pass; a tighter loop
+(`crash-repro.mjs`, the two exact SQL queries from the live trace, 6
+iterations) shows zero failures and the VM alive afterward.
+`contract.spec.mjs` (28/28, including the pre-existing Phase-4 fork/session
+cases), `dist-smoke.spec.mjs`, and `native-phase3-pthread-selftest.sh`
+(thread-style scheduling, unaffected by this fix, still `PASS: counter=
+40000`) all green — zero regression. The patch was regenerated into
+`blink/patches/blink-wasm.patch` and verified to `git apply --check` clean
+against a **fresh** clone of upstream blink (not dependent on the dirty
+local `blink-src/` checkout), then the whole wasm pipeline was rebuilt
+from that clean patch apply before any of the above verification ran.
+
+**This does NOT close the memory-isolation gap below** — that's a
+different resource (guest memory pages, not the fd-list head) and remains
+open. It DOES mean the empty-output symptom recorded above, and the
+specific production crash that motivated this investigation, are resolved.
 
 **Also newly built** (a real, separately-useful fix, verified via the
 one-line-vs-two-line experiment above to NOT be the memory-isolation
@@ -576,12 +644,38 @@ fibers — on every swap, symmetric with the existing `g_machine`
 save/restore. This is real, needed groundwork regardless of the memory
 gap; it's just not sufficient by itself.
 
+**A second, DISTINCT stdout-loss shape, found while verifying the fds fix
+above — NOT fixed, NOT the same bug, sharpens the memory-isolation gap's
+scope.** Native `lldb` repro of the production trace's exact `sqlite3`
+invocation (the *real* `own_system`/private-fork path — plain `fork()`, no
+`CLONE_VM`, the common case for dash's own children, distinct from the
+`CLONE_VM`-with-stack path Phase 4's four bugs above are about) shows the
+crash is gone, but the child's own query output never appears: syscall
+tracing tagged with the owning `Machine*` shows the forked `sqlite3` fiber
+opening its libraries and config file correctly, then simply never calling
+`write()` on fd 1 at all before the outer shell resumes — not a failed
+write, an absent one. `own_system` fibers are deliberately exempt from
+`MvlSchedInstallFds`/`MvlSchedSaveFds` (`if (t->own_system) return;` — they
+own a private `System` with its own real fd table, copied at fork time via
+`EmDupFdsForChild`, so the canonical-head mechanism above doesn't apply to
+them at all), which rules out the bug just fixed as the cause. Not yet
+root-caused: candidates include the private fd table's copied `realfd`s
+racing against the SAME real host fd namespace every fiber shares (`fds.h`:
+"every fiber in this process still shares one real host fd namespace"), or
+a `g_machine`/scheduling interaction specific to `own_system` fibers that
+Phase 4's `g_machine`-nesting fix didn't cover. This is a second concrete,
+reproducible instance of the memory/resource-isolation gap already scoped
+below — evidence for that scoping work, not a new open item to track
+separately.
+
 **Recommendation:** do not enable Fork()'s new concurrent path for
 anything beyond the verified-safe shapes above (single background job
 immediately followed by `wait` on the same logical statement, or
 sequential non-backgrounded commands) until the memory-isolation gap is
 addressed. Phase 5 (JS contract wiring for `{done:false, pid}`) should
 wait for that work, not build on top of a known-corruptible foundation.
+The fds-head fix above closes one concrete crash/data-loss path but the
+broader gap — and this second `own_system` stdout-loss shape — remain.
 
 **Phase 5 — wire the JS contract. TWO HARD PREREQUISITES, in order:
 (a) the Phase 4 memory-isolation gap (a concurrently-scheduled fork child

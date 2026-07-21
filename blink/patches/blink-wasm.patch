@@ -52,7 +52,7 @@ index 3571b61..06da822 100644
    GetStartDir();
  #ifndef NDEBUG
 diff --git a/blink/close.c b/blink/close.c
-index daf01d6..73a7497 100644
+index daf01d6..d951e7a 100644
 --- a/blink/close.c
 +++ b/blink/close.c
 @@ -36,10 +36,21 @@
@@ -110,7 +110,7 @@ index daf01d6..73a7497 100644
    struct Fd *fd;
 +#ifdef MVL_NATIVE_DEBUG
 +  extern FILE *g_mvldbg;
-+  fprintf(g_mvldbg, "[SysClose] fildes=%d\n", fildes);
++  fprintf(g_mvldbg, "[SysClose] m=%p fildes=%d\n", (void *)m, fildes);
 +#endif
    LOCK(&m->system->fds.lock);
    if ((fd = GetFd(&m->system->fds, fildes))) {
@@ -531,7 +531,7 @@ index 7d5cc93..3260232 100644
    if (!(entry & PAGE_XD) && !(entry & PAGE_RSRV)) {
      *executable_code_was_made_non_executable = true;
 diff --git a/blink/open.c b/blink/open.c
-index f717c07..e92247a 100644
+index f717c07..5bf5f43 100644
 --- a/blink/open.c
 +++ b/blink/open.c
 @@ -122,6 +122,10 @@ int SysOpenat(struct Machine *m, i32 dirfildes, i64 pathaddr, i32 oflags,
@@ -540,7 +540,7 @@ index f717c07..e92247a 100644
    RESTARTABLE(fildes = VfsOpen(GetDirFildes(dirfildes), path, sysflags, mode));
 +#ifdef MVL_NATIVE_DEBUG
 +  extern FILE *g_mvldbg;
-+  fprintf(g_mvldbg, "[SysOpenat] path=%s -> fildes=%d\n", path, fildes);
++  fprintf(g_mvldbg, "[SysOpenat] m=%p path=%s -> fildes=%d\n", (void *)m, path, fildes);
 +#endif
    if (fildes != -1) {
      if (fildes >= lim) {
@@ -635,7 +635,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..3d80977 100644
+index 34cc01c..c307248 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -1702,6 +1702,14 @@ index 34cc01c..3d80977 100644
 -  // noting Linux reproduces that in both its dup(2) and dup(3) manual
 -  RESTARTABLE(rc = VfsDup2(fildes, newfildes));
 -  return rc;
+-}
+-
+-#ifdef HAVE_DUP3
+-static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
+-  int rc;
+-  // The Linux Programmer's Manual also lists this as interruptible.
+-  RESTARTABLE(rc = VfsDup3(fildes, newfildes, flags));
+-  return rc;
 +// See fds.h's realfd comment. dup2()/dup3()/fcntl(F_DUPFD*) with an explicit
 +// target guest number must never do a REAL host dup onto that literal
 +// number — this process has exactly one real host fd namespace shared by
@@ -1714,16 +1722,8 @@ index 34cc01c..3d80977 100644
 +static int DupToRealfd(struct Fds *fds, int fildes) {
 +  return VfsFcntl(GetRealFd(fds, fildes), F_DUPFD_CLOEXEC, kMinBlinkFd);
  }
- 
--#ifdef HAVE_DUP3
--static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
--  int rc;
--  // The Linux Programmer's Manual also lists this as interruptible.
--  RESTARTABLE(rc = VfsDup3(fildes, newfildes, flags));
--  return rc;
--}
 -#endif
--
+ 
  static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
 -  int rc, oflags;
 -  struct Fd *fd;
@@ -1935,7 +1935,7 @@ index 34cc01c..3d80977 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2381,9 +3333,11 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+@@ -2381,17 +3333,26 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -1946,8 +1946,15 @@ index 34cc01c..3d80977 100644
 +    realfd = fildes;
    }
    UNLOCK(&m->system->fds.lock);
++#ifdef MVL_NATIVE_DEBUG
++  if (!fd || fildes <= 2) {
++    fprintf(g_mvldbg, "[SysWrite] m=%p fildes=%d fd=%p realfd=%d size=%llu path=%s\n",
++            (void *)m, fildes, (void *)fd, fd ? realfd : -999, (unsigned long long)size,
++            fd && fd->path ? fd->path : "?");
++  }
++#endif
    if (!fd) return -1;
-@@ -2391,7 +3345,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+   if ((oflags & O_ACCMODE) == O_RDONLY) return ebadf();
    if (size) {
      InitIovs(&iv);
      if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
@@ -1956,7 +1963,7 @@ index 34cc01c..3d80977 100644
        if (rc != -1) SetReadAddr(m, addr, rc);
      }
      FreeIovs(&iv);
-@@ -2464,7 +3418,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
+@@ -2464,7 +3425,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
  static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                        i64 offset, i32 flags) {
    i64 rc;
@@ -1965,7 +1972,7 @@ index 34cc01c..3d80977 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*readv_impl)(int, const struct iovec *, int);
-@@ -2478,9 +3432,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2478,9 +3439,11 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(readv_impl = fd->cb->readv);
      oflags = fd->oflags;
@@ -1977,7 +1984,7 @@ index 34cc01c..3d80977 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2490,13 +3446,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2490,13 +3453,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -1993,7 +2000,7 @@ index 34cc01c..3d80977 100644
          }
        } else {
          rc = 0;
-@@ -2512,7 +3468,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2512,7 +3475,7 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                         i64 offset, i32 flags) {
    i64 rc;
@@ -2002,7 +2009,7 @@ index 34cc01c..3d80977 100644
    struct Fd *fd;
    struct Iovs iv;
    ssize_t (*writev_impl)(int, const struct iovec *, int);
-@@ -2526,9 +3482,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2526,9 +3489,11 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      unassert(fd->cb);
      unassert(writev_impl = fd->cb->writev);
      oflags = fd->oflags;
@@ -2014,7 +2021,7 @@ index 34cc01c..3d80977 100644
    }
    UNLOCK(&m->system->fds.lock);
    if (!fd) return -1;
-@@ -2538,14 +3496,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2538,14 +3503,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
      if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
        if (iv.i) {
          if (offset == -1) {
@@ -2031,7 +2038,7 @@ index 34cc01c..3d80977 100644
          }
        } else {
          rc = 0;
-@@ -2559,6 +3517,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+@@ -2559,6 +3524,9 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
  }
  
  static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
@@ -2041,7 +2048,7 @@ index 34cc01c..3d80977 100644
    return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
  }
  
-@@ -2652,9 +3613,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+@@ -2652,9 +3620,16 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
    struct dirent *ent;
    struct dirent_linux rec;
    if (size < sizeof(rec) - sizeof(rec.name)) return einval();
@@ -2059,7 +2066,7 @@ index 34cc01c..3d80977 100644
    if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
      return -1;
    }
-@@ -2743,7 +3711,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
+@@ -2743,7 +3718,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
    if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
    if (!(fd = GetAndLockFd(m, fildes))) return -1;
    if (!fd->dirstream) {
@@ -2068,7 +2075,7 @@ index 34cc01c..3d80977 100644
    } else if (whence == SEEK_SET_LINUX) {
      if (!offset) {
        VfsRewinddir(fd->dirstream);
-@@ -2806,10 +3774,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
+@@ -2806,10 +3781,13 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
  }
  
  static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
@@ -2084,7 +2091,7 @@ index 34cc01c..3d80977 100644
      XlatStatToLinux(&gst, &st);
      if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
    }
-@@ -3253,7 +4224,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3253,7 +4231,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
      rc = UnXlatOpenFlags(fd->oflags);
    } else if (cmd == F_SETFD_LINUX) {
      if (!(arg & ~FD_CLOEXEC_LINUX)) {
@@ -2093,7 +2100,7 @@ index 34cc01c..3d80977 100644
          fd->oflags &= ~O_CLOEXEC;
          if (arg) fd->oflags |= O_CLOEXEC;
          rc = 0;
-@@ -3266,7 +4237,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+@@ -3266,7 +4244,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
    } else if (cmd == F_SETFL_LINUX) {
      fl = XlatOpenFlags(arg & (O_APPEND_LINUX | O_ASYNC_LINUX | O_DIRECT_LINUX |
                                O_NOATIME_LINUX | O_NDELAY_LINUX));
@@ -2102,7 +2109,7 @@ index 34cc01c..3d80977 100644
        fd->oflags &= ~SETFL_FLAGS;
        fd->oflags |= fl;
        rc = 0;
-@@ -3526,6 +4497,7 @@ static void ResetSignalDispositions(struct System *s) {
+@@ -3526,6 +4504,7 @@ static void ResetSignalDispositions(struct System *s) {
    UNLOCK(&s->sig_lock);
  }
  
@@ -2110,7 +2117,7 @@ index 34cc01c..3d80977 100644
  static void ExecveBlink(struct Machine *m, char *prog, char **argv,
                          char **envp) {
    char *execfn;
-@@ -3627,6 +4599,148 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+@@ -3627,6 +4606,156 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    }
    return rc;
  }
@@ -2137,7 +2144,7 @@ index 34cc01c..3d80977 100644
 +  if (!(argv = CopyStrList(m, aa))) return -1;
 +  if (!(envp = CopyStrList(m, ea))) return -1;
 +#ifdef MVL_NATIVE_DEBUG
-+  fprintf(g_mvldbg, "[SysExecve] %s vfork_child=%d\n", prog, (int)m->em_vfork_child);
++  fprintf(g_mvldbg, "[SysExecve] m=%p %s vfork_child=%d\n", (void *)m, prog, (int)m->em_vfork_child);
 +#endif
 +  LOCK(&m->system->exec_lock);
 +  sigfillset(&block);
@@ -2171,8 +2178,16 @@ index 34cc01c..3d80977 100644
 +    m2->system->exec = m->system->exec;
 +    memcpy(m2->system->rlim, m->system->rlim, sizeof(m2->system->rlim));
 +    m2->system->fds.list = m->system->fds.list;  // inherit redirected fds
++    // The live fd ring now moves with m2 (its opens/closes update
++    // m2->system->fds.list, not m->system's) — point the dispatcher's
++    // save/install at the nested System for the duration, or a yield
++    // during the nested run re-installs a stale pre-exec head and
++    // cross-splices this table with a concurrently-running fiber's (see
++    // MvlSchedSetNestedFds in mvl_dispatch.c).
++    MvlSchedSetNestedFds(m2->system);
 +    LoadProgram(m2, prog, prog, argv, envp, NULL);
 +    status = RunMachineUntilExit(m2);
++    MvlSchedSetNestedFds(0);  // re-syncs our fd view from m2's final head
 +    m2->system->fds.list = 0;  // detach: those fds belong to the parent/host
 +    FreeMachine(m2);
 +    g_machine = saved_g;
@@ -2259,7 +2274,7 @@ index 34cc01c..3d80977 100644
  
  static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
    int rc;
-@@ -3922,6 +5036,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+@@ -3922,6 +5051,18 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
    for (;;) {
      if (CompareTime(now, deadline) >= 0) return 0;
      ts = SubtractTime(deadline, now);
@@ -2278,7 +2293,7 @@ index 34cc01c..3d80977 100644
      if (nanosleep(&ts, 0)) {
        unassert(errno == EINTR);
        // this may run a guest signal handler before returning
-@@ -5620,6 +6746,20 @@ void OpSyscall(P) {
+@@ -5620,6 +6761,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -2299,7 +2314,7 @@ index 34cc01c..3d80977 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +6860,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6875,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);
