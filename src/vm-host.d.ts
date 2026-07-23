@@ -9,8 +9,17 @@ export interface StartVMOptions {
   cdnBase?: string;
   /** URL of vm-worker.js (same-origin, or its source is inlined via blob). */
   workerUrl?: string;
-  /** Host-side HTTP routes exposed to the guest at http://api.vm/... */
+  /**
+   * Host-side HTTP routes exposed to the guest, keyed by hostname. No hostname
+   * is special-cased — any entry (e.g. `api.vm`) is seeded into /etc/hosts and
+   * routed the same way. Unknown hosts get a 403.
+   */
   vmRoutes?: Record<string, unknown>;
+  /**
+   * Cap on a guest HTTP request before the bridge synthesizes a 504.
+   * Defaults to the worker's 300000 ms.
+   */
+  proxyTimeoutMs?: number;
 }
 
 /** Boot the VM and install window.vm. Idempotent: later calls return the same promise. */

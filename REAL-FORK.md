@@ -1,5 +1,14 @@
 # Real fork(): giving each fork child its own address space
 
+**Status: landed and green (f969ada, 2026-07-20).** Dead shared-memory-fork
+machinery removed in eb24a61. Two follow-ons came out of this work and are
+tracked separately: a child-pid collision that this model's
+one-fresh-`System`-per-fork made reachable — fixed, see
+[CHILD-PID-COLLISION-BUG.md](CHILD-PID-COLLISION-BUG.md) — and an open
+fd-lifetime-across-forks investigation (an indefinite `poll()` on orphaned
+pipe fds), noted under Phase 4's follow-up in
+[SCHEDULER-DESIGN.md](SCHEDULER-DESIGN.md).
+
 Successor to SCHEDULER-DESIGN.md's Phase 4. That phase deliberately shipped
 "share, don't isolate" — fork children share the parent's `struct System`,
 so memory AND fds are shared, with no copy-on-write. That was a
@@ -42,14 +51,14 @@ honest instead of one case pretending to be the other.
 | # | Real POSIX | Today | After |
 |---|---|---|---|
 | 1 | address space COW-copied, child's writes private | fully shared, only the stack duplicated | private copy |
-| 2 | fd table copied; guest numbers preserved, open-file-descriptions shared | dup'd, numbers preserved via `realfd` (fixed in 7ee24de) | unchanged, but owned by the child's System |
+| 2 | fd table copied; guest numbers preserved, open-file-descriptions shared | dup'd, numbers preserved via `realfd` (fixed in 5e3a5f4) | unchanged, but owned by the child's System |
 | 3 | **child exit closes the child's fds** | never happens | `FreeSystem` does it |
 | 4 | pipe: blocking read, EOF when last write end closes, `EPIPE` when last read end closes | temp file; `read()==0` ambiguous; no `EPIPE` | EOF becomes real (3); `EPIPE` still absent |
 | 5 | child is a zombie until `wait()`, then reaped | fiber unlinked; Machine, 256 KB host stack, fd list all leaked | reaped |
 
 Row 3 is why `seq 1 5 | head -2` wedges. `head` exits early; nothing closes
 its fds; the write-end `Fd` stranded in the dead child's list keeps
-`MvlPipeRef.refcount > 0` forever; `SysRead`'s retry loop (added in 7ee24de)
+`MvlPipeRef.refcount > 0` forever; `SysRead`'s retry loop (added in 5e3a5f4)
 then waits for a writer that already exited, and that fiber never finishes.
 Measured: a healthy 150-pipeline session frees 300 child stacks; a poisoned
 one frees 4.
@@ -57,7 +66,7 @@ one frees 4.
 ## What this deletes (final tally — the plan below over-estimated)
 
 The plan assumed EVERY fork-style child would go private, but musl's
-posix_spawn trampoline (Rust's `std::process::Command`, i.e. the guestcli CLI)
+posix_spawn trampoline (Rust's `std::process::Command`, i.e. a Rust guest CLI)
 calls `clone(CLONE_VM|CLONE_VFORK, stack)` — genuinely shared memory with a
 guest-supplied stack — and that path stays. So the shared-System machinery
 splits into deleted vs. still-load-bearing:

@@ -7,9 +7,9 @@ that's a separate, normal release decision, not a bug-block anymore.
 
 ## Symptom
 
-Reported from the host app's subagent feature: a shelled-out subprocess (Rust's
-`std::process::Command::new("sh")...output()`, in `agent-rs/src/bin/agent.rs`
-line ~86) intermittently fails with:
+Reported from a host app's subagent feature: a shelled-out subprocess (Rust's
+`std::process::Command::new("sh")...output()`, in that app's agent binary)
+intermittently fails with:
 
 ```
 Error: No child process (os error 10)
@@ -79,7 +79,7 @@ the same pid regardless of how many independent `System`s exist.
   concurrent `vm.execute()` calls fired without awaiting the first — no
   guest-side `&` at all, matching how overlap would actually occur if
   `agent_busy` (a *prompt-level*, not code-enforced, guard in
-  `system.md`) were ever violated — 25/25 clean, zero collisions, zero
+  the orchestrator's prompt spec) were ever violated — 25/25 clean, zero
   hangs.
 - Full regression: `realfork-test.mjs` (0/60 fail), `contract.spec.mjs`
   (17/17), `guest-userland.mjs` (10/10) all green after the fix.
@@ -95,7 +95,17 @@ all in some variants tested) — most likely a scheduler/job-control
 interaction specific to one shell backgrounding multiple children and
 `wait`ing on all of them at once.
 
-**Deliberately not chased further**: `system.md`'s `Delegate()` procedure
+**Possibly the same root cause as a later finding.** On 2026-07-21 a
+`Poll()` fd-list trace (`MVL_NATIVE_DEBUG` only, 31b9165) pinned an
+unrelated-looking guest-CLI table-output hang on a real, indefinite
+`poll()` over two orphaned pipe fds — i.e. fds outliving the fork child that should have
+closed them. A `wait` builtin blocking forever on two backgrounded jobs
+fits that shape. Whoever picks up the fd-leak-across-forks investigation
+(see Phase 4's follow-up in [SCHEDULER-DESIGN.md](SCHEDULER-DESIGN.md))
+should re-run `isolate-hang.mjs` under that trace before assuming these are
+two bugs.
+
+**Deliberately not chased further**: the orchestrator's `Delegate()` procedure
 explicitly documents "foreground, never background (&)", and the
 realistic overlap path (separate `vm.execute()` calls, verified above) is
 what subagent actually risks, not guest-side `&`. Revisit only if a real
@@ -107,6 +117,6 @@ anything today.
 - **Fixed and verified**, per above.
 - No longer blocks a `microvm-v*` tag on its own; production promotion is
   a separate, ordinary release decision now.
-- Related: [[REAL-FORK.md]] — this bug was a side effect of real fork()'s
+- Related: [REAL-FORK.md](REAL-FORK.md) — this bug was a side effect of real fork()'s
   private-System-per-fork model, not a flaw in the private-address-space
   design itself.

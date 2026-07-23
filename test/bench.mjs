@@ -1,6 +1,6 @@
 // M1 performance gate: benchmark the blink guest against the v86 timing budget.
 //
-// v86 reference budget (agent-rs/skills/env.md):
+// v86 reference budget (from the predecessor's own measurements):
 //   simple_shell        : 150-400 ms
 //   pdftotext_per_10_pages : 25-35 s
 //   pdftotext_100_pages    : 60-90 s

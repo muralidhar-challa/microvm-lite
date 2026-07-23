@@ -1,17 +1,36 @@
 # Blink WASM Shell — Build Notes
 
+> ⚠️ **Mostly historical. Do not treat this as current.** Everything from
+> "Architecture" down to "M0 Port Findings" describes the original v86-era
+> spike: busybox `hush` on a NOMMU build, a JS-emulated REPL with no shell
+> process, paths under `/Volumes/Data/code/v86/`, and SharedArrayBuffer via
+> `coi-serviceworker.js`. **All of that is gone.** microvm-lite now runs dash
+> + toybox under a real in-guest process model, real `fork()` with a private
+> address space per child, and no SAB/COOP-COEP at all.
+>
+> Still accurate and worth keeping: the **excluded-source-files table** (it
+> still matches `build.sh`'s `grep -vE` list) and the **M0 Port Findings** at
+> the bottom (config.h shadowing, the `mkfifoat_` stub, the
+> `callMain`-isn't-Asyncify-safe finding, and `em_reset_getopt` — all four
+> still hold and are load-bearing in `build.sh`/`stubs.c` today).
+>
+> For current state see [../README.md](../README.md),
+> [../SCHEDULER-DESIGN.md](../SCHEDULER-DESIGN.md), and
+> [../REAL-FORK.md](../REAL-FORK.md).
+
 ## What This Is
 
 A browser-based x86-64 Linux emulator built from [blink](https://github.com/jart/blink)
 compiled to WebAssembly via Emscripten. It runs real x86-64 Linux ELF binaries in the
 browser with no server-side execution.
 
-**Current state:** Working shell (busybox hush, NOMMU build) + file manager UI. Rust `guestbin` binary
+**State as of this writing (historical):** Working shell (busybox hush, NOMMU build)
++ file manager UI. A Rust document-processing binary
 runs successfully inside the emulator. Shell stays alive; fork-based commands being resolved via NOMMU/vfork.
 
 ---
 
-## Architecture
+## Architecture (historical — v86-era layout and paths)
 
 ```
 blink-src/          ← blink C source (cloned from github.com/jart/blink)
@@ -64,7 +83,7 @@ Open: http://localhost:8765/blink.html
 
 ---
 
-## Source Files Excluded From Build
+## Source Files Excluded From Build (still current)
 
 These were excluded because they use platform headers unavailable in Emscripten
 (sys/sysctl.h, sys/mount.h, sys/sysinfo.h) or have a conflicting `main()`:
@@ -131,7 +150,7 @@ sed, etc.) gets its own copy of the busybox binary so argv[0] detection works.
 
 ### \r → \n conversion
 xterm sends `\r` (13) on Enter. Converted to `\n` (10) before pushing to
-stdinBuffer so line-oriented programs (guestbin's BufRead::lines()) see newlines
+stdinBuffer so line-oriented programs (Rust BufRead::lines()) see newlines
 correctly.
 
 ### put_char \n → \r\n
@@ -153,7 +172,13 @@ Also hooked to `window.resize`.
 
 ---
 
-## Busybox Build
+## Busybox Build (historical — superseded by dash + toybox)
+
+> The premise of this whole section — "fork is impossible in WebAssembly" —
+> was disproved. blink's WASM build implements `fork()` in-guest, and since
+> f969ada each child gets a genuinely private address space
+> ([../REAL-FORK.md](../REAL-FORK.md)). busybox/hush/NOMMU were dropped for
+> dash (BSD-3-Clause) + toybox (0BSD) in 2859963.
 
 ### Why NOMMU?
 
@@ -203,16 +228,16 @@ await Module.callMain(['/bin/busybox', 'hush', '-i']);
 
 ---
 
-## guestbin Integration
+## Rust guest-binary integration
 
-`guestbin` is a Rust JSON-lines document processor (PDF + XLSX).
-Binary: `guest-binary-rs/target/x86_64-unknown-linux-musl/release/guestbin`
+The guest binary used during this spike was a Rust JSON-lines document
+processor (PDF + XLSX), built for x86_64-unknown-linux-musl.
 
-Upload via file manager → runs as `/root/guestbin` in the shell.
+Upload via file manager → runs as `/root/<binary>` in the shell.
 
 Usage from shell:
 ```sh
-./guestbin
+./<binary>
 {"cmd":"ping"}
 → {"ok":true,"text":"pong"}
 ```
@@ -230,7 +255,12 @@ BlinkFS.readdir(path?)                       // list /root by default
 
 ---
 
-## Known Issues / TODO
+## Known Issues / TODO (historical — all resolved differently)
+
+> The JS-REPL design below was the v86-era answer to "no fork". It is not how
+> microvm-lite works: there is a real dash process inside the guest, real
+> pipes, real redirection, and a persistent FS snapshot in IndexedDB. The
+> "Known Limitations / TODO" list that follows it is likewise obsolete.
 
 ### Fork / vfork — resolved via JS REPL
 
@@ -266,7 +296,7 @@ The shell is emulated entirely in JavaScript — no shell process runs inside bl
   - Both flags reset at start and end of every `runCommand` so a failed pipe never hangs the shell
   - Temp files use timestamp-unique names (`/.pipeN_i`) and are deleted after use
 - **stdin passthrough**: while a command is running (`replRunning=true`), keystrokes go to
-  `stdinBuffer` so interactive programs (e.g. `guestbin`) still work
+  `stdinBuffer` so interactive programs (e.g. a Rust REPL binary) still work
 - **`em_readv` fix**: only polls-loops on fd==0 (stdin). Previously polled all fds, causing
   `tail file` to hang even when reading a regular file argument.
 - **Paste detection**: `data.length > 1` = paste; appended to line buffer without executing,
@@ -286,10 +316,10 @@ The shell is emulated entirely in JavaScript — no shell process runs inside bl
 
 ---
 
-# M0 Port Findings (busybox-wasm/microvm, 2026-07-13)
+# M0 Port Findings (busybox-wasm/microvm, 2026-07-13) — STILL CURRENT
 
 Ported from v86/blink into microvm/. Four root causes fixed to get Rust static
-x86_64-musl binaries (mytool, probe) running in a Worker:
+x86_64-musl binaries (an xlsx tool, a probe) running in a Worker:
 
 ## 1. config.h shadowing (build.sh regression vs the original spike)
 `blink/builtin.h` does `#include "config.h"` and emcc is invoked with `-I.`
@@ -330,5 +360,5 @@ place pointer never dangles into freed memory.
 - emcc 5.x needs python ≥3.10: build.sh prepends /opt/homebrew/bin to PATH.
 - Host-page gotcha: `var status = ...` collides with window.status (silent
   string coercion) — the test page uses statusEl.
-- Timings (M0, arm64 Mac, -O2): busybox applets 20-50ms, Rust mytool help ~270ms,
-  mytool ping ~230ms end-to-end per exec.
+- Timings (M0, arm64 Mac, -O2): busybox applets 20-50ms, Rust tool help ~270ms,
+  tool ping ~230ms end-to-end per exec.

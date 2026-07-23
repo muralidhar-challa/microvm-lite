@@ -29,5 +29,5 @@ dist/bin/
 dist/rootfs/
 dist/pidcollide
 
-# local convenience symlink → ../public/microvm
+# local convenience symlink to a downstream product's dist dir
 product-dist

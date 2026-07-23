@@ -1,11 +1,11 @@
 // microvm-lite main-thread host (M4 contract layer).
 //
-// Transcribes the main-thread half of the host app's the v86 host against the blink
-// worker (vm-worker.js): installs the identical `window.vm` API and
-// `window.registerVmEndpoint`, the gzip+IndexedDB snapshot cache with
+// Transcribes the main-thread half of the v86-based predecessor this replaces
+// against the blink worker (vm-worker.js): installs the identical `window.vm`
+// API and `window.registerVmEndpoint`, the gzip+IndexedDB snapshot cache with
 // etag/TTL, `resetToFresh`, and the proxy_request → registerVmEndpoint routing.
-// A drop-in backend swap: the host app's the host bridge talks to `window.vm` and
-// never learns which emulator is underneath.
+// A drop-in backend swap: a host app talks to `window.vm` and never learns
+// which emulator is underneath.
 //
 // Differences from the v86 host, all deliberate:
 //  - No libv86/zstd/boot-command machinery — blink has no BIOS/kernel and no
@@ -15,7 +15,7 @@
 //    because it is agnostic to what the ArrayBuffer contains.
 //  - etag is a caller-supplied build id (there is no base state URL to HEAD).
 
-// ── IndexedDB (identical to the v86 host) ───────────────────────────────────────
+// ── IndexedDB (identical to the v86 host) ───────────────────────────────────
 const IDB_NAME = "microvm-lite-data";
 const IDB_STORE = "snapshot";
 
@@ -152,7 +152,7 @@ async function handleVirtualRequest(pathname, method, bodyText, url, hostname, g
   return { status: 404, body: JSON.stringify({ __error__: "no handler for: " + pathname }) };
 }
 
-// ── Singleton state (mirrors the v86 host) ──────────────────────────────────────
+// ── Singleton state (mirrors the v86 host) ──────────────────────────────────
 let _worker = null;
 let _ready = false;
 let _startPromise = null;

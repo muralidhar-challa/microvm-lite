@@ -44,12 +44,12 @@
     'llm.vm': function (req) {
       var n = llmCalls.push(JSON.parse(req.body));
       if (n === 1) {
-        // first iteration: ask the runner to run its shell tool
+        // first iteration: ask the agent to run its shell tool
         return { status: 200, body: JSON.stringify({
           content: [
             { type: 'text', text: 'Let me check.' },
             // A SIMPLE command: exercises the full HTTP round-trip through the
-            // runner's run_shell tool. A pipeline here (echo|tr) hits the known
+            // agent's run_shell tool. A pipeline here (echo|tr) hits the known
             // M2 limitation — output of a pipeline captured across a Rust
             // Command (probe spawnsh) is lost — which is a fork/fd issue, not
             // an HTTP-bridge one. See project_microvm_backend memory.

@@ -1,5 +1,18 @@
 # M1 Performance Gate — Results
 
+> ⚠️ **Point-in-time, and no longer reproducible as written.** These are the
+> M1 gate numbers from 2026-07-13. Most rows measure binaries the reference
+> build has since dropped — GPL poppler (`pdftotext`/`pdfinfo`/`pdftoppm`) was
+> removed in ae135e1, and `sqlite3` and an in-house xlsx tool were never part
+> of the permissive dash + toybox toolchain adopted in 2859963. They remain useful as evidence
+> that blink comfortably beats a full-system emulator on the common path, and
+> as a template for benchmarking your *own* layered binaries. They are not a
+> description of what `bash dist/build-dist.sh` produces today.
+>
+> The process model has also changed substantially since (real `fork()` with a
+> private address space per child, a cooperative scheduler) — re-measure before
+> quoting any of this.
+
 Date: 2026-07-13 · Host: Apple Silicon Mac · blink.wasm **interpreter** (JIT
 disabled), `-O2`, ASYNCIFY build · Chromium headless via Playwright.
 
@@ -12,10 +25,10 @@ Run it yourself: static server on :8765 serving `test/`, then
 |---|---:|---|---|
 | boot-to-ready (incl. all binary + rootfs fetches) | 193 | — | — |
 | echo — simple shell | 24 | 150–400 ms | **6–16× faster** |
-| mytool ping (Rust static) | 248 | — | — |
-| mytool excel_create | 392 | 300 ms–10 s | within |
-| mytool excel_set_batch 50 cells | 610 | 3–5 s | **5–8× faster** |
-| mytool excel_get col | 433 | 300 ms–10 s | within |
+| xlsx tool ping (Rust static) | 248 | — | — |
+| xlsx tool create | 392 | 300 ms–10 s | within |
+| xlsx tool set_batch 50 cells | 610 | 3–5 s | **5–8× faster** |
+| xlsx tool get col | 433 | 300 ms–10 s | within |
 | sqlite3 create + 1k rows + aggregate | 264 | — | fast |
 | pdfinfo (1st dynamic exec — warms musl loader + lib closure) | 640 | — | — |
 | **pdftotext 10 text pages** | **3 115** | **25–35 s** | **~8–11× faster** |
@@ -28,8 +41,8 @@ the right page counts; `sqlite3` returned `1000|500500`.
 
 ## Verdict: **GO** to M2
 
-The performance gate passes decisively. Every tool on the common runner path —
-shell, mytool (xlsx), sqlite3, and **pdftotext text extraction** — beats the v86
+The performance gate passes decisively. Every tool on the common agent path —
+shell, an xlsx tool, sqlite3, and **pdftotext text extraction** — beats the v86
 budget, most by ~5–11×, despite blink running as a pure interpreter with no JIT.
 The M1 gate criterion was "≤ 2–3× of v86"; we're comfortably *faster* than v86,
 not slower.
@@ -37,8 +50,8 @@ not slower.
 ### The one caveat: raster rendering (pdftoppm) is slow
 Rasterizing a scanned page to PNG took ~27.6 s (Splash software rasterizer, heavy
 in an interpreter). This only affects the **scanned-PDF image fallback** path, is
-per-page and on-demand, and the runner's primary strategy for scanned PDFs is the
-`read_pdf` LLM tool (send the PDF directly), not local rasterization. Acceptable
+per-page and on-demand, and the consuming app's primary strategy for scanned
+PDFs is to hand the PDF to an LLM directly, not local rasterization. Acceptable
 for M1; revisit only if raster fallback becomes hot (options: lower DPI, or the
 no-ASYNCIFY scheduler build should also speed the interpreter).
 
@@ -63,4 +76,4 @@ no-ASYNCIFY scheduler build should also speed the interpreter).
 `sh -c`, pipes, and multi-command lines currently fail with
 `vfork/waitpid: Function not implemented` (HAVE_FORK off). Wiring
 vfork/execve/waitpid + the cooperative scheduler is exactly M2 — and it's on the
-critical path for the `runner` binary, whose Bash tool shells out via `sh -c`.
+critical path for an agent binary whose shell tool shells out via `sh -c`.

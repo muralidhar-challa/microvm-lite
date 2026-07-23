@@ -1,18 +1,44 @@
 # Scheduler Design: shared-memory concurrency in blink
 
+> **Status at a glance (last verified 2026-07-21).** This is a long,
+> chronological design doc — phases were appended as they landed, so earlier
+> sections describe decisions that later ones reversed. Superseded passages
+> are annotated inline rather than deleted, because the reasoning is the
+> useful part.
+>
+> | Phase | State |
+> |---|---|
+> | 0 — context-switch shim | DONE |
+> | 1 — fiber PoC | DONE |
+> | 2 — two Machines, one System | DONE |
+> | 3 — `CLONE_THREAD` / guest pthreads | DONE |
+> | 4 — fork/vfork background jobs | DONE; its memory-isolation gap closed by real `fork()` ([REAL-FORK.md](REAL-FORK.md)) |
+> | 5 — wire the JS contract (`done:false` + pid) | NOT STARTED — blocked only on the `em_http_fetch` issue-then-poll conversion |
+> | 6 — `kill` | NOT STARTED |
+>
+> **The title is now half-wrong.** Fork-style children no longer share
+> memory — they get a private `System` each. Literal shared memory survives
+> only for `CLONE_VM` thread-style spawns (guest `pthread_create`, musl's
+> `posix_spawn`), which is correct for those.
+>
+> **Open, tracked elsewhere in this doc:** fd lifetime across forks — an
+> indefinite `poll()` on two orphaned pipe fds (Phase 4 follow-up), and a
+> guest-side hang when one shell backgrounds two jobs and `wait`s on both
+> ([CHILD-PID-COLLISION-BUG.md](CHILD-PID-COLLISION-BUG.md)).
+
 ## Problem
 
 microvm-lite's guest process model (`Fork()` in `blink-src/blink/syscall.c`,
 `__EMSCRIPTEN__`-only) is **run-to-completion**: a forked child always runs
 all the way to exit or execve before `Fork()` returns control to the parent.
 There is no preemption point, so `window.vm.run()` can never report
-`done:false` the way the host app's `the v86 host` (the v86-backed oracle) does for
-a command that's still running after its timeout — v86 launches every
+`done:false` the way the v86-backed predecessor (this contract's oracle)
+does for a command that's still running after its timeout — v86 launches every
 command backgrounded (`sh script.sh & wait $!`) and, on timeout, detaches
 from the wait while the job keeps running in the guest; a later
 `readFile(output_file)` sees the eventually-complete output, and the real
 pid lets a caller `kill` it later. `vm-host.js`'s pidfile-readback code
-(`vm-host.js:257`, `if (!r.done && r.output_file && r.pid == null)`) is
+(`vm-host.js:283`, `if (!r.done && r.output_file && r.pid == null)`) is
 already written and currently dead, waiting for `done:false` to ever happen.
 
 A prior session fixed the last known correctness bug in the current
@@ -27,7 +53,7 @@ Ranked by what the product actually suffers from, to keep the remaining
 phases pointed at value:
 
 1. **Background jobs (`done:false` + pid + later readFile + kill)** — the
-   UPSTREAM backend intermittently takes 24s-10min on query execution
+   upstream backend intermittently takes 24s-10min on query execution
    (HAR-confirmed). Today a slow query blocks the whole VM (all other calls
    serialize behind it — see the `runExecQueued` note under "Near-term
    wins") and a host-side timeout loses the handle to work that is still
@@ -76,6 +102,14 @@ real Linux `clone()` flag semantics) and how they're reaped (thread-join vs.
 never need to background) — it doesn't extend to scheduled jobs, and doesn't
 need to, since scheduled jobs are meant to share memory, not have it undone.
 
+> **Superseded (2026-07-20).** This decision held through Phase 4 and then
+> failed on contact with real workloads — see Phase 4's findings. Fork-style
+> children now get a private `System` (private memory *and* fds); only
+> `CLONE_VM` thread-style spawns still share. `EmSaveMem`/`EmRestoreMem`/
+> `EmSaveFds`/`EmRestoreFds` and the whole snapshot-restore era were deleted
+> outright in eb24a61. Everything below that describes them is history, not
+> the current code: see [REAL-FORK.md](REAL-FORK.md).
+
 This is real, novel C-level work on a component that has already proven
 subtle and bug-prone even in its simpler form. The plan is phased so each
 step is independently buildable and testable — via the native
@@ -111,9 +145,14 @@ before the next step depends on it.
   `SysSpawn` is never registered in the syscall table — a later phase
   re-enables registration under `__EMSCRIPTEN__` specifically, routed to the
   fiber scheduler instead of real pthreads.
-- `Fork()` (`syscall.c` ~895) — today's run-to-completion path stays exactly
-  as-is (including `EmSaveFds`/`EmSaveMem`/`EmRestoreFds`/`EmRestoreMem`) as
-  the fast synchronous path for ordinary sequential commands. A fork/vfork
+- `Fork()` (`syscall.c` ~895) — *as of this doc's writing*, the
+  run-to-completion path stays exactly as-is (including
+  `EmSaveFds`/`EmSaveMem`/`EmRestoreFds`/`EmRestoreMem`) as
+  the fast synchronous path for ordinary sequential commands. **No longer
+  true:** Phase 4 replaced that path for every fork, and real fork()
+  (f969ada) then split `Fork()` into `EmForkPrivate` (plain fork → private
+  `System`) vs. the shared-`System` `CLONE_VM` branch; the `Em*Mem`/`Em*Fds`
+  helpers are deleted. A fork/vfork
   that the JS side decides to background takes a **different** path: like
   `SysSpawn`, `NewMachine(m->system, m)` (shared memory), but with an
   **independently-copied fd table** (`EmSaveFds`-style duplication, reused
@@ -156,7 +195,7 @@ of exactly this bug were already found and fixed with the same pattern
 **`em_http_fetch` is the third — and it is the flagship use case, not an
 edge case.** An earlier draft of this doc listed "a Machine mid-
 `em_http_fetch` being fiber-swapped" as out of scope. That exclusion cannot
-survive contact with the goal: a slow `guestcli` query — the very thing
+survive contact with the goal: a slow upstream query — the very thing
 `{done:false, pid}` exists to background — spends nearly ALL of its time
 inside the fetch. A fiber suspended in a plain Asyncify await cannot also
 be fiber-swapped (the await unwinds to the JS event loop, not to a swap
@@ -182,10 +221,10 @@ jobs that never yield.
 
 - **Proxy 30s cap vs. legitimately slow queries.** `emHttpFetch` in
   `src/vm-worker.js` synthesizes a 504 after a hard-coded 30 000 ms, but
-  some predefined queries legitimately run 1-2 min (the guestcli CLI's own
+  some queries legitimately run 1-2 min (a guest CLI's own
   per-attempt timeout defaults to 240s, and the backend hangs up to
   10 min). On microvm-lite ANY query >30s currently dies at the proxy
-  regardless of guestcli settings. Make the cap configurable from the init
+  regardless of client settings. Make the cap configurable from the init
   message with a default comfortably above 240s.
 - **"Started"-message stepping stone (optional).** The worker posts
   `{type:"started", id, output_file, pid}` as soon as the capture file is
@@ -195,7 +234,7 @@ jobs that never yield.
   commands still queue behind the running one until it finishes. ~80% of
   the background-jobs UX for ~5% of the effort; Phase 5 replaces its
   internals, not its contract.
-- **Context: `runExecQueued` (vm-worker, commit 2d2b825).** All guest
+- **Context: `runExecQueued` (vm-worker, commit 9f531b8).** All guest
   executions now serialize through one promise chain — the correctness
   stopgap for the single-continuation world (two concurrent `em_main`
   calls corrupted Asyncify and wedged the worker permanently, observed
@@ -205,9 +244,10 @@ jobs that never yield.
 
 Each phase gate must pass (native `lldb` harness where noted, else
 `bun test/contract.spec.mjs` / `test/stress.spec.mjs`) before starting the
-next. New scheduler code lives in `blink/sched.c` + `blink/sched.h`, added to
-the emcc source list in `blink/build.sh` alongside a `ucontext`-based shim
-for the native debug build (Emscripten fibers don't exist natively).
+next. New scheduler code lives in `blink/mvl_sched.c` + `blink/mvl_sched.h`
+(planned as `sched.*`; renamed for the header-shadowing reason in Phase 0),
+added to the emcc source list in `blink/build.sh` alongside a `ucontext`-based
+shim for the native debug build (Emscripten fibers don't exist natively).
 
 **Phase 0 — context-switch shim, no behavior change. DONE.**
 `SchedMakeContext`/`SchedSwap` behind a thin abstraction in
@@ -439,10 +479,16 @@ stdout at all before this.
   function) still goes through the ordinary `SysExitGroup` path, untested
   against the scheduler.
 
-**Phase 4 — fork/vfork-backed background jobs. PARTIALLY DONE — literal
-gate passes, zero regression, but a real architectural limitation remains
-and is NOT safe for production background-job use yet. Read the whole
-section before building on this.**
+**Phase 4 — fork/vfork-backed background jobs. DONE, with its central
+limitation since retired.** As shipped (0b3b4bf, 2026-07-19) this phase
+passed its literal gate with zero regression but left a real architectural
+limitation — fork children shared the parent's address space with no
+divergence — that made it unsafe for production background-job use. That
+limitation was **fixed by real `fork()`** (f969ada, 2026-07-20 — private
+`System` per fork child; see [REAL-FORK.md](REAL-FORK.md)), which is the
+successor to this phase. The sections below are kept as the historical
+record and are annotated where superseded; read them for the four bugs and
+the reasoning, not for current status.
 
 **What changed.** `Fork()`'s `__EMSCRIPTEN__` implementation was rewritten
 to route through the scheduler instead of running synchronously to
@@ -513,8 +559,9 @@ actual `dist/blink.js`):
   regression** on every earlier phase's gate and the original synchronous
   fast path.
 
-**What's NOT safe yet: real memory isolation for concurrently-scheduled
-fork children.** Confirmed with a controlled, repeatable experiment:
+**The memory-isolation gap (STATUS: FIXED by real fork(), 2026-07-20 — see
+[REAL-FORK.md](REAL-FORK.md); the diagnosis below is what motivated it).**
+Confirmed with a controlled, repeatable experiment:
 `toybox echo A & wait; echo EXIT:$?` on ONE line (dash reads the whole
 line before executing any of it, so the child never runs concurrently
 with a parent that's also doing memory-touching work) works correctly.
@@ -546,6 +593,18 @@ one suspended while the other mutates) — a materially harder problem than
 the old model was synchronous (never two sides truly concurrent). Scoping
 that fix is real design work for a future session, not a bug to patch
 blind.
+
+**How it was resolved.** The scoping work happened the next day and the
+answer was the third of the options listed below under "out of scope":
+give every plain-`fork()` child its own `System` — private page tables,
+private fd table — instead of any form of divergence-tracking on a shared
+one. Read-only pages are aliased rather than copied (`PAGE_NOOWN`),
+writable ones are eagerly copied; measured at ~4 ms and 32 KB per fork.
+`CLONE_VM`-with-stack children (musl's `posix_spawn`, i.e. Rust's
+`std::process::Command`) keep sharing a `System`, which is the correct
+semantics for that flag, so the shared-memory machinery above is still
+load-bearing for exactly that path. Full details, post-mortem, and gate
+results: [REAL-FORK.md](REAL-FORK.md).
 
 **A related, likely-connected symptom** (STATUS: ROOT-CAUSED AND FIXED,
 2026-07-21 — see below), found while validating the gate through the real
@@ -668,26 +727,43 @@ reproducible instance of the memory/resource-isolation gap already scoped
 below — evidence for that scoping work, not a new open item to track
 separately.
 
-**Recommendation:** do not enable Fork()'s new concurrent path for
-anything beyond the verified-safe shapes above (single background job
-immediately followed by `wait` on the same logical statement, or
-sequential non-backgrounded commands) until the memory-isolation gap is
-addressed. Phase 5 (JS contract wiring for `{done:false, pid}`) should
-wait for that work, not build on top of a known-corruptible foundation.
-The fds-head fix above closes one concrete crash/data-loss path but the
-broader gap — and this second `own_system` stdout-loss shape — remain.
+**Follow-up (2026-07-21, still open — fd lifetime across forks, not
+memory).** The memory half of the gap above is now closed by real fork().
+The resource half is not, and it has sharpened into a specific open
+investigation: a guest-CLI table-output hang was traced with a new `Poll()`
+fd-list trace (`MVL_NATIVE_DEBUG` only, compiles out of the shipped build
+— 31b9165) to a **real, indefinite `poll()` on two unnamed pipe fds**, not
+the memory corruption originally suspected. That points at fds leaking
+across forks — a write end that no longer has a live owner to close it —
+which is the same family as the `own_system` stdout-loss shape above.
+`FreeSystem`/`EmCloseAllFds` at child exit was supposed to make exactly
+this class impossible, so the next step is to find which fds escape it.
+The trace was left in place deliberately for whoever picks this up.
 
-**Phase 5 — wire the JS contract. TWO HARD PREREQUISITES, in order:
-(a) the Phase 4 memory-isolation gap (a concurrently-scheduled fork child
-corrupts the parent's unisolated address space — see Phase 4's findings;
-real design work, not a patch), and (b) the `em_http_fetch` issue-then-poll
-conversion (see "Blocking calls" above — without it, backgrounding cannot
-detach from exactly the fetch-bound jobs that motivate the feature).**
+**Recommendation (updated 2026-07-21).** The memory-isolation blocker is
+gone: fork children have private address spaces, `realfork-test.mjs` is
+0/60, and the full suite is green (see [REAL-FORK.md](REAL-FORK.md)).
+What remains before leaning on concurrent backgrounding in production is
+**fd lifetime across forks** — the open `poll()`-hang investigation above,
+plus the known guest-side hang when one dash backgrounds two jobs with `&`
+and `wait`s on both at once (see
+[CHILD-PID-COLLISION-BUG.md](CHILD-PID-COLLISION-BUG.md)). Verified-safe
+shapes today: sequential non-backgrounded commands, pipelines, and a
+single background job immediately followed by `wait`.
+
+**Phase 5 — wire the JS contract. ONE HARD PREREQUISITE REMAINS.**
+~~(a) the Phase 4 memory-isolation gap~~ — **DONE**, closed by real
+`fork()` ([REAL-FORK.md](REAL-FORK.md), 2026-07-20). **(b) the
+`em_http_fetch` issue-then-poll conversion** (see "Blocking calls" above —
+without it, backgrounding cannot detach from exactly the fetch-bound jobs
+that motivate the feature) is still outstanding and is now the gating item.
+Also worth closing first, though not strictly blocking: the open fd-lifetime
+investigation under Phase 4's follow-up.
 `doExecute` (`vm-worker.js`) is wired to
 a scheduler tick loop (`em_sched_run(budget_ms)` called repeatedly from a JS
 `setTimeout(0)` loop, not one giant Asyncify-suspended call — keeps the
 browser responsive and avoids nesting Asyncify unwinds inside a fiber swap);
-on timeout it detaches exactly like `the v86 host`'s Ctrl+C-the-wait behavior
+on timeout it detaches exactly like the v86 host's Ctrl+C-the-wait behavior
 and returns `{done:false, output_file, pid}` while the job keeps running.
 This retires the interim `runExecQueued` serialization queue.
 `doRun` stays on the legacy path for now. Gate: new `contract.spec.mjs` case
@@ -722,32 +798,35 @@ path onto the scheduler too, and re-run the full regression suite.
   checkpoint, since there's no JIT — every instruction hits the counter.)
 - ~~A Machine simultaneously mid-`em_http_fetch` (Asyncify) and being
   fiber-swapped/backgrounded~~ — REMOVED from this list: it is the flagship
-  use case (backgrounding a fetch-bound `guestcli` query) and is now a designed
+  use case (backgrounding a fetch-bound upstream query) and is now a designed
   component — see "Blocking calls: the yield-and-recheck pattern, and
   `em_http_fetch`", a stated prerequisite for Phase 5.
 - Full job control (SIGSTOP/SIGCONT, process groups, tty ownership,
   `fg`/`bg`) — only SIGTERM/SIGKILL-style `em_kill`.
-- Real per-page copy-on-write divergence for fork-style jobs (the kind real
-  Linux does via page-fault-triggered duplication) — **status changed by
-  Phase 4's findings.** The original bet ("share memory with no divergence;
-  only revisit if a workload needs a child's writes invisible to its
-  parent") is falsified: the observed failure is not leaked writes but the
-  parent's own unrelated buffers being corrupted by a concurrently-
-  scheduled child in ordinary multi-line scripts (repeatable SIGSEGV — see
-  Phase 4). SOME form of memory isolation for concurrently-scheduled fork
-  children is therefore a hard prerequisite for Phase 5, and scoping it
-  (full CoW vs. targeted isolation of the guest stack/heap regions vs.
-  restricting concurrency to post-execve children, which already get a
-  separate System) is the next real design task. Full Linux-grade
-  page-fault CoW machinery remains out of scope unless that scoping
-  concludes it's the only correct option.
+- ~~Real per-page copy-on-write divergence for fork-style jobs~~ —
+  **RESOLVED, not deferred.** The original bet ("share memory with no
+  divergence; only revisit if a workload needs a child's writes invisible
+  to its parent") was falsified by Phase 4: the observed failure was not
+  leaked writes but the parent's own unrelated buffers being corrupted by a
+  concurrently-scheduled child in ordinary multi-line scripts (repeatable
+  SIGSEGV). The scoping task named here — "full CoW vs. targeted isolation
+  vs. restricting concurrency to post-execve children" — was done on
+  2026-07-20 and picked a fourth, simpler option: **a private `System` per
+  plain-`fork()` child, eagerly copied**. Read-only pages are aliased, not
+  copied, which is what keeps it cheap (~4 ms, 32 KB/fork). Page-fault-
+  driven CoW is written up as Step 2 in [REAL-FORK.md](REAL-FORK.md) and
+  remains unbuilt — deliberately, since Step 1's measured copy cost never
+  showed up as a bottleneck. `CLONE_VM` children still share memory by
+  design.
 
 ## Critical files
 
 - `blink-src/blink/machine.c` — `Actor` yield hook, `RunMachineUntilExit`,
   `Blink`.
-- `blink-src/blink/syscall.c` — `Fork`, `SysSpawn`/`OnSpawn` (the reference
-  pattern to adapt), `SysExecve` vfork branch, `SysWait4`, `g_em_children`.
+- `blink-src/blink/syscall.c` — `Fork`, `EmForkPrivate`/`EmForkChildEntry`
+  (the real-fork path), `SysSpawn`/`OnSpawn` (the reference
+  pattern to adapt), `SysExecve` vfork branch, `SysWait4`, `g_em_children`,
+  `g_em_next_child_pid`.
 - `blink-src/blink/machine.h` — `System::machines`, `Machine::killed`/
   `attention`.
 - `blink-src/blink/config.h` — `DISABLE_THREADS` (a later phase conditionally
@@ -756,14 +835,18 @@ path onto the scheduler too, and re-run the full regression suite.
   non-wasm builds stays disabled — only the wasm/fiber-routed path is new).
 - `blink/stubs.c` — `em_main`/`em_last_exit`; new `em_sched_*` exports live
   here.
-- `blink/build.sh` — emcc source list (add `sched.c`) and
-  `EXPORTED_FUNCTIONS` (add the new `em_sched_*`/`em_kill` exports); the
-  native `MVL_NATIVE_DEBUG` compile command (add the `ucontext` shim source).
-- `src/vm-worker.js` — `doExecute`/`doRun`, `callMainAsync`, message
-  protocol (unchanged shape, changed internals only).
+- `blink/build.sh` — emcc source list and `EXPORTED_FUNCTIONS` (Phase 5/6
+  add `em_sched_run`/`em_kill` to the existing
+  `_em_sched_phase2_test` etc.); the native `MVL_NATIVE_DEBUG` compile
+  command (add the `ucontext` shim source).
+- `src/vm-worker.js` — `doExecute`/`doRun`, `callMainAsync`, `runExecQueued`,
+  message protocol (unchanged shape, changed internals only).
 - `src/vm-host.js` — the already-written, currently-dead pidfile-readback
-  block (`vm-host.js:257`) that Phase 5 makes reachable.
-- New: `blink/sched.c`, `blink/sched.h`.
+  block (`vm-host.js:283`, inside `vm.run`) that Phase 5 makes reachable.
+- The scheduler itself: `blink/mvl_sched.c`/`.h` (context-switch primitives,
+  Emscripten Fibers backend), `blink/mvl_dispatch.c`/`.h` (spawn/swap/fd-list
+  machinery), `blink/mvl_sched_phase2_test.c` (the Phase 2 gate). These are
+  the files the earlier drafts of this doc called `blink/sched.c`/`sched.h`.
 
 ## Verification
 

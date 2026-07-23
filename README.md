@@ -18,8 +18,10 @@ from a plain static file server.
 - **No SAB / no COOP-COEP.** blink is pure Asyncify; it runs on any page. WASIX
   needs SAB even single-threaded.
 - **Runs existing binaries unmodified.** No recompiling tools to a WASM target.
-- Cold boot ~130 ms; common tools run 3–11× faster than a full-system emulator
-  (v86) on the common path. See `test/bench-results.md`.
+- Cold boot ~200 ms; common tools run 3–11× faster than a full-system emulator
+  (v86) on the common path. See `test/bench-results.md` — but note those
+  numbers are the 2026-07-13 M1 gate, measured with poppler/sqlite/Rust
+  binaries that the reference build no longer ships.
 
 ## What it ships, what you add
 
@@ -30,20 +32,32 @@ endpoints, or paths baked in. You add the rest at runtime:
   `vm.writeFile(path, data, { mode })`.
 - **Network endpoints** → `init.vmRoutes` (hostname → URL); the runtime seeds
   `/etc/hosts` and routes guest HTTP to your handlers.
-- **Working dir** → `/workspace` by default (`manifest.home` / `init.home`).
+- **Working dir** → `/workspace` by default, set via `manifest.home` (the
+  worker also honors `init.home`, but `startVM` does not forward it).
 
 ## Layout
 
 ```
 src/vm-worker.js     the Web Worker: hosts blink, runs commands, HTTP bridge, FS
 src/vm-host.js       main thread: window.vm API, endpoint registry, IDB snapshot
+src/vm-host.d.ts     typed startVM/preloadVM surface for TS integrators
+src/vm-terminal.js   drop-in xterm.js front end for window.vm (attachTerminal)
 blink/               build.sh, config.h, stubs.c, patches/, toybox.config
+blink/mvl_sched.*    cooperative fiber scheduler (see SCHEDULER-DESIGN.md)
+blink/mvl_dispatch.* spawn/context-swap/fd-list machinery for scheduled jobs
 dist/build-dist.sh   assembles dist/ + a hashed, bundle-based manifest.json
 dist/console.html    an interactive terminal against the packaged dist
-test/                contract.spec.mjs, dist-smoke.spec.mjs, stress.spec.mjs
+test/                playwright + bun specs; test/debug/ holds ad-hoc repros
 ```
-`blink-src/`, `blink-wasm/`, `dist/{blink.*,bin,vm-*.js,manifest.json}` are
-build outputs (gitignored — regenerate, see below).
+`blink-src/`, `blink-wasm/`, `blink-native/`, and
+`dist/{blink.*,bin,vm-worker.js,vm-host.js,manifest.json}` are build outputs
+(gitignored — regenerate, see below). `dist/vm-terminal.js` and the `dist/xterm*`
+assets are *also* produced by `build-dist.sh` but are checked in.
+
+Design docs: [SCHEDULER-DESIGN.md](SCHEDULER-DESIGN.md) (concurrency, phase
+status), [REAL-FORK.md](REAL-FORK.md) (private address space per fork child),
+[CHILD-PID-COLLISION-BUG.md](CHILD-PID-COLLISION-BUG.md) (a fixed ECHILD bug
+plus one still-open `&`+`wait` hang).
 
 ## Build
 
@@ -61,22 +75,37 @@ cd . && python3 -m http.server 8080
 
 ## The `window.vm` contract
 
-`vm-host.js` installs, on `startVM({ cdnBase, workerUrl, vmRoutes, baseEtag, home })`:
+`vm-host.js` installs, on
+`startVM({ cdnBase, workerUrl, vmRoutes, baseEtag, proxyTimeoutMs })`:
 
 | API | Purpose |
 |---|---|
 | `vm.execute(cmd, timeout?)` → string | run a shell command, get combined stdout+stderr |
-| `vm.run(cmd, timeout?)` → `{done, output_file, pid, output}` | file-captured run with a guest pid |
+| `vm.run(cmd, timeout?, session?)` → `{done, output_file, pid, output}` | file-captured run with a guest pid |
 | `vm.writeFile(path, data, {mode}?)` | push a file; `mode: 0o755` installs an executable |
 | `vm.readFile(path)` / `vm.readFileRaw(path)` | read text / bytes |
 | `vm.loadBundle(name)` | stage a named manifest bundle on demand |
 | `vm.resetToFresh()` | wipe the snapshot and reboot |
 | `vm.ready()` / `vm.isReady` | boot readiness |
+| `vm._stat()` | diagnostic: wasm heap size + `/tmp` residue |
 | `window.registerVmEndpoint(path, handler)` | answer guest HTTP to a virtual host |
 
+`proxyTimeoutMs` caps how long a guest HTTP request may take before the bridge
+synthesizes a 504; it defaults to 300 000 ms, which matters for backends that
+legitimately run for minutes.
+
+> **Sessions.** Passing `session` to `vm.run` scopes the call to an emulated
+> shell session: `WORKDIR=/tmp/session_<session>` and `SESSION_ID` are exported,
+> and exported env + cwd persist across calls sharing that id — a persistent
+> shell without a live shell process. `/tmp` is included in the snapshot, so
+> sessions survive a reboot. Omit it for a stateless call cd'd to `HOME`.
+
 > **Backgrounding note:** blink runs each command to completion in one Asyncify
-> call, so `vm.run` always returns `done:true` (no preemption/kill). A truly
-> hung command blocks the worker until it exits — reload to recover.
+> call, so `vm.run` always returns `done:true` (no `vm.kill`). A truly hung
+> command blocks the worker until it exits — reload to recover. A guest module
+> *crash* is different: the worker latches it and the host auto-restarts the VM
+> (up to 3 times in 60 s), failing the in-flight call with a `[vm fatal]`
+> message rather than wedging.
 
 ## Manifest & asset loading
 
@@ -192,16 +221,37 @@ back. Unknown hosts get a 403.
 ## Tests
 
 ```sh
-bun test/contract.spec.mjs    # window.vm contract + writeFile-install
-bun test/dist-smoke.spec.mjs  # packaging: cold boot, buildId etag, snapshot
-bun test/stress.spec.mjs      # sustained-load soak (ITERS=N)
+bun test/contract.spec.mjs             # window.vm contract + writeFile-install
+bun test/dist-smoke.spec.mjs           # packaging: cold boot, buildId etag, snapshot
+bun test/stress.spec.mjs               # sustained-load soak (ITERS=N)
+bun test/fiber-selftest.spec.mjs       # scheduler Phase 1: Emscripten Fibers
+bun test/phase2-selftest.spec.mjs      # Phase 2: two Machines, one System
+bun test/phase3-pthread-selftest.spec.mjs  # Phase 3: guest CLONE_THREAD
+bun test/debug/realfork-test.mjs       # real fork(): pipelines, 60-iteration loop
 ```
+
+`test/debug/` holds ad-hoc repros kept alongside the bugs they isolate
+(`pidcollide-test.mjs`, `isolate-hang.mjs`, `session-id-test.mjs`, …).
+`test/native-*.sh` run the native `MVL_NATIVE_DEBUG` + `lldb` builds — the
+primary gate for scheduler work, since production's `-DNDEBUG` swallows
+exactly the class of bug this codebase keeps hitting.
 
 ## Known limitations
 
-- **No scheduler / no true concurrency.** Run-to-completion vfork: `fork→exec→wait`
-  works (shell, pipelines, sequences, subprocess capture); `&` backgrounding,
-  preemption, and `kill` do not.
-- **Per-fork memory.** A single `sh -c` that forks heavily (deep `$()`, big
-  loops spawning many externals) can grow the wasm heap toward its ~2 GB ceiling
-  within that one invocation.
+- **Concurrency exists, but isn't exposed yet.** There *is* a cooperative
+  fiber scheduler (Emscripten Fibers, preemption via an instruction-count
+  checkpoint), guest `pthread_create` works, and `fork()` gives each child a
+  private address space. What's not wired is the host-facing contract:
+  `vm.run` still always returns `done:true`, and there's no `vm.kill`. See
+  [SCHEDULER-DESIGN.md](SCHEDULER-DESIGN.md) (Phases 5–6).
+- **`&` backgrounding is partially working.** A single background job followed
+  by `wait` is verified; one shell backgrounding *two* jobs and `wait`ing on
+  both hangs (see [CHILD-PID-COLLISION-BUG.md](CHILD-PID-COLLISION-BUG.md)).
+  Sequential commands, pipelines, and subprocess capture are the well-trodden
+  paths.
+- **Host executions serialize.** All guest work runs through one promise chain
+  in the worker, so a slow command blocks later ones until it finishes. This is
+  a deliberate stopgap that Phase 5 retires.
+- **fd lifetime across forks.** An open investigation: some pipe fds outlive
+  their owner and leave a reader polling indefinitely. Long-lived sessions that
+  fork heavily are the exposure.

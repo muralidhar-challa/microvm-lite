@@ -1,6 +1,6 @@
 // microvm-lite production worker (M4 contract layer).
 //
-// Speaks the EXACT the host app the v86 host worker message protocol so the app can
+// Speaks the EXACT v86-host worker message protocol so a host app can
 // swap the v86 backend for blink with no code changes:
 //   main → worker:  init | run | execute | write_file | read_file |
 //                   save_state | proxy_response | serial_send
@@ -26,8 +26,8 @@ self.onunhandledrejection = function (e) {
 
 // ── Config ───────────────────────────────────────────────────────────────────
 // `base` is where blink.js/blink.wasm and the guest binaries live; the main
-// thread passes it in `init.cdnBase` (mirrors the v86 host's cdnBase). Defaults to
-// the worker's own directory so a plain static server just works.
+// thread passes it in `init.cdnBase` (mirrors the v86 host's cdnBase).
+// Defaults to the worker's own directory so a plain static server just works.
 var BASE = ".";
 
 // Virtual HTTP routes: IP → hostname. Built from init.vmRoutes at init time —
@@ -39,9 +39,9 @@ var VM_ROUTES = {};
 // Proxy bridge timeout: how long a guest HTTP request may wait for the host
 // page's proxy_response before a synthesized 504. Overridable via
 // init.proxyTimeoutMs — the old hard-coded 30s silently killed legitimately
-// slow predefined queries (some run 1-2 min; guestcli' own per-attempt budget is
-// 240s, and its client-side timeouts can't work through this bridge, so this
-// cap is the only effective one).
+// slow queries (some backends run 1-2 min; a guest client's own per-attempt
+// budget can be 240s+, and its client-side timeouts can't work through this
+// bridge, so this cap is the only effective one).
 var PROXY_TIMEOUT_MS = 300000;
 
 // Applet fallback list for the no-manifest path. manifest.applets overrides.
@@ -73,7 +73,7 @@ var _runSeq = 0;
 // Snapshot passed in init (restore the guest FS before we signal ready).
 var _initSnapshot = null;
 
-// ── FS dirty tracking (debounced fs_dirty like the v86 host) ───────────────────────
+// ── FS dirty tracking (debounced fs_dirty like the v86 host) ────────────────
 var _fsDirty = false;
 setInterval(function () {
   if (_fsDirty && !_execBusy) {
@@ -134,9 +134,9 @@ self.Module = {
 
   // Called by blink's virtual-socket layer with the guest's HTTP request.
   // Routes known vm hosts to the main thread via proxy_request/proxy_response
-  // in the SAME shape as the v86 host (id/url/pathname/method/body), so the app's
-  // registerVmEndpoint registry and its auth-injecting proxyFetch both work
-  // unchanged. Unknown hosts get a synthesized 403 — never a real network hop.
+  // in the SAME shape as the v86 host (id/url/pathname/method/body), so the
+  // app's registerVmEndpoint registry and its auth-injecting proxyFetch both
+  // work unchanged. Unknown hosts get a synthesized 403 — never a real hop.
   emHttpFetch: async function (ip, port, reqBytes) {
     var hostname = VM_ROUTES[ip];
     if (!hostname || port !== 80) return textResponse(403, "Forbidden", "blocked: " + ip + ":" + port + "\n");
@@ -149,8 +149,8 @@ self.Module = {
         if (_proxyWaiters[id]) { delete _proxyWaiters[id]; resolve({ status: 504, statusText: "Gateway Timeout", body: "endpoint timeout\n" }); }
       }, PROXY_TIMEOUT_MS);
     });
-    // Split the query off for the registry key (the v86 host routes on pathname
-    // only); keep the full target in `url` so handlers can read query params.
+    // Split the query off for the registry key (the v86 host routes on
+    // pathname only); keep the full target in `url` for query params.
     var q = req.path.indexOf("?");
     var pathname = q === -1 ? req.path : req.path.slice(0, q);
     self.postMessage({
@@ -298,7 +298,7 @@ async function runExec(argv) {
 
 // Serialize ALL guest executions: two concurrent em_main calls on one
 // Asyncify module corrupt its unwind state and wedge the worker permanently
-// (real incident: a guestcli call stuck retrying against a slow backend + the
+// (real incident: a guest HTTP client stuck retrying against a slow backend + the
 // user typing `pwd` in the terminal → every later call timed out forever).
 // A queued call just waits its turn; the host-side per-call timeout may still
 // fire for the waiting caller, but the worker stays healthy and drains.
@@ -455,7 +455,7 @@ async function doRun(cmd) {
 }
 
 // ── vm.run (worker msg "execute"): file-capture + pid, {done,output_file,pid} ─
-// Mirrors the v86 host.executeCmd's on-disk contract (/tmp/out-<hex>.txt,
+// Mirrors the v86 host's executeCmd on-disk contract (/tmp/out-<hex>.txt,
 // /tmp/pid-<hex>.txt) so the app's window.vm.run pid-readback path is byte-for-
 // byte compatible. Run-to-completion → always done:true (see file header).
 async function doExecute(cmd, session) {

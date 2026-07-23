@@ -1,7 +1,7 @@
 // Phase 3 gate (SCHEDULER-DESIGN.md): a real guest binary (cross-compiled
 // with musl, blink/native-debug/pthread-counter-test.c) that calls
 // pthread_create() twice, exercised through the REAL production contract —
-// window.vm.writeFile + window.vm.execute, the same path the host app's agent
+// window.vm.writeFile + window.vm.execute, the same path an integrating agent
 // uses — against the actual dist/blink.js build. The native lldb harness
 // (test/native-phase3-*.sh, run manually — see SCHEDULER-DESIGN.md) proved
 // genuine interleaving via g_mvl_current alternation; this proves the same
