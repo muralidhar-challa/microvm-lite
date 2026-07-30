@@ -256,9 +256,10 @@ void MvlSchedMaybeYield(void) {
   MvlSchedSwapToNext();
 }
 
-void MvlSchedYieldOnce(void) {
-  if (!g_mvl_current || g_mvl_current->next == g_mvl_current) return;  // alone
+bool MvlSchedYieldOnce(void) {
+  if (!g_mvl_current || g_mvl_current->next == g_mvl_current) return false;  // alone
   MvlSchedSwapToNext();
+  return true;
 }
 
 _Noreturn void MvlSchedThreadExitAndYield(void) {

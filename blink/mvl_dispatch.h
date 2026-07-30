@@ -30,7 +30,12 @@ void MvlSchedMaybeYield(void);
 // check, matching MvlSchedMaybeYield's contract) — with nothing else in
 // the ring it would just return immediately, but the caller's g_machine
 // bookkeeping assumes a real thread exists to hand off to.
-void MvlSchedYieldOnce(void);
+// Returns true if it actually handed off to another fiber, false if this
+// fiber was alone in the ring (nothing to yield to, so nothing happened).
+// Callers that yield INSTEAD OF sleeping need to know the difference: when
+// alone, skipping the sleep too would busy-spin a core. Existing callers
+// that just want "let others run if any" can keep ignoring the result.
+bool MvlSchedYieldOnce(void);
 
 // SysSpawn's __EMSCRIPTEN__ implementation calls this once `m2` (a fresh
 // Machine sharing `m`'s System, already fully set up by NewMachine +

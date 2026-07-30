@@ -635,7 +635,7 @@ index 8999ef5..be3c087 100644
  
  // clang-format off
 diff --git a/blink/syscall.c b/blink/syscall.c
-index 34cc01c..e056e6f 100644
+index 34cc01c..3c57bf1 100644
 --- a/blink/syscall.c
 +++ b/blink/syscall.c
 @@ -87,8 +87,13 @@
@@ -2312,7 +2312,34 @@ index 34cc01c..e056e6f 100644
        for (;;) {
          for (i = 0; i < nfds; ++i) {
          TryAgain:
-@@ -5620,6 +6773,20 @@ void OpSyscall(P) {
+@@ -4736,6 +5889,26 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
+         if (CompareTime(remain, wait) < 0) {
+           wait = remain;
+         }
++#ifdef __EMSCRIPTEN__
++        // Same hazard as SysFutexWait/SysNanosleep (both already fixed): a
++        // real blocking nanosleep() here stalls the ONE real OS thread every
++        // fiber shares. This loop is where it bites hardest, because what a
++        // poll() is usually waiting FOR is another fiber — a forked child
++        // writing to (and closing) the pipe the parent is polling. Sleeping
++        // never lets that child run, and nanosleep is not a swap point, so
++        // the loop just re-polls fds nothing can ever make ready: a genuine
++        // cooperative deadlock, permanent when the timeout is infinite.
++        // Yielding hands control to the child, which then makes the fd ready.
++        //
++        // Only skip the sleep when the yield actually happened. Alone in the
++        // ring MvlSchedYieldOnce() is a no-op, and skipping the sleep anyway
++        // would spin a core at 100% for the whole poll.
++        //
++        // Two fibers that are both stuck can still ping-pong here until the
++        // deadline, burning CPU rather than blocking — noisier than a silent
++        // wedge, but bounded by the deadline and no longer a deadlock.
++        if (!(g_mvl_sched_active && MvlSchedYieldOnce()))
++#endif
+         nanosleep(&wait, 0);
+       }
+       if (rc != -1) {
+@@ -5620,6 +6793,20 @@ void OpSyscall(P) {
      SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
      SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
  #endif /* DISABLE_SOCKETS */
@@ -2333,7 +2360,7 @@ index 34cc01c..e056e6f 100644
  #ifdef HAVE_FORK
      SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
  #ifndef DISABLE_NONPOSIX
-@@ -5720,6 +6887,9 @@ void OpSyscall(P) {
+@@ -5720,6 +6907,9 @@ void OpSyscall(P) {
      default:
      DefaultCase:
        LOGF("missing syscall 0x%03" PRIx64, ax);
