@@ -170,11 +170,58 @@ let _proxyTimeoutMs = 0;  // 0 → worker default (300s); override via startVM o
 
 const DEFAULT_CALL_TIMEOUT_MS = 120000;
 
+// Tear down and relaunch the worker after it has become unusable. Shared by the
+// guest-module `fatal` path (an actual wasm trap) and the hang watchdog in
+// `_call` (no trap, just permanently unresponsive) — both leave the worker
+// incapable of serving another call, and both are recoverable by restarting
+// while KEEPING the IDB snapshot, so HOME + /tmp survive.
+//
+// `_fatalTimes` is shared across both causes on purpose: two crashes plus two
+// hangs inside a minute is just as unhealthy as four of either, and should
+// stop the same way instead of each cause getting its own fresh budget.
+function _restartWorker(logMsg, pendingErr) {
+  console.error("[vm]", logMsg);
+  _pending.forEach(({ reject }) => reject(new Error(pendingErr)));
+  _pending.clear();
+  try { if (_worker) _worker.terminate(); } catch { /* already dead */ }
+  _worker = null; _ready = false; _startPromise = null;
+  const now = Date.now();
+  _fatalTimes = _fatalTimes.filter((t) => now - t < 60000); _fatalTimes.push(now);
+  if (_fatalTimes.length <= 3) {
+    _startPromise = _doStartVM();
+  } else {
+    console.error("[vm] unhealthy >3 times in 60s — auto-restart stopped; call vm.resetToFresh()");
+  }
+}
+
 function _call(msg, transfer, timeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
   const id = _nextId++;
   return new Promise((resolve, reject) => {
     const timer = timeoutMs > 0 ? setTimeout(() => {
-      if (_pending.delete(id)) reject(new Error(`VM call timed out after ${timeoutMs}ms (type: ${String(msg.type)})`));
+      if (!_pending.delete(id)) return;
+      reject(new Error(`VM call timed out after ${timeoutMs}ms (type: ${String(msg.type)})`));
+      // A guest-exec call that blew its deadline is not merely slow — blink
+      // runs each command to completion inside a single Asyncify call and
+      // cannot be interrupted, so the worker is still inside that command and
+      // every later call would queue behind it indefinitely. Until now the
+      // only exit was a human noticing and reloading the page (or the model
+      // calling reset_vm_state), which is why a hung sub-agent read as "the
+      // whole VM died". Treat it like the crash it functionally is.
+      //
+      // Non-exec calls (read_file, save_state, …) are deliberately NOT
+      // restarted on timeout: they don't run guest code, so a timeout there
+      // is either a symptom of a wedge some exec call will report anyway, or
+      // a slow host-side operation that restarting would only make worse.
+      if (msg.type === "run" || msg.type === "execute") {
+        // Deliberately does NOT claim "state preserved" the way the crash path
+        // does: the snapshot can only be flushed while the worker is idle
+        // (fs_dirty is gated on !_execBusy), and a hang never goes idle — so
+        // anything the hung command wrote is lost with it.
+        _restartWorker(
+          `guest exec exceeded ${timeoutMs}ms and cannot be interrupted — restarting worker`,
+          "VM hung and is restarting — retry the command. Work done by the hung command was not saved.",
+        );
+      }
     }, timeoutMs) : undefined;
     _pending.set(id, {
       resolve: (v) => { clearTimeout(timer); resolve(v); },
@@ -247,18 +294,10 @@ async function _doStartVM() {
       // further call would hang. Reject in-flight callers with a retryable
       // error and restart the worker; the IDB snapshot (HOME + /tmp) is
       // KEPT, so session workdirs and result files survive the restart.
-      console.error("[vm] guest module fatal, restarting worker:", msg.error);
-      _pending.forEach(({ reject }) => reject(new Error("VM crashed and is restarting (state preserved) — retry the command. Cause: " + String(msg.error).split("\n")[0])));
-      _pending.clear();
-      try { _worker.terminate(); } catch { /* already dead */ }
-      _worker = null; _ready = false; _startPromise = null;
-      const now = Date.now();
-      _fatalTimes = _fatalTimes.filter((t) => now - t < 60000); _fatalTimes.push(now);
-      if (_fatalTimes.length <= 3) {
-        _startPromise = _doStartVM();
-      } else {
-        console.error("[vm] crashed >3 times in 60s — auto-restart stopped; call vm.resetToFresh()");
-      }
+      _restartWorker(
+        "guest module fatal, restarting worker: " + msg.error,
+        "VM crashed and is restarting (state preserved) — retry the command. Cause: " + String(msg.error).split("\n")[0],
+      );
       return;
     }
     if (msg.type === "fs_dirty") { _saveSnapshot(); return; }

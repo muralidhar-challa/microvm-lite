@@ -181,6 +181,34 @@ try {
   const afterReset = await page.evaluate(() => window.vm.readFile("/workspace/persist.txt").catch(() => "<missing>"));
   check("resetToFresh wipes persisted files", afterReset === "<missing>", JSON.stringify(afterReset));
 
+  // ── hang watchdog: an exec that blows its deadline restarts the worker ─────
+  // Runs LAST on purpose. blink executes a command to completion in one
+  // uninterruptible Asyncify call, so an exec past its deadline leaves the
+  // worker wedged forever — before the watchdog the only exit was a page
+  // reload; now it self-heals like a crash. But recovering means terminating
+  // the worker mid-command, and the IDB snapshot can only be flushed while the
+  // worker is IDLE (fs_dirty is gated on !_execBusy) — a hang never goes idle,
+  // so everything written since the last snapshot dies with it. That makes
+  // this check destructive to guest state: placed earlier, it silently wiped
+  // the /tmp session state the reboot checks above depend on.
+  //
+  // An unbounded CPU spin is the deterministic stand-in for the real fd-leak
+  // hang (bug #2): it can never complete, so it wedges the worker exactly the
+  // way a stuck poll() does, with none of that bug's timing sensitivity.
+  // (`sleep` does NOT work here — it goes through the scheduler's cooperative
+  // nanosleep and returns far faster than wall-clock, never tripping the
+  // deadline.) Short deadline so the suite doesn't pay the 120s+15s default.
+  const hung = await page.evaluate(() => window.vm.run("while :; do :; done", 3000)
+    .then(() => "RESOLVED-UNEXPECTEDLY").catch((e) => String(e.message)));
+  check("hang: exec past deadline rejects with a timeout error",
+    hung.includes("timed out"), hung);
+  // Restart is async (terminate → new Worker → boot → stage bundles) — wait
+  // for readiness rather than racing it.
+  await page.waitForFunction(() => window.vm && window.vm.isReady === true, { timeout: 45000 });
+  const revived = await page.evaluate(() => window.vm.run("echo revived"));
+  check("hang: worker auto-restarted and serves commands again",
+    revived.output === "revived", JSON.stringify(revived.output));
+
 } catch (e) {
   failures++;
   console.log("FATAL:", e.stack || e.message);
