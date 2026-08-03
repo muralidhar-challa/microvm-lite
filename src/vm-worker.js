@@ -73,6 +73,21 @@ var _runSeq = 0;
 // Snapshot passed in init (restore the guest FS before we signal ready).
 var _initSnapshot = null;
 
+// Emscripten's FS errors are plain objects carrying errno/code and NO .message,
+// so the obvious `err.message || err` stringifies a perfectly ordinary ENOENT
+// to "[object Object]". That reached the model verbatim — a missing file was
+// indistinguishable from a crash, and cost a live debugging round trip.
+function errText(err) {
+  if (!err) return "unknown error";
+  if (typeof err === "string") return err;
+  if (err.message) return String(err.message);
+  var parts = [];
+  if (err.name) parts.push(String(err.name));
+  if (err.code) parts.push(String(err.code));
+  if (err.errno !== undefined && err.errno !== null) parts.push("errno " + err.errno);
+  return parts.length ? parts.join(" ") : String(err);
+}
+
 // ── FS dirty tracking (debounced fs_dirty like the v86 host) ────────────────
 var _fsDirty = false;
 setInterval(function () {
@@ -572,7 +587,7 @@ self.onmessage = async function (ev) {
   if (msg.type === "load_bundle") {
     await moduleReadyPromise;
     try { await ensureBundle(msg.name); self.postMessage({ type: "result", id: msg.id, value: { ok: true, name: msg.name } }); }
-    catch (err) { self.postMessage({ type: "error", id: msg.id, message: String(err && err.message || err) }); }
+    catch (err) { self.postMessage({ type: "error", id: msg.id, message: errText(err) }); }
     return;
   }
 
@@ -595,14 +610,14 @@ self.onmessage = async function (ev) {
   if (msg.type === "run") {
     await moduleReadyPromise;
     try { self.postMessage({ type: "result", id: msg.id, value: await doRun(msg.cmd) }); }
-    catch (err) { self.postMessage({ type: "error", id: msg.id, message: String(err && err.message || err) }); }
+    catch (err) { self.postMessage({ type: "error", id: msg.id, message: errText(err) }); }
     return;
   }
 
   if (msg.type === "execute") {
     await moduleReadyPromise;
     try { self.postMessage({ type: "result", id: msg.id, value: await doExecute(msg.cmd, msg.session) }); }
-    catch (err) { self.postMessage({ type: "result", id: msg.id, value: { done: false, output_file: null, pid: null, output: "error: " + String(err && err.message || err) } }); }
+    catch (err) { self.postMessage({ type: "result", id: msg.id, value: { done: false, output_file: null, pid: null, output: "error: " + errText(err) } }); }
     return;
   }
 
@@ -618,7 +633,7 @@ self.onmessage = async function (ev) {
       FS.writeFile(p, bytes, opts);
       _fsDirty = true;
       self.postMessage({ type: "result", id: msg.id, value: null });
-    } catch (err) { self.postMessage({ type: "error", id: msg.id, message: String(err && err.message || err) }); }
+    } catch (err) { self.postMessage({ type: "error", id: msg.id, message: errText(err) }); }
     return;
   }
 
@@ -628,14 +643,14 @@ self.onmessage = async function (ev) {
       var b = FS.readFile(msg.path);
       var copy = b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
       self.postMessage({ type: "result", id: msg.id, value: copy }, [copy]);
-    } catch (err) { self.postMessage({ type: "error", id: msg.id, message: String(err && err.message || err) }); }
+    } catch (err) { self.postMessage({ type: "error", id: msg.id, message: errText(err) }); }
     return;
   }
 
   if (msg.type === "save_state") {
     await moduleReadyPromise;
     try { var s = makeSnapshot(); self.postMessage({ type: "result", id: msg.id, value: s }, [s]); }
-    catch (err) { self.postMessage({ type: "error", id: msg.id, message: String(err && err.message || err) }); }
+    catch (err) { self.postMessage({ type: "error", id: msg.id, message: errText(err) }); }
     return;
   }
 
