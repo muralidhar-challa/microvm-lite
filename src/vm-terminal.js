@@ -110,7 +110,21 @@ export async function attachTerminal(container, opts = {}) {
     const wrapped = cdPrefix + line + '; printf "' + PWD_MARK + '%s\\n" "$(pwd)"';
 
     try {
-      const out = await vm.execute(wrapped, opts.timeout || 30000);
+      // 180s, deliberately far above the agent's 120s. A human typing at a
+      // terminal is willing to wait for a heavy query; an agent is not — it
+      // should narrow the query instead of blocking a turn on it.
+      //
+      // The old 30s (→ 45s once the host adds its margin) was below what a
+      // large `sams query` legitimately takes, so real work was being killed
+      // mid-flight and reported as a failure. It also undercut the CLI's own
+      // --timeout-secs (240s default): the host gave up long before the value
+      // the caller actually set could apply.
+      //
+      // This deadline also has to stay generous because the host treats an
+      // exec that blows it as a wedged VM and restarts the worker. That is
+      // right for a command that is never coming back, and wrong for one that
+      // is merely slow — so the threshold must sit above legitimate slowness.
+      const out = await vm.execute(wrapped, opts.timeout || 180000);
       const idx = out.lastIndexOf(PWD_MARK);
       let shown = out, newCwd = null;
       if (idx !== -1) {
